@@ -1,9 +1,12 @@
 package docker
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 )
 
 // fakeClient is a hand-rolled Client used by every Manager.Status test below.
@@ -19,6 +22,11 @@ type fakeClient struct {
 	volumes     []VolumeSummary
 	networks    []NetworkSummary
 	daemon      DaemonInfo
+	logs        []LogEntry
+	streamLogs  []LogEntry
+	streamErr   error
+	lastTail    int
+	lastSince   time.Time
 }
 
 func (f fakeClient) Version(ctx context.Context) (VersionInfo, error) {
@@ -51,6 +59,17 @@ func (f fakeClient) Networks(ctx context.Context) ([]NetworkSummary, error) {
 
 func (f fakeClient) Info(ctx context.Context) (DaemonInfo, error) {
 	return f.daemon, f.err
+}
+
+func (f fakeClient) ContainerLogs(ctx context.Context, id string, tail int) ([]LogEntry, error) {
+	return f.logs, f.err
+}
+
+func (f fakeClient) ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error {
+	for _, entry := range f.streamLogs {
+		emit(entry)
+	}
+	return f.streamErr
 }
 
 func newManager(t *testing.T, c Client) *Manager {
@@ -390,6 +409,73 @@ func TestDaemonInfoMapsCountsAndVersion(t *testing.T) {
 	if got.ServerVersion != "26.0.0" || got.OperatingSystem != "Ubuntu 22.04" {
 		t.Fatalf("daemon metadata not mapped: %+v", got)
 	}
+}
+
+// AC issue #30: docker.container.logs returns a bounded recent log tail with
+// stdout/stderr stream markers and timestamps when Docker provides them.
+func TestContainerLogsReturnsBoundedTailWithStreamsAndTimestamps(t *testing.T) {
+	m := newManager(t, fakeClient{logs: []LogEntry{
+		{ContainerID: "abc", Stream: "stdout", Timestamp: "2026-05-29T10:00:00Z", Line: "ready"},
+		{ContainerID: "abc", Stream: "stderr", Timestamp: "2026-05-29T10:00:01Z", Line: "warn"},
+	}})
+	got, err := m.Logs(context.Background(), "abc", MaxLogTail+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Stream != "stdout" || got[1].Stream != "stderr" {
+		t.Fatalf("log stream markers not preserved: %+v", got)
+	}
+	if got[0].Timestamp == "" || got[1].Line != "warn" {
+		t.Fatalf("log timestamp/line not preserved: %+v", got)
+	}
+}
+
+// AC issue #30: streaming emits follow-up log events and surfaces Docker stream
+// termination/errors to callers.
+func TestContainerLogsSubscribeStreamsEventsAndErrors(t *testing.T) {
+	expectedErr := errors.New("container removed")
+	m := newManager(t, fakeClient{
+		streamLogs: []LogEntry{{ContainerID: "abc", Stream: "stdout", Line: "next"}},
+		streamErr:  expectedErr,
+	})
+	var got []LogEntry
+	err := m.SubscribeLogs(context.Background(), "abc", time.Unix(10, 0), func(entry LogEntry) {
+		got = append(got, entry)
+	})
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("err = %v want %v", err, expectedErr)
+	}
+	if len(got) != 1 || got[0].Line != "next" {
+		t.Fatalf("streamed logs = %+v", got)
+	}
+}
+
+// AC issue #30: Docker multiplexed log frames are decoded into stdout/stderr
+// events and Docker timestamps are separated from the visible line.
+func TestDecodeDockerLogsMultiplexedFrames(t *testing.T) {
+	var body bytes.Buffer
+	writeDockerLogFrame(&body, 1, "2026-05-29T10:00:00.000000001Z hello\n")
+	writeDockerLogFrame(&body, 2, "2026-05-29T10:00:01Z bad\n")
+	var got []LogEntry
+	if err := decodeDockerLogs(&body, "abc", func(entry LogEntry) {
+		got = append(got, entry)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Stream != "stdout" || got[1].Stream != "stderr" {
+		t.Fatalf("decoded stream markers = %+v", got)
+	}
+	if got[0].Timestamp != "2026-05-29T10:00:00.000000001Z" || got[0].Line != "hello" {
+		t.Fatalf("decoded timestamp/line = %+v", got[0])
+	}
+}
+
+func writeDockerLogFrame(buf *bytes.Buffer, stream byte, line string) {
+	header := make([]byte, 8)
+	header[0] = stream
+	binary.BigEndian.PutUint32(header[4:8], uint32(len(line)))
+	buf.Write(header)
+	buf.WriteString(line)
 }
 
 // SocketClient image list strips Docker's "<none>:<none>" placeholders so the

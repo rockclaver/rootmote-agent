@@ -298,6 +298,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 	case "docker.status",
 		"docker.container.list",
 		"docker.container.get",
+		"docker.container.logs",
+		"docker.container.logs_subscribe",
 		"docker.image.list",
 		"docker.image.get",
 		"docker.volume.list",
@@ -1234,6 +1236,57 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.get", map[string]any{"container": container})
+	case "docker.container.logs":
+		var in struct {
+			ID   string `json:"id"`
+			Tail int    `json:"tail"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		logs, err := s.cfg.Docker.Logs(ctx, in.ID, in.Tail)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs", map[string]any{"logs": logs})
+	case "docker.container.logs_subscribe":
+		var in struct {
+			ID        string `json:"id"`
+			SinceTime string `json:"since_time"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		var since time.Time
+		if in.SinceTime != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, in.SinceTime)
+			if err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "since_time must be RFC3339Nano")
+				return
+			}
+			since = parsed
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs_subscribe", map[string]any{"container_id": in.ID})
+		go func() {
+			err := s.cfg.Docker.SubscribeLogs(ctx, in.ID, since, func(entry docker.LogEntry) {
+				s.writeOK(ctx, c, writeMu, "", "docker.container.log_event", entry)
+			})
+			if err != nil {
+				s.writeOK(ctx, c, writeMu, "", "docker.container.log_done", map[string]any{
+					"container_id": in.ID,
+					"ok":           false,
+					"error":        err.Error(),
+				})
+				return
+			}
+			s.writeOK(ctx, c, writeMu, "", "docker.container.log_done", map[string]any{
+				"container_id": in.ID,
+				"ok":           true,
+			})
+		}()
 	case "docker.image.list":
 		images, err := s.cfg.Docker.Images(ctx)
 		if err != nil {

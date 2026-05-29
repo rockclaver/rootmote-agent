@@ -1026,6 +1026,86 @@ func TestDockerInfo(t *testing.T) {
 	}
 }
 
+func TestDockerContainerLogs(t *testing.T) {
+	// AC issue #30: docker.container.logs exposes a bounded recent log tail.
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{logs: []docker.LogEntry{{
+		ContainerID: "abc",
+		Stream:      "stdout",
+		Timestamp:   "2026-05-29T10:00:00Z",
+		Line:        "ready",
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"id": "abc", "tail": 50})
+	resp := dockerRoundTrip(t, mgr, "docker.container.logs", payload)
+	if resp.Kind != "docker.container.logs" {
+		t.Fatalf("kind = %q", resp.Kind)
+	}
+	var dto struct {
+		Logs []docker.LogEntry `json:"logs"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if len(dto.Logs) != 1 || dto.Logs[0].Stream != "stdout" || dto.Logs[0].Line != "ready" {
+		t.Fatalf("logs payload = %+v", dto.Logs)
+	}
+}
+
+func TestDockerContainerLogsSubscribeTerminalState(t *testing.T) {
+	// AC issue #30: docker.container.logs_subscribe streams events then emits a
+	// visible terminal state when the Docker stream ends.
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{streamLogs: []docker.LogEntry{{
+		ContainerID: "abc",
+		Stream:      "stderr",
+		Line:        "warn",
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	t.Cleanup(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
+	payload, _ := json.Marshal(map[string]any{"id": "abc"})
+	req, _ := json.Marshal(Frame{ID: "sub", Kind: "docker.container.logs_subscribe", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	var seen []Frame
+	for len(seen) < 3 {
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f Frame
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		seen = append(seen, f)
+	}
+	if seen[0].Kind != "docker.container.logs_subscribe" ||
+		seen[1].Kind != "docker.container.log_event" ||
+		seen[2].Kind != "docker.container.log_done" {
+		t.Fatalf("stream frames = %+v", seen)
+	}
+	var done struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(seen[2].Payload, &done); err != nil {
+		t.Fatal(err)
+	}
+	if !done.OK {
+		t.Fatalf("done payload = %s", string(seen[2].Payload))
+	}
+}
+
 func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []byte) Frame {
 	t.Helper()
 	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
@@ -1060,6 +1140,9 @@ type fakeDockerClient struct {
 	volumes     []docker.VolumeSummary
 	networks    []docker.NetworkSummary
 	daemon      docker.DaemonInfo
+	logs        []docker.LogEntry
+	streamLogs  []docker.LogEntry
+	streamErr   error
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -1092,6 +1175,17 @@ func (f fakeDockerClient) Networks(context.Context) ([]docker.NetworkSummary, er
 
 func (f fakeDockerClient) Info(context.Context) (docker.DaemonInfo, error) {
 	return f.daemon, f.err
+}
+
+func (f fakeDockerClient) ContainerLogs(context.Context, string, int) ([]docker.LogEntry, error) {
+	return f.logs, f.err
+}
+
+func (f fakeDockerClient) ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(docker.LogEntry)) error {
+	for _, entry := range f.streamLogs {
+		emit(entry)
+	}
+	return f.streamErr
 }
 
 type fakeErr struct{ cause error }

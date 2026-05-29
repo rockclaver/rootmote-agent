@@ -8,12 +8,16 @@
 package docker
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -56,6 +60,8 @@ type Client interface {
 	Volumes(ctx context.Context) ([]VolumeSummary, error)
 	Networks(ctx context.Context) ([]NetworkSummary, error)
 	Info(ctx context.Context) (DaemonInfo, error)
+	ContainerLogs(ctx context.Context, id string, tail int) ([]LogEntry, error)
+	ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error
 }
 
 // Status is the typed daemon status returned by Manager.Status.
@@ -267,6 +273,16 @@ type DaemonInfo struct {
 	KernelVersion     string `json:"kernel_version,omitempty"`
 }
 
+// LogEntry is one container log line with Docker stream/timestamp metadata when
+// Docker exposes it. Timestamp is RFC3339Nano text to keep the wire format
+// stable across Go/Dart.
+type LogEntry struct {
+	ContainerID string `json:"container_id"`
+	Stream      string `json:"stream"`
+	Timestamp   string `json:"timestamp,omitempty"`
+	Line        string `json:"line"`
+}
+
 // Images returns every local image with safe metadata.
 func (m *Manager) Images(ctx context.Context) ([]ImageSummary, error) {
 	return m.client.Images(ctx)
@@ -294,6 +310,37 @@ func (m *Manager) Networks(ctx context.Context) ([]NetworkSummary, error) {
 // Info returns the daemon-level inventory snapshot from Docker /info.
 func (m *Manager) Info(ctx context.Context) (DaemonInfo, error) {
 	return m.client.Info(ctx)
+}
+
+const (
+	DefaultLogTail = 200
+	MaxLogTail     = 500
+)
+
+// Logs returns a bounded recent log tail for a container.
+func (m *Manager) Logs(ctx context.Context, id string, tail int) ([]LogEntry, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("docker: container id required")
+	}
+	if tail <= 0 {
+		tail = DefaultLogTail
+	}
+	if tail > MaxLogTail {
+		tail = MaxLogTail
+	}
+	return m.client.ContainerLogs(ctx, id, tail)
+}
+
+// SubscribeLogs streams follow-up log lines after the current view. Docker does
+// not provide a durable sequence number, so resume is timestamp-based.
+func (m *Manager) SubscribeLogs(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("docker: container id required")
+	}
+	if emit == nil {
+		return errors.New("docker: log emit callback required")
+	}
+	return m.client.ContainerLogStream(ctx, id, since, emit)
 }
 
 func composeProject(labels map[string]string) string {
@@ -356,6 +403,7 @@ const DefaultSocketPath = "/var/run/docker.sock"
 type SocketClient struct {
 	socketPath string
 	httpc      *http.Client
+	streamc    *http.Client
 }
 
 // NewSocketClient returns a SocketClient bound to socketPath. If socketPath is
@@ -374,6 +422,7 @@ func NewSocketClient(socketPath string) *SocketClient {
 	return &SocketClient{
 		socketPath: socketPath,
 		httpc:      &http.Client{Transport: tr, Timeout: 5 * time.Second},
+		streamc:    &http.Client{Transport: tr},
 	}
 }
 
@@ -559,6 +608,61 @@ func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetai
 		Labels:          composeLabels(raw.Config.Labels),
 		EnvironmentVars: redactEnv(raw.Config.Env),
 	}, nil
+}
+
+// ContainerLogs calls Docker's logs endpoint with a bounded tail. It requests
+// stdout, stderr, and timestamps; stream tags are decoded from Docker's
+// multiplexed log framing when available.
+func (c *SocketClient) ContainerLogs(ctx context.Context, id string, tail int) ([]LogEntry, error) {
+	entries := []LogEntry{}
+	err := c.readLogs(ctx, id, logQuery(tail, false, time.Time{}), c.httpc, func(e LogEntry) {
+		entries = append(entries, e)
+	})
+	return entries, err
+}
+
+// ContainerLogStream follows Docker logs from since until the response ends or
+// ctx is cancelled.
+func (c *SocketClient) ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error {
+	return c.readLogs(ctx, id, logQuery(0, true, since), c.streamc, emit)
+}
+
+func logQuery(tail int, follow bool, since time.Time) string {
+	q := url.Values{}
+	q.Set("stdout", "1")
+	q.Set("stderr", "1")
+	q.Set("timestamps", "1")
+	if follow {
+		q.Set("follow", "1")
+		if !since.IsZero() {
+			q.Set("since", fmt.Sprintf("%d", since.Unix()))
+		}
+	} else {
+		q.Set("tail", fmt.Sprintf("%d", tail))
+	}
+	return q.Encode()
+}
+
+func (c *SocketClient) readLogs(ctx context.Context, id, query string, client *http.Client, emit func(LogEntry)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/"+id+"/logs?"+query, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return translateDialError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: docker returned %d", ErrPermissionDenied, resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("%w: docker returned %d", ErrDaemonDown, resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("docker: unexpected status %d", resp.StatusCode)
+	}
+	return decodeDockerLogs(resp.Body, id, emit)
 }
 
 // Images calls GET /images/json and maps it into the agent's stable summary.
@@ -747,6 +851,73 @@ func dropNoneTags(tags []string) []string {
 		return nil
 	}
 	return out
+}
+
+func decodeDockerLogs(r io.Reader, containerID string, emit func(LogEntry)) error {
+	br := bufio.NewReader(r)
+	for {
+		header, err := br.Peek(8)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return decodeRawLogLines(br, containerID, "stdout", emit)
+		}
+		stream := streamName(header[0])
+		size := binary.BigEndian.Uint32(header[4:8])
+		if stream == "" || size == 0 {
+			return decodeRawLogLines(br, containerID, "stdout", emit)
+		}
+		if _, err := br.Discard(8); err != nil {
+			return err
+		}
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return err
+		}
+		emitLogChunk(containerID, stream, string(buf), emit)
+	}
+}
+
+func decodeRawLogLines(r io.Reader, containerID, stream string, emit func(LogEntry)) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		emitLogChunk(containerID, stream, scanner.Text()+"\n", emit)
+	}
+	return scanner.Err()
+}
+
+func emitLogChunk(containerID, stream, chunk string, emit func(LogEntry)) {
+	for _, line := range strings.SplitAfter(chunk, "\n") {
+		if line == "" {
+			continue
+		}
+		text := strings.TrimSuffix(line, "\n")
+		timestamp := ""
+		if ts, rest, ok := strings.Cut(text, " "); ok {
+			if _, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+				timestamp = ts
+				text = rest
+			}
+		}
+		emit(LogEntry{
+			ContainerID: containerID,
+			Stream:      stream,
+			Timestamp:   timestamp,
+			Line:        text,
+		})
+	}
+}
+
+func streamName(code byte) string {
+	switch code {
+	case 1:
+		return "stdout"
+	case 2:
+		return "stderr"
+	default:
+		return ""
+	}
 }
 
 func (c *SocketClient) getJSON(ctx context.Context, path string, out any) error {
