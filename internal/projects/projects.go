@@ -199,11 +199,11 @@ func (m *Manager) requireClean(id string, force bool) (string, error) {
 }
 
 // Delete removes the project row and, if wipe is true, the workspace dir.
+// When wipe is requested the workspace is removed first; only on success do we
+// drop the row, so a failed wipe leaves the project still listable and the
+// user can retry instead of being stuck with an orphan workspace dir.
 func (m *Manager) Delete(id string, wipe bool) error {
 	if _, err := m.Store.GetProject(id); err != nil {
-		return err
-	}
-	if err := m.Store.DeleteProject(id); err != nil {
 		return err
 	}
 	if wipe {
@@ -211,7 +211,7 @@ func (m *Manager) Delete(id string, wipe bool) error {
 			return err
 		}
 	}
-	return nil
+	return m.Store.DeleteProject(id)
 }
 
 func run(dir, name string, args ...string) (string, error) {

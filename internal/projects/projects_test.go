@@ -238,6 +238,39 @@ func TestDelete_OptionallyWipesWorkspace(t *testing.T) {
 	}
 }
 
+// Regression: when wipe fails, the project row must remain so the user can
+// retry — previously the row was dropped first and the workspace orphaned.
+func TestDelete_WipeFailureLeavesRowForRetry(t *testing.T) {
+	m := newManager(t)
+	p, err := m.CreateEmpty("d3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := m.WorkspaceDir(p.ID)
+
+	// Make the workspace un-removable by chmod'ing its parent to read-only.
+	// We do it by replacing the workspace dir with a regular file at a path
+	// that os.RemoveAll cannot wipe transparently: actually, RemoveAll is
+	// quite tolerant — instead, point the manager root at a read-only parent.
+	// Simpler: drop a sentinel inside, then chmod the workspace dir 0500 so
+	// RemoveAll fails when it tries to unlink children.
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := m.Delete(p.ID, true); err == nil {
+		t.Skip("filesystem allowed removal; cannot exercise wipe-failure path here")
+	}
+	// Row must still be present so the user can retry.
+	if _, err := m.Store.GetProject(p.ID); err != nil {
+		t.Fatalf("row should remain after failed wipe, got: %v", err)
+	}
+}
+
 // AC: "Two projects on the same server never read/write each other's
 // workspaces (verified by an integration test)."
 func TestProjectIsolation_NoCrossReadOrWrite(t *testing.T) {
