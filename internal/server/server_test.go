@@ -814,13 +814,117 @@ func TestDockerStatus_Unconfigured(t *testing.T) {
 	}
 }
 
+// AC: docker.container.list is exposed over the WebSocket with all returned
+// containers, including Compose metadata and unmanaged markers.
+func TestDockerContainerList(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{containers: []docker.ContainerSummary{
+		{ID: "1", Name: "api", Image: "api:latest", State: "running", Labels: map[string]string{
+			"com.docker.compose.project": "nest",
+			"com.docker.compose.service": "api",
+		}},
+		{ID: "2", Name: "redis", Image: "redis:7", State: "exited"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "docker.container.list"})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "docker.container.list" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Containers []docker.ContainerSummary `json:"containers"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if len(dto.Containers) != 2 || dto.Containers[0].ComposeProject != "nest" || dto.Containers[1].Managed {
+		t.Fatalf("containers payload = %+v", dto.Containers)
+	}
+}
+
+// AC: docker.container.get is exposed over the WebSocket and returns the
+// detail inspect subset with environment redaction preserved.
+func TestDockerContainerGet(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{detail: docker.ContainerDetail{
+		ID:            "1",
+		Name:          "api",
+		Image:         "api:latest",
+		Command:       "npm start",
+		RestartPolicy: "unless-stopped",
+		EnvironmentVars: []docker.EnvSummary{{
+			Key: "API_TOKEN", Value: "REDACTED", Redacted: true,
+		}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+	payload, _ := json.Marshal(map[string]string{"id": "1"})
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "docker.container.get", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "docker.container.get" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Container docker.ContainerDetail `json:"container"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Container.Command != "npm start" || len(dto.Container.EnvironmentVars) != 1 || !dto.Container.EnvironmentVars[0].Redacted {
+		t.Fatalf("detail payload = %+v", dto.Container)
+	}
+}
+
 type fakeDockerClient struct {
-	v   docker.VersionInfo
-	err error
+	v          docker.VersionInfo
+	err        error
+	containers []docker.ContainerSummary
+	detail     docker.ContainerDetail
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
 	return f.v, f.err
+}
+
+func (f fakeDockerClient) Containers(context.Context) ([]docker.ContainerSummary, error) {
+	return f.containers, f.err
+}
+
+func (f fakeDockerClient) Container(context.Context, string) (docker.ContainerDetail, error) {
+	return f.detail, f.err
 }
 
 type fakeErr struct{ cause error }

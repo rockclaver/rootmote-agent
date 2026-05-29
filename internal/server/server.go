@@ -295,7 +295,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"auth.logout",
 		"auth.relay_callback":
 		s.dispatchAuth(ctx, c, writeMu, f)
-	case "docker.status":
+	case "docker.status",
+		"docker.container.list",
+		"docker.container.get":
 		s.dispatchDocker(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
@@ -1206,6 +1208,27 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 	case "docker.status":
 		st := s.cfg.Docker.Status(ctx)
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.status", toDockerDTO(st))
+	case "docker.container.list":
+		containers, err := s.cfg.Docker.Containers(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.list", map[string]any{"containers": containers})
+	case "docker.container.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		container, err := s.cfg.Docker.Container(ctx, in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.get", map[string]any{"container": container})
 	}
 }
 

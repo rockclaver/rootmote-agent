@@ -88,7 +88,10 @@ func main() {
 		previewMgr = nil
 	}
 
-	dockerMgr, err := docker.New(docker.Config{Client: docker.NewSocketClient("")})
+	dockerMgr, err := docker.New(docker.Config{
+		Client:      docker.NewSocketClient(""),
+		ProjectRoot: filepath.Join(*dataDir, "projects"),
+	})
 	if err != nil {
 		log.Fatalf("claver-agent: init docker: %v", err)
 	}
