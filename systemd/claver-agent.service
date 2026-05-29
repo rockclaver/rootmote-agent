@@ -1,0 +1,31 @@
+[Unit]
+Description=Claver VPS Agent
+Documentation=https://github.com/rockclaver/claver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claver
+Group=claver
+ExecStart=/usr/local/bin/claver-agent --addr 127.0.0.1:7676
+Restart=on-failure
+RestartSec=2s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Agent only listens on loopback; deny any attempt to reach the public net.
+IPAddressAllow=localhost
+IPAddressDeny=any
+ReadWritePaths=/var/lib/claver
+
+[Install]
+WantedBy=multi-user.target
