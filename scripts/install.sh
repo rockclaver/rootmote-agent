@@ -93,8 +93,16 @@ if ! command -v caddy >/dev/null 2>&1; then
   fi
 fi
 
-install -d -o caddy -g caddy -m 0755 "$CADDY_FRAGMENTS_DIR" 2>/dev/null \
-  || install -d -m 0755 "$CADDY_FRAGMENTS_DIR"
+# Owned by the agent user so the agent can write per-preview fragments, with
+# the caddy group + setgid bit so new files inherit group=caddy and the caddy
+# daemon can read them. Falls back gracefully if either user is missing.
+if id claver >/dev/null 2>&1 && getent group caddy >/dev/null 2>&1; then
+  install -d -o claver -g caddy -m 2750 "$CADDY_FRAGMENTS_DIR"
+elif id claver >/dev/null 2>&1; then
+  install -d -o claver -g claver -m 0755 "$CADDY_FRAGMENTS_DIR"
+else
+  install -d -m 0755 "$CADDY_FRAGMENTS_DIR"
+fi
 
 # Ensure the main Caddyfile exists and imports our fragments glob. The check
 # is intentionally a literal grep so re-runs of the installer are idempotent.
