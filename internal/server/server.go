@@ -291,9 +291,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"auth.logout",
 		"auth.relay_callback":
 		s.dispatchAuth(ctx, c, writeMu, f)
-	case "github.device_start",
-		"github.device_poll",
-		"github.repo_list",
+	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
 		"github.push",
@@ -784,27 +782,6 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 	}
 	mgr := s.cfg.GitHub
 	switch f.Kind {
-	case "github.device_start":
-		out, err := mgr.StartDeviceFlow(ctx)
-		if err != nil {
-			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, out)
-	case "github.device_poll":
-		var in struct {
-			DeviceCode string `json:"device_code"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.DeviceCode == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "device_code required")
-			return
-		}
-		out, err := mgr.PollDeviceFlow(ctx, in.DeviceCode)
-		if err != nil {
-			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, out)
 	case "github.repo_list":
 		var in struct {
 			Account string `json:"account"`
@@ -931,12 +908,6 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 
 func (s *Server) writeGitHubErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
 	switch {
-	case errors.Is(err, gh.ErrAuthPending):
-		s.writeError(ctx, c, writeMu, id, "github_pending", err.Error())
-	case errors.Is(err, gh.ErrSlowDown):
-		s.writeError(ctx, c, writeMu, id, "github_slow_down", err.Error())
-	case errors.Is(err, gh.ErrExpiredDeviceCode):
-		s.writeError(ctx, c, writeMu, id, "github_device_expired", err.Error())
 	case errors.Is(err, gh.ErrTokenMissing):
 		s.writeError(ctx, c, writeMu, id, "github_reauth_required", err.Error())
 	case errors.Is(err, gh.ErrUnapprovedChanges):

@@ -253,7 +253,7 @@ func runWithEnv(dir string, extraEnv []string, name string, args ...string) (str
 
 // isAuthError reports whether git's combined output looks like a credentials
 // refusal (private repo, bad creds, terminal prompts disabled). Phase 3 has
-// no credential path; Phase 6 wires in the GitHub Device Flow token.
+// no credential path; GitHub imports pass credentials through the GitHub CLI.
 func isAuthError(out string) bool {
 	s := strings.ToLower(out)
 	switch {

@@ -24,7 +24,7 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # The agent's *listener* is locked to loopback by an in-process self-check
 # (assertLoopback). It still needs outbound network to clone repos, talk to
-# GitHub (Device Flow, Phase 6), etc., so we leave egress open here.
+# GitHub CLI auth, previews, etc., so we leave egress open here.
 ReadWritePaths=/var/lib/claver /etc/caddy/claver
 
 [Install]

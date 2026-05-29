@@ -1,12 +1,13 @@
-// Package cliauth drives the interactive login flows of the Claude Code
-// and Codex CLIs on a headless VPS, so the mobile app can authenticate a
+// Package cliauth drives the interactive login flows of the Claude Code,
+// Codex, and GitHub CLIs on a headless VPS, so the mobile app can authenticate a
 // user's subscription without an on-server browser.
 //
 // Strategy: spawn the CLI inside a captive tmux pane, tail its output via
 // `tmux pipe-pane`, scrape the auth URL the CLI prints, and signal completion
-// when the CLI writes its credential file. Tokens are persisted in the same
-// AES-GCM vault used for GitHub credentials; on subsequent session.start the
-// agent injects them via `tmux new-session -e` so the CLI inherits them.
+// when the CLI writes its credential file or the GitHub CLI reports an active
+// login. Claude/Codex tokens are persisted in the agent's AES-GCM vault; on
+// subsequent session.start the agent injects them via `tmux new-session -e` so
+// the CLI inherits them.
 package cliauth
 
 import (
@@ -38,6 +39,7 @@ import (
 const (
 	KindClaude = "claude"
 	KindCodex  = "codex"
+	KindGitHub = "github"
 )
 
 // Modes.
@@ -186,10 +188,13 @@ func (m *Manager) credPath(kind string) string {
 // Status reports whether the named CLI is logged in. It checks the vault
 // first (explicit token/api_key) and falls back to the CLI's credential file.
 func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
-	if kind != KindClaude && kind != KindCodex {
+	if kind != KindClaude && kind != KindCodex && kind != KindGitHub {
 		return Status{}, ErrBadKind
 	}
 	out := Status{Kind: kind, Method: MethodNone}
+	if kind == KindGitHub {
+		return m.githubStatus(ctx)
+	}
 
 	if row, err := m.cfg.Store.GetCliToken(kind); err == nil {
 		out.LoggedIn = true
@@ -231,12 +236,85 @@ func (m *Manager) probeVersion(ctx context.Context, kind string) string {
 }
 
 func (m *Manager) resolveBin(kind string) string {
-	candidate := filepath.Join(m.cfg.BinDir, kind)
+	binName := kind
+	if kind == KindGitHub {
+		binName = "gh"
+	}
+	candidate := filepath.Join(m.cfg.BinDir, binName)
 	if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
 		return candidate
 	}
-	if p, err := exec.LookPath(kind); err == nil {
+	if p, err := exec.LookPath(binName); err == nil {
 		return p
+	}
+	return ""
+}
+
+func (m *Manager) githubStatus(ctx context.Context) (Status, error) {
+	out := Status{Kind: KindGitHub, Method: MethodNone}
+	if v := m.probeVersion(ctx, KindGitHub); v != "" {
+		out.Version = v
+	}
+	bin := m.resolveBin(KindGitHub)
+	if bin == "" {
+		return out, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(cctx, bin, "auth", "status", "--active", "--hostname", "github.com", "--json", "hosts").CombinedOutput()
+	if err != nil {
+		return out, nil
+	}
+	account := activeGitHubAccount(raw)
+	if account == "" {
+		return out, nil
+	}
+	out.LoggedIn = true
+	out.Method = MethodSubscription
+	out.Account = account
+	return out, nil
+}
+
+func activeGitHubAccount(raw []byte) string {
+	var doc struct {
+		Hosts map[string]json.RawMessage `json:"hosts"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	host := doc.Hosts["github.com"]
+	if len(host) == 0 {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal(host, &decoded); err != nil {
+		return ""
+	}
+	return findGitHubAccount(decoded)
+}
+
+func findGitHubAccount(v any) string {
+	switch x := v.(type) {
+	case map[string]any:
+		if active, ok := x["active"].(bool); ok && !active {
+			return ""
+		}
+		for _, key := range []string{"user", "username", "login"} {
+			if s, ok := x[key].(string); ok && s != "" {
+				return s
+			}
+		}
+		for _, child := range x {
+			if account := findGitHubAccount(child); account != "" {
+				return account
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if account := findGitHubAccount(child); account != "" {
+				return account
+			}
+		}
 	}
 	return ""
 }
@@ -272,7 +350,7 @@ func parseAccount(kind, path string) string {
 // StartLogin spawns a captive CLI login process and returns a handle.
 // The Events channel closes after EvtDone.
 func (m *Manager) StartLogin(parent context.Context, kind, mode string) (*Login, error) {
-	if kind != KindClaude && kind != KindCodex {
+	if kind != KindClaude && kind != KindCodex && kind != KindGitHub {
 		return nil, ErrBadKind
 	}
 	if mode != ModeInteractive {
@@ -396,8 +474,16 @@ func (m *Manager) SetToken(ctx context.Context, kind, mode, value string) (Statu
 
 // Logout removes stored credentials and asks the CLI to forget its session.
 func (m *Manager) Logout(ctx context.Context, kind string) error {
-	if kind != KindClaude && kind != KindCodex {
+	if kind != KindClaude && kind != KindCodex && kind != KindGitHub {
 		return ErrBadKind
+	}
+	if kind == KindGitHub {
+		if bin := m.resolveBin(kind); bin != "" {
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			_ = exec.CommandContext(cctx, bin, "auth", "logout", "--hostname", "github.com").Run()
+		}
+		return nil
 	}
 	if kind == KindCodex {
 		if bin := m.resolveBin(kind); bin != "" {
@@ -528,6 +614,12 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 		case raw, ok := <-lines:
 			if !ok {
 				// Pipe closed (tmux session ended). Check credential file.
+				if login.Kind == KindGitHub {
+					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
+						login.emitDone(true, "", st)
+						return
+					}
+				}
 				if mtimeNewer(m.credPath(login.Kind), credBaseline) {
 					m.finishOK(ctx, login)
 					return
@@ -578,11 +670,24 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 				login.emit(Event{Type: EvtPromptPaste})
 			}
 		case <-poll.C:
+			if login.Kind == KindGitHub {
+				if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
+					_ = killTmux(login.sessionName)
+					login.emitDone(true, "", st)
+					return
+				}
+			}
 			if mtimeNewer(m.credPath(login.Kind), credBaseline) {
 				m.finishOK(ctx, login)
 				return
 			}
 			if !tmuxSessionAlive(login.sessionName) {
+				if login.Kind == KindGitHub {
+					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
+						login.emitDone(true, "", st)
+						return
+					}
+				}
 				if mtimeNewer(m.credPath(login.Kind), credBaseline) {
 					m.finishOK(ctx, login)
 					return
@@ -595,6 +700,12 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 }
 
 func (m *Manager) finishOK(ctx context.Context, login *Login) {
+	if login.Kind == KindGitHub {
+		_ = killTmux(login.sessionName)
+		st, _ := m.Status(ctx, login.Kind)
+		login.emitDone(st.LoggedIn, "", st)
+		return
+	}
 	// Claude's interactive /login credential file is the canonical state.
 	// Do not extract its access token and inject it as CLAUDE_CODE_OAUTH_TOKEN:
 	// that env var is for tokens generated by `claude setup-token` and has
@@ -640,6 +751,8 @@ func loginCommandArgs(kind, bin string) []string {
 		return []string{bin, "auth", "login"}
 	case KindCodex:
 		return []string{bin, "login"}
+	case KindGitHub:
+		return []string{bin, "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--scopes", "repo,read:org,workflow", "--web"}
 	default:
 		return []string{bin}
 	}

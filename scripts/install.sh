@@ -47,6 +47,30 @@ if ! id claver >/dev/null 2>&1; then
 fi
 install -d -o claver -g claver -m 0750 "$STATE_DIR"
 
+if ! command -v gh >/dev/null 2>&1; then
+  echo "installing GitHub CLI" >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    if ! apt-get install -y gh; then
+      apt-get install -y curl gpg
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+      apt-get update
+      apt-get install -y gh
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y 'dnf-command(config-manager)' || true
+    dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo || true
+    dnf install -y gh
+  else
+    echo "warning: no supported package manager found; install GitHub CLI manually" >&2
+  fi
+fi
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 

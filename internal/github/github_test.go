@@ -41,101 +41,55 @@ func fixture(t *testing.T) (*Manager, *store.Store, *projects.Manager, *review.M
 	mustGit(t, ws, "add", "README.md")
 	mustGit(t, ws, "commit", "-q", "-m", "seed")
 	rm := review.New(pm, st, review.HeuristicSummarizer{})
-	m := New(st, pm, rm, NewTokenVault(filepath.Join(dir, "github.key"), filepath.Join(dir, "tokens")), "client-id")
+	m := New(st, pm, rm, NewTokenVault(filepath.Join(dir, "github.key"), filepath.Join(dir, "tokens")))
 	m.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+	storeToken(t, m, "octo", "token")
 	return m, st, pm, rm, ws
 }
 
-// AC: "Device Flow happy path works end-to-end against real GitHub; flow
-// gracefully handles expired device codes and slow-down responses."
-func TestDeviceFlow_HappyPathSlowDownAndExpiredCodes(t *testing.T) {
-	m, st, _, _, _ := fixture(t)
-	var pollCount int
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/login/device/code":
-			_, _ = w.Write([]byte(`{"device_code":"dev","user_code":"USER","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}`))
-		case "/login/oauth/access_token":
-			pollCount++
-			if pollCount == 1 {
-				_, _ = w.Write([]byte(`{"error":"slow_down"}`))
-				return
-			}
-			if pollCount == 2 {
-				_, _ = w.Write([]byte(`{"error":"expired_token"}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"access_token":"gho_secret"}`))
-		case "/user":
-			if r.Header.Get("Authorization") != "Bearer gho_secret" {
-				t.Fatalf("missing auth header: %q", r.Header.Get("Authorization"))
-			}
-			_, _ = w.Write([]byte(`{"login":"octo"}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer ts.Close()
-	m.LoginBase = ts.URL
-	m.APIBase = ts.URL
-
-	start, err := m.StartDeviceFlow(context.Background())
+func TestToken_UsesGitHubCLIActiveAccount(t *testing.T) {
+	m, _, _, _, _ := fixture(t)
+	var gotName string
+	var gotArgs []string
+	m.RunCommand = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return []byte("gho_from_gh\n"), nil
+	}
+	token, err := m.token(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if start.DeviceCode != "dev" || start.UserCode != "USER" {
-		t.Fatalf("bad start: %+v", start)
+	if token != "gho_from_gh" {
+		t.Fatalf("token = %q", token)
 	}
-	if _, err := m.PollDeviceFlow(context.Background(), "dev"); !errors.Is(err, ErrSlowDown) {
-		t.Fatalf("slow_down got %v", err)
-	}
-	if _, err := m.PollDeviceFlow(context.Background(), "dev"); !errors.Is(err, ErrExpiredDeviceCode) {
-		t.Fatalf("expired got %v", err)
-	}
-	got, err := m.PollDeviceFlow(context.Background(), "dev")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.AccountLogin != "octo" {
-		t.Fatalf("account = %+v", got)
-	}
-	if _, err := st.GetGitHubToken("octo"); err != nil {
-		t.Fatalf("token row missing: %v", err)
+	if gotName != "gh" || strings.Join(gotArgs, " ") != "auth token --hostname github.com" {
+		t.Fatalf("gh command = %q %q", gotName, strings.Join(gotArgs, " "))
 	}
 }
 
-// AC: "OAuth token is stored in `github_tokens` as ciphertext; the encryption
-// key file is `0600` and root-owned."
-func TestTokenVault_StoresCiphertextAndKeyIs0600(t *testing.T) {
-	m, st, _, _, _ := fixture(t)
-	path, err := m.Vault.Seal("octo", "gho_secret")
-	if err != nil {
+func TestToken_UsesSelectedGitHubCLIAccount(t *testing.T) {
+	m, _, _, _, _ := fixture(t)
+	var gotArgs []string
+	m.RunCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte("gho_user\n"), nil
+	}
+	if _, err := m.token(context.Background(), "octo"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutGitHubToken(store.GitHubToken{AccountLogin: "octo", CiphertextPath: path}); err != nil {
-		t.Fatal(err)
+	if strings.Join(gotArgs, " ") != "auth token --hostname github.com --user octo" {
+		t.Fatalf("gh args = %q", strings.Join(gotArgs, " "))
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestToken_MissingGitHubCLIAuthReturnsSentinel(t *testing.T) {
+	m, _, _, _, _ := fixture(t)
+	m.RunCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("not logged in"), errors.New("exit 1")
 	}
-	if strings.Contains(string(raw), "gho_secret") {
-		t.Fatal("ciphertext blob contains plaintext token")
-	}
-	info, err := os.Stat(m.Vault.KeyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("key mode = %03o want 600", info.Mode().Perm())
-	}
-	opened, err := m.Vault.Open("octo", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if opened != "gho_secret" {
-		t.Fatalf("open = %q", opened)
+	if _, _, err := m.ListRepos(context.Background(), "", 1, 10); !errors.Is(err, ErrTokenMissing) {
+		t.Fatalf("missing gh auth got %v", err)
 	}
 }
 
@@ -333,32 +287,29 @@ func TestPullRequests_DraftCreateAndListWithCIStatus(t *testing.T) {
 // AC: "Revoke-token clears the row, removes the encrypted blob, and forces
 // re-auth on next GitHub call."
 func TestRevoke_RemovesRowBlobAndForcesReauth(t *testing.T) {
-	m, st, _, _, _ := fixture(t)
-	path := storeToken(t, m, "octo", "token")
+	m, _, _, _, _ := fixture(t)
+	var gotArgs []string
+	m.RunCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte(""), nil
+	}
 	if err := m.Revoke(context.Background(), "octo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetGitHubToken("octo"); err == nil {
-		t.Fatal("token row still exists")
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("blob still exists or unexpected stat err: %v", err)
-	}
-	if _, _, err := m.ListRepos(context.Background(), "octo", 1, 10); !errors.Is(err, ErrTokenMissing) {
-		t.Fatalf("next call should force reauth, got %v", err)
+	if strings.Join(gotArgs, " ") != "auth logout --hostname github.com --user octo" {
+		t.Fatalf("gh args = %q", strings.Join(gotArgs, " "))
 	}
 }
 
-func storeToken(t *testing.T, m *Manager, account, token string) string {
+func storeToken(t *testing.T, m *Manager, account, token string) {
 	t.Helper()
-	path, err := m.Vault.Seal(account, token)
-	if err != nil {
-		t.Fatal(err)
+	m.RunCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "auth" && args[1] == "token" {
+			return []byte(token + "\n"), nil
+		}
+		return []byte("ok\n"), nil
 	}
-	if err := m.Store.PutGitHubToken(store.GitHubToken{AccountLogin: account, CiphertextPath: path}); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	_ = account
 }
 
 func mustGit(t *testing.T, dir string, args ...string) {

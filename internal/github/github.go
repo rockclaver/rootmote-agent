@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,10 +21,7 @@ import (
 )
 
 var (
-	ErrAuthPending        = errors.New("github device flow authorization pending")
-	ErrSlowDown           = errors.New("github device flow slow down")
-	ErrExpiredDeviceCode  = errors.New("github device code expired")
-	ErrTokenMissing       = errors.New("github token missing")
+	ErrTokenMissing       = errors.New("github cli is not authenticated")
 	ErrUnapprovedChanges  = errors.New("commit requires an approved change set")
 	ErrConfirmationNeeded = errors.New("push requires confirmation_token")
 )
@@ -34,29 +30,19 @@ type HTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
+
 type Manager struct {
 	Store       *store.Store
 	Projects    *projects.Manager
 	Review      *review.Manager
 	Vault       *TokenVault
-	ClientID    string
+	GitHubCLI   string
+	RunCommand  CommandRunner
 	HTTP        HTTPClient
 	APIBase     string
-	LoginBase   string
 	Now         func() time.Time
 	DraftPRBody func(projectID string, files []review.ChangedFile) (string, string)
-}
-
-type DeviceStart struct {
-	DeviceCode      string `json:"device_code"`
-	UserCode        string `json:"user_code"`
-	VerificationURI string `json:"verification_uri"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
-}
-
-type DevicePoll struct {
-	AccountLogin string `json:"account_login"`
 }
 
 type Repo struct {
@@ -77,86 +63,24 @@ type PullRequest struct {
 	CI     string `json:"ci_status"`
 }
 
-func New(st *store.Store, pm *projects.Manager, rm *review.Manager, vault *TokenVault, clientID string) *Manager {
+func New(st *store.Store, pm *projects.Manager, rm *review.Manager, vault *TokenVault) *Manager {
 	return &Manager{
 		Store:     st,
 		Projects:  pm,
 		Review:    rm,
 		Vault:     vault,
-		ClientID:  clientID,
-		HTTP:      http.DefaultClient,
-		APIBase:   "https://api.github.com",
-		LoginBase: "https://github.com",
-		Now:       time.Now,
+		GitHubCLI: "gh",
+		RunCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		},
+		HTTP:    http.DefaultClient,
+		APIBase: "https://api.github.com",
+		Now:     time.Now,
 	}
-}
-
-func (m *Manager) StartDeviceFlow(ctx context.Context) (DeviceStart, error) {
-	if m.ClientID == "" {
-		return DeviceStart{}, errors.New("github client_id not configured")
-	}
-	form := url.Values{"client_id": {m.ClientID}, "scope": {"repo read:org workflow"}}
-	var out DeviceStart
-	if err := m.postForm(ctx, m.LoginBase+"/login/device/code", "", form, &out); err != nil {
-		return DeviceStart{}, err
-	}
-	return out, nil
-}
-
-func (m *Manager) PollDeviceFlow(ctx context.Context, deviceCode string) (DevicePoll, error) {
-	form := url.Values{
-		"client_id":   {m.ClientID},
-		"device_code": {deviceCode},
-		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
-	}
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		Error       string `json:"error"`
-	}
-	if err := m.postForm(ctx, m.LoginBase+"/login/oauth/access_token", "", form, &tokenResp); err != nil {
-		return DevicePoll{}, err
-	}
-	switch tokenResp.Error {
-	case "authorization_pending":
-		return DevicePoll{}, ErrAuthPending
-	case "slow_down":
-		return DevicePoll{}, ErrSlowDown
-	case "expired_token":
-		return DevicePoll{}, ErrExpiredDeviceCode
-	case "":
-	default:
-		return DevicePoll{}, errors.New(tokenResp.Error)
-	}
-	if tokenResp.AccessToken == "" {
-		return DevicePoll{}, errors.New("github returned empty access_token")
-	}
-	user, err := m.viewer(ctx, tokenResp.AccessToken)
-	if err != nil {
-		return DevicePoll{}, err
-	}
-	path, err := m.Vault.Seal(user, tokenResp.AccessToken)
-	if err != nil {
-		return DevicePoll{}, err
-	}
-	if err := m.Store.PutGitHubToken(store.GitHubToken{
-		AccountLogin:   user,
-		CiphertextPath: path,
-		CreatedAt:      m.Now(),
-		UpdatedAt:      m.Now(),
-	}); err != nil {
-		return DevicePoll{}, err
-	}
-	_, _ = m.Review.LogAudit(store.AuditEntry{
-		Type:      "github.token.grant",
-		Actor:     "mobile",
-		Summary:   "GitHub token granted for " + user,
-		CreatedAt: m.Now(),
-	})
-	return DevicePoll{AccountLogin: user}, nil
 }
 
 func (m *Manager) ListRepos(ctx context.Context, account string, page, perPage int) ([]Repo, bool, error) {
-	token, err := m.token(account)
+	token, err := m.token(ctx, account)
 	if err != nil {
 		return nil, false, err
 	}
@@ -173,7 +97,7 @@ func (m *Manager) ListRepos(ctx context.Context, account string, page, perPage i
 }
 
 func (m *Manager) ImportRepo(ctx context.Context, account, fullName string) (store.Project, error) {
-	token, err := m.token(account)
+	token, err := m.token(ctx, account)
 	if err != nil {
 		return store.Project{}, err
 	}
@@ -223,7 +147,7 @@ func (m *Manager) Push(projectID, account, confirmationToken string, files []str
 		_, _ = m.logPush(projectID, false, err.Error())
 		return err
 	}
-	token, err := m.token(account)
+	token, err := m.token(context.Background(), account)
 	if err != nil {
 		_, _ = m.logPush(projectID, false, err.Error())
 		return err
@@ -263,7 +187,7 @@ func (m *Manager) DraftPR(projectID string) (string, string, error) {
 }
 
 func (m *Manager) CreatePR(ctx context.Context, account, repoFullName, head, base, title, body string) (PullRequest, error) {
-	token, err := m.token(account)
+	token, err := m.token(ctx, account)
 	if err != nil {
 		return PullRequest{}, err
 	}
@@ -284,7 +208,7 @@ func (m *Manager) CreatePR(ctx context.Context, account, repoFullName, head, bas
 }
 
 func (m *Manager) ListPRs(ctx context.Context, account, repoFullName string) ([]PullRequest, error) {
-	token, err := m.token(account)
+	token, err := m.token(ctx, account)
 	if err != nil {
 		return nil, err
 	}
@@ -316,36 +240,42 @@ func (m *Manager) ListPRs(ctx context.Context, account, repoFullName string) ([]
 }
 
 func (m *Manager) Revoke(ctx context.Context, account string) error {
-	row, err := m.Store.GetGitHubToken(account)
-	if err != nil {
-		return err
+	args := []string{"auth", "logout", "--hostname", "github.com"}
+	if strings.TrimSpace(account) != "" {
+		args = append(args, "--user", strings.TrimSpace(account))
 	}
-	if err := m.Vault.Delete(row.CiphertextPath); err != nil {
-		return err
+	if _, err := m.runGH(ctx, args...); err != nil {
+		return fmt.Errorf("%w: %s", ErrTokenMissing, err)
 	}
-	if err := m.Store.DeleteGitHubToken(account); err != nil {
-		return err
-	}
-	_, _ = m.Review.LogAudit(store.AuditEntry{Type: "github.token.revoke", Actor: "mobile", Summary: "GitHub token revoked for " + account, CreatedAt: m.Now()})
+	_, _ = m.Review.LogAudit(store.AuditEntry{Type: "github.token.revoke", Actor: "mobile", Summary: "GitHub CLI logged out", CreatedAt: m.Now()})
 	return nil
 }
 
-func (m *Manager) token(account string) (string, error) {
-	if account == "" {
-		rows, err := m.Store.ListGitHubTokens()
-		if err != nil {
-			return "", err
-		}
-		if len(rows) == 0 {
-			return "", ErrTokenMissing
-		}
-		account = rows[0].AccountLogin
+func (m *Manager) token(ctx context.Context, account string) (string, error) {
+	args := []string{"auth", "token", "--hostname", "github.com"}
+	if strings.TrimSpace(account) != "" {
+		args = append(args, "--user", strings.TrimSpace(account))
 	}
-	row, err := m.Store.GetGitHubToken(account)
+	out, err := m.runGH(ctx, args...)
 	if err != nil {
 		return "", ErrTokenMissing
 	}
-	return m.Vault.Open(account, row.CiphertextPath)
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		return "", ErrTokenMissing
+	}
+	return token, nil
+}
+
+func (m *Manager) runGH(ctx context.Context, args ...string) ([]byte, error) {
+	bin := strings.TrimSpace(m.GitHubCLI)
+	if bin == "" {
+		bin = "gh"
+	}
+	if m.RunCommand == nil {
+		return exec.CommandContext(ctx, bin, args...).CombinedOutput()
+	}
+	return m.RunCommand(ctx, bin, args...)
 }
 
 func (m *Manager) requireApproved(projectID string, files []string) error {
@@ -391,35 +321,9 @@ func (m *Manager) currentRevisions(projectID string, files []string) (map[string
 	return out, nil
 }
 
-func (m *Manager) viewer(ctx context.Context, token string) (string, error) {
-	var out struct {
-		Login string `json:"login"`
-	}
-	if err := m.getNoPage(ctx, m.APIBase+"/user", token, &out); err != nil {
-		return "", err
-	}
-	if out.Login == "" {
-		return "", errors.New("github viewer login missing")
-	}
-	return out.Login, nil
-}
-
 func (m *Manager) logPush(projectID string, ok bool, summary string) (store.AuditEntry, error) {
 	body, _ := json.Marshal(map[string]any{"ok": ok, "summary": summary})
 	return m.Review.LogAudit(store.AuditEntry{Type: "push.attempt", ProjectID: projectID, Actor: "mobile", Summary: summary, Data: string(body), CreatedAt: m.Now()})
-}
-
-func (m *Manager) postForm(ctx context.Context, endpoint, token string, form url.Values, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	return m.do(req, out)
 }
 
 func (m *Manager) postJSON(ctx context.Context, endpoint, token string, payload any, out any) error {

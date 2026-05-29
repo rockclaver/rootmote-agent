@@ -1,5 +1,5 @@
-// Package github implements GitHub OAuth, repository, commit, push, and pull
-// request operations for the agent.
+// Package github implements GitHub repository, commit, push, and pull request
+// operations for the agent.
 package github
 
 import (
@@ -18,8 +18,8 @@ import (
 
 const keyBytes = 32
 
-// TokenVault encrypts GitHub OAuth tokens into per-account blobs. SQLite stores
-// only blob paths; the plaintext token is returned only at call time.
+// TokenVault encrypts opaque CLI credentials into per-account or per-kind blobs.
+// SQLite stores only blob paths; plaintext is returned only at call time.
 type TokenVault struct {
 	KeyPath          string
 	BlobDir          string

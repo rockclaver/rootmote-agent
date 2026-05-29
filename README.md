@@ -24,6 +24,63 @@ go run ./cmd/claver-agent --addr 127.0.0.1:7676
 
 The agent refuses to start if `--addr` is anything other than a loopback IP.
 
+### Startup options
+
+| Flag | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `--addr` | | `127.0.0.1:7676` | Loopback bind address for the WebSocket control plane. |
+| `--data-dir` | | `$HOME/claver` | Directory for `state.db`, project workspaces, tool installs, and token vault files. |
+| `--caddy-fragments-dir` | `CLAVER_CADDY_FRAGMENTS_DIR` | `/etc/caddy/claver` | Directory where preview site-block fragments are written. |
+| `--preview-expected-ip` | `CLAVER_PREVIEW_EXPECTED_IP` | unset | Optional DNS guard; preview setup requires wildcard DNS to resolve to this IP. |
+| `--version` | | `false` | Print the installed agent version and exit. |
+
+Examples:
+
+```sh
+# Local development
+go run ./cmd/claver-agent \
+  --addr 127.0.0.1:7676 \
+  --data-dir ./claver-data
+```
+
+For a systemd install, prefer an override instead of editing the packaged unit:
+
+```sh
+sudo systemctl edit claver-agent
+```
+
+```ini
+[Service]
+Environment=CLAVER_PREVIEW_EXPECTED_IP=203.0.113.10
+```
+
+Then reload and restart:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart claver-agent
+```
+
+### GitHub setup
+
+GitHub imports use GitHub CLI authentication. No custom OAuth app, callback URL,
+or Client ID is required.
+
+Install `gh` on the VPS, then sign in as the same user that runs
+`claver-agent`:
+
+```sh
+sudo -u claver -H gh auth login \
+  --hostname github.com \
+  --git-protocol https \
+  --scopes repo,read:org,workflow \
+  --web
+```
+
+The mobile app can also start the same browser sign-in flow from **Import from
+GitHub**. Repository listing, imports, pushes, and PR creation read the active
+token with `gh auth token --hostname github.com`.
+
 ## Test
 
 ```sh

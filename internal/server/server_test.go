@@ -12,6 +12,8 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/cliauth"
+	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -116,6 +118,80 @@ func TestServerHealth_ReturnsVersionAndUptime(t *testing.T) {
 	}
 	if hp.UptimeS < 0 {
 		t.Errorf("uptime_s should be >= 0, got %d", hp.UptimeS)
+	}
+}
+
+func TestAuthStatus_AcceptsGitHubKind(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghBin := filepath.Join(binDir, "gh")
+	if err := os.WriteFile(ghBin, []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "gh version 2.0.0"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"hosts":{"github.com":[{"active":true,"user":"octo"}]}}'
+  exit 0
+fi
+exit 1
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := cliauth.New(cliauth.Config{
+		BinDir:  binDir,
+		HomeDir: dir,
+		Vault:   gh.NewTokenVault(filepath.Join(dir, "github.key"), filepath.Join(dir, "tokens")),
+		Store:   st,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Auth: auth})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]string{"kind": "github"})
+	req, _ := json.Marshal(Frame{ID: "github-status", Kind: "auth.status", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kind != "auth.status" {
+		t.Fatalf("kind = %s payload=%s", resp.Kind, string(resp.Payload))
+	}
+	var stResp struct {
+		Kind     string `json:"kind"`
+		LoggedIn bool   `json:"logged_in"`
+		Account  string `json:"account"`
+	}
+	if err := json.Unmarshal(resp.Payload, &stResp); err != nil {
+		t.Fatal(err)
+	}
+	if stResp.Kind != "github" || !stResp.LoggedIn || stResp.Account != "octo" {
+		t.Fatalf("status = %+v", stResp)
 	}
 }
 

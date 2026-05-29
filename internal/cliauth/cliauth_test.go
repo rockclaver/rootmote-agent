@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/rockclaver/claver/agent/internal/github"
@@ -114,6 +115,34 @@ func TestSetTokenRejectsBadKind(t *testing.T) {
 	m := newTestManager(t)
 	if _, err := m.SetToken(context.Background(), "nope", ModeToken, "x"); !errors.Is(err, ErrBadKind) {
 		t.Errorf("err = %v want ErrBadKind", err)
+	}
+}
+
+func TestStatusGitHubFromCLI(t *testing.T) {
+	m := newTestManager(t)
+	if err := os.MkdirAll(m.cfg.BinDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghBin := filepath.Join(m.cfg.BinDir, "gh")
+	if err := os.WriteFile(ghBin, []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "gh version 2.0.0"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"hosts":{"github.com":[{"active":true,"user":"octo"}]}}'
+  exit 0
+fi
+exit 1
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := m.Status(context.Background(), KindGitHub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LoggedIn || st.Method != MethodSubscription || st.Account != "octo" {
+		t.Fatalf("status = %+v", st)
 	}
 }
 
@@ -283,5 +312,8 @@ func TestLoginCommandArgs(t *testing.T) {
 	}
 	if got := loginCommandArgs(KindCodex, "/bin/codex"); got[0] != "/bin/codex" || got[1] != "login" {
 		t.Errorf("codex args = %#v", got)
+	}
+	if got := strings.Join(loginCommandArgs(KindGitHub, "/bin/gh"), " "); got != "/bin/gh auth login --hostname github.com --git-protocol https --scopes repo,read:org,workflow --web" {
+		t.Errorf("github args = %q", got)
 	}
 }

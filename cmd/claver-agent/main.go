@@ -24,7 +24,6 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
-	githubClientID := flag.String("github-client-id", os.Getenv("CLAVER_GITHUB_CLIENT_ID"), "GitHub OAuth device-flow client ID")
 	caddyFragmentsDir := flag.String("caddy-fragments-dir", envOr("CLAVER_CADDY_FRAGMENTS_DIR", "/etc/caddy/claver"), "directory for per-preview Caddy site blocks")
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -58,7 +57,7 @@ func main() {
 	}
 	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
 	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
-	githubMgr := gh.New(st, mgr, reviewMgr, vault, *githubClientID)
+	githubMgr := gh.New(st, mgr, reviewMgr, vault)
 
 	// cliauth reuses the same vault for CLI credentials. SQLite keeps the
 	// two namespaces separate (cli_tokens vs github_tokens).
