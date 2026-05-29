@@ -62,14 +62,28 @@ type Config struct {
 type Server struct {
 	cfg     Config
 	startAt time.Time
+	// seen tracks request ids that have already been dispatched. It is shared
+	// across WebSocket connections so a frame replayed on a fresh tunnel
+	// (after the previous one dropped) still short-circuits instead of
+	// re-executing the side-effect. Entries expire after replayWindow.
+	seen *idSet
 }
+
+// replayWindow bounds how long a request id remains in the dedupe cache.
+// Long enough to cover a flaky tunnel + backoff retries, short enough that
+// a real session id reuse (extremely unlikely) doesn't permanently block.
+const replayWindow = 5 * time.Minute
 
 // New constructs a Server. It does not bind any sockets.
 func New(cfg Config) *Server {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Server{cfg: cfg, startAt: cfg.Now()}
+	return &Server{
+		cfg:     cfg,
+		startAt: cfg.Now(),
+		seen:    newIDSet(1024, replayWindow, cfg.Now),
+	}
 }
 
 // ErrNonLoopbackBind is returned when the configured address is not loopback.
@@ -137,13 +151,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var writeMu sync.Mutex
-	// Per-connection request-id dedupe: when the mobile transport replays a
-	// frame after a tunnel drop (same id), short-circuit so we don't execute
-	// the side-effect twice. The response of the first execution is dropped
-	// by the dead WebSocket; clients re-issue with the same id so this branch
-	// fires on the retry. We ack the replay as session.replay; the client
-	// transport treats any frame matching the pending id as a completion.
-	seen := newIDSet(512)
+	// Request-id dedupe spans reconnects (the cache lives on Server, not this
+	// connection). When the mobile transport replays a frame after a tunnel
+	// drop on a new WebSocket, this branch still fires so side-effecting
+	// kinds like project.create / session.prompt don't execute twice.
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
@@ -154,7 +165,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.writeError(ctx, c, &writeMu, "", "bad_frame", err.Error())
 			continue
 		}
-		if f.ID != "" && seen.add(f.ID) {
+		if f.ID != "" && s.seen.add(f.ID) {
 			s.writeOK(ctx, c, &writeMu, f.ID, f.Kind, map[string]any{"replay": true})
 			continue
 		}
@@ -162,34 +173,61 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// idSet is a tiny FIFO-evicting set used for request-id dedupe over a single
-// WebSocket. Capacity is small (a few hundred) — enough to cover the in-flight
-// + recent-history window for a single client.
+// idSet tracks request ids that have already been dispatched. Entries expire
+// after the configured TTL so the map cannot grow unbounded over an agent's
+// lifetime; cap triggers oldest-first eviction if a burst of writes blows
+// past the TTL before sweep.
 type idSet struct {
-	mu    sync.Mutex
-	seen  map[string]struct{}
-	order []string
-	cap   int
+	mu     sync.Mutex
+	seen   map[string]time.Time
+	cap    int
+	ttl    time.Duration
+	now    func() time.Time
+	lastGC time.Time
 }
 
-func newIDSet(cap int) *idSet {
-	return &idSet{seen: make(map[string]struct{}, cap), order: make([]string, 0, cap), cap: cap}
+func newIDSet(cap int, ttl time.Duration, now func() time.Time) *idSet {
+	if now == nil {
+		now = time.Now
+	}
+	return &idSet{
+		seen: make(map[string]time.Time, cap),
+		cap:  cap,
+		ttl:  ttl,
+		now:  now,
+	}
 }
 
-// add returns true iff id was already present.
+// add returns true iff id is already in the cache (within TTL). The id is
+// inserted on the first call and refreshed on subsequent calls so an
+// actively-retried request keeps its dedupe entry alive.
 func (s *idSet) add(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.seen[id]; ok {
+	now := s.now()
+	if len(s.seen) >= s.cap || now.Sub(s.lastGC) > s.ttl {
+		for k, t := range s.seen {
+			if now.Sub(t) > s.ttl {
+				delete(s.seen, k)
+			}
+		}
+		s.lastGC = now
+	}
+	if t, ok := s.seen[id]; ok && now.Sub(t) <= s.ttl {
+		s.seen[id] = now
 		return true
 	}
-	if len(s.order) >= s.cap {
-		evict := s.order[0]
-		s.order = s.order[1:]
-		delete(s.seen, evict)
+	if len(s.seen) >= s.cap {
+		var oldestK string
+		var oldestT time.Time
+		for k, t := range s.seen {
+			if oldestK == "" || t.Before(oldestT) {
+				oldestK, oldestT = k, t
+			}
+		}
+		delete(s.seen, oldestK)
 	}
-	s.seen[id] = struct{}{}
-	s.order = append(s.order, id)
+	s.seen[id] = now
 	return false
 }
 
