@@ -16,6 +16,8 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
 
@@ -38,6 +40,8 @@ type Config struct {
 	Addr string
 	// Now returns the current time. Defaults to time.Now.
 	Now func() time.Time
+	// Projects, when non-nil, enables the project.* kinds.
+	Projects *projects.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -140,8 +144,135 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, f Frame) {
 			Version: version.Version,
 			UptimeS: uptime,
 		})
+	case "project.create",
+		"project.import",
+		"project.list",
+		"project.status",
+		"project.branch_create",
+		"project.branch_switch",
+		"project.delete":
+		s.dispatchProject(ctx, c, f)
 	default:
 		s.writeError(ctx, c, f.ID, "unknown_kind", f.Kind)
+	}
+}
+
+// ProjectDTO is the wire shape of a project row.
+type ProjectDTO struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	RemoteURL string `json:"remote_url,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func toDTO(p store.Project) ProjectDTO {
+	return ProjectDTO{ID: p.ID, Name: p.Name, RemoteURL: p.RemoteURL, CreatedAt: p.CreatedAt.Unix()}
+}
+
+func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, f Frame) {
+	if s.cfg.Projects == nil {
+		s.writeError(ctx, c, f.ID, "unavailable", "projects subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Projects
+	switch f.Kind {
+	case "project.create":
+		var in struct{ Name string `json:"name"` }
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Name == "" {
+			s.writeError(ctx, c, f.ID, "bad_payload", "name required")
+			return
+		}
+		p, err := mgr.CreateEmpty(in.Name)
+		if err != nil {
+			s.writeError(ctx, c, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, f.ID, "project.create", toDTO(p))
+	case "project.import":
+		var in struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Name == "" || in.URL == "" {
+			s.writeError(ctx, c, f.ID, "bad_payload", "name and url required")
+			return
+		}
+		p, err := mgr.Import(in.Name, in.URL)
+		if err != nil {
+			s.writeError(ctx, c, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, f.ID, "project.import", toDTO(p))
+	case "project.list":
+		ps, err := mgr.List()
+		if err != nil {
+			s.writeError(ctx, c, f.ID, "internal", err.Error())
+			return
+		}
+		out := make([]ProjectDTO, 0, len(ps))
+		for _, p := range ps {
+			out = append(out, toDTO(p))
+		}
+		s.writeOK(ctx, c, f.ID, "project.list", map[string]any{"projects": out})
+	case "project.status":
+		var in struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, f.ID, "bad_payload", "id required")
+			return
+		}
+		st, err := mgr.Status(in.ID)
+		if err != nil {
+			s.writeProjectErr(ctx, c, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, f.ID, "project.status", st)
+	case "project.branch_create", "project.branch_switch":
+		var in struct {
+			ID     string `json:"id"`
+			Branch string `json:"branch"`
+			Force  bool   `json:"force"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" || in.Branch == "" {
+			s.writeError(ctx, c, f.ID, "bad_payload", "id and branch required")
+			return
+		}
+		var err error
+		if f.Kind == "project.branch_create" {
+			err = mgr.BranchCreate(in.ID, in.Branch, in.Force)
+		} else {
+			err = mgr.BranchSwitch(in.ID, in.Branch, in.Force)
+		}
+		if err != nil {
+			s.writeProjectErr(ctx, c, f.ID, err)
+			return
+		}
+		st, _ := mgr.Status(in.ID)
+		s.writeOK(ctx, c, f.ID, f.Kind, st)
+	case "project.delete":
+		var in struct {
+			ID   string `json:"id"`
+			Wipe bool   `json:"wipe"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, f.ID, "bad_payload", "id required")
+			return
+		}
+		if err := mgr.Delete(in.ID, in.Wipe); err != nil {
+			s.writeProjectErr(ctx, c, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, f.ID, "project.delete", map[string]any{"id": in.ID, "wiped": in.Wipe})
+	}
+}
+
+func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, id string, err error) {
+	switch {
+	case errors.Is(err, projects.ErrDirtyTree):
+		s.writeError(ctx, c, id, "dirty_tree", err.Error())
+	case errors.Is(err, projects.ErrNotFound):
+		s.writeError(ctx, c, id, "not_found", err.Error())
+	default:
+		s.writeError(ctx, c, id, "internal", err.Error())
 	}
 }
 

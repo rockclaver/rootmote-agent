@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
 
@@ -17,7 +20,12 @@ import (
 // ws URL plus a cancel function.
 func startTestServer(t *testing.T) (wsURL string, stop func()) {
 	t.Helper()
-	srv := New(Config{Addr: "127.0.0.1:0"})
+	return startTestServerWith(t, Config{Addr: "127.0.0.1:0"})
+}
+
+func startTestServerWith(t *testing.T, cfg Config) (wsURL string, stop func()) {
+	t.Helper()
+	srv := New(cfg)
 	ln, err := srv.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -93,6 +101,91 @@ func TestServerHealth_ReturnsVersionAndUptime(t *testing.T) {
 	}
 	if hp.UptimeS < 0 {
 		t.Errorf("uptime_s should be >= 0, got %d", hp.UptimeS)
+	}
+}
+
+// AC: end-to-end wiring for project.create / project.list over WebSocket.
+func TestProject_CreateAndListOverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	// Create.
+	payload, _ := json.Marshal(map[string]string{"name": "demo"})
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "project.create", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "project.create" {
+		t.Fatalf("unexpected kind: %s", resp.Kind)
+	}
+	var p ProjectDTO
+	_ = json.Unmarshal(resp.Payload, &p)
+	if p.ID == "" || p.Name != "demo" {
+		t.Fatalf("bad dto: %+v", p)
+	}
+
+	// List should see it.
+	req, _ = json.Marshal(Frame{ID: "2", Kind: "project.list"})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	var list struct {
+		Projects []ProjectDTO `json:"projects"`
+	}
+	_ = json.Unmarshal(resp.Payload, &list)
+	if len(list.Projects) != 1 || list.Projects[0].ID != p.ID {
+		t.Fatalf("list mismatch: %+v", list)
+	}
+}
+
+// AC: project.* surface is unavailable without the projects manager wired in.
+func TestProject_Unavailable_WhenNotWired(t *testing.T) {
+	wsURL, stop := startTestServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "project.list"})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "error.unavailable" {
+		t.Errorf("got %q want error.unavailable", resp.Kind)
 	}
 }
 
