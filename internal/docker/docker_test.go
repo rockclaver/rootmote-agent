@@ -239,6 +239,26 @@ func TestContainerDetailRedactsEnvironmentAndMapsInspectFields(t *testing.T) {
 	}
 }
 
+// Review comment 3326987577: connection-string style environment keys must be
+// redacted because values commonly embed credentials.
+func TestRedactEnvRedactsConnectionStringKeys(t *testing.T) {
+	got := redactEnv([]string{
+		"DATABASE_URL=postgres://user:password@host/db",
+		"REDIS_URL=redis://:password@host:6379/0",
+		"MONGO_URI=mongodb://user:password@host/db",
+		"SENTRY_DSN=https://public:secret@sentry.example/1",
+		"PUBLIC_HOST=example.com",
+	})
+	for i, key := range []string{"DATABASE_URL", "REDIS_URL", "MONGO_URI", "SENTRY_DSN"} {
+		if got[i].Key != key || !got[i].Redacted || got[i].Value != "REDACTED" {
+			t.Fatalf("%s not redacted: %+v", key, got[i])
+		}
+	}
+	if got[4].Redacted {
+		t.Fatalf("non-secret host value should remain visible: %+v", got[4])
+	}
+}
+
 // wrap returns an error chain whose root is sentinel, so errors.Is works.
 func wrap(sentinel error, msg string) error {
 	return errWithCause{msg: msg, cause: sentinel}

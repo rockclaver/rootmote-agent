@@ -578,7 +578,17 @@ func redactEnv(env []string) []EnvSummary {
 
 func isSecretKey(key string) bool {
 	k := strings.ToUpper(key)
-	for _, needle := range []string{"SECRET", "TOKEN", "PASSWORD", "PASS", "KEY", "CREDENTIAL"} {
+	for _, needle := range []string{
+		"SECRET",
+		"TOKEN",
+		"PASSWORD",
+		"PASS",
+		"KEY",
+		"CREDENTIAL",
+		"URL",
+		"URI",
+		"DSN",
+	} {
 		if strings.Contains(k, needle) {
 			return true
 		}
