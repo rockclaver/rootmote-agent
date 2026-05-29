@@ -33,7 +33,7 @@ func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { 
 func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
 func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
 func (fakeSessionRuntime) Capture(context.Context, string) (string, error)    { return "", nil }
-func (fakeSessionRuntime) Alive(context.Context, string) bool                  { return true }
+func (fakeSessionRuntime) Alive(context.Context, string) bool                 { return true }
 
 // startTestServer brings up a server on a real loopback port and returns the
 // ws URL plus a cancel function.
