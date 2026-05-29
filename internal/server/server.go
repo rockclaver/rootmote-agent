@@ -257,6 +257,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"session.prompt",
 		"session.interrupt",
 		"session.stop",
+		"session.delete",
 		"session.list",
 		"session.subscribe",
 		"session.download":
@@ -514,6 +515,19 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.stop", map[string]any{"session_id": in.SessionID})
+	case "session.delete":
+		var in struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		if err := mgr.Delete(ctx, in.SessionID); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.delete", map[string]any{"session_id": in.SessionID})
 	case "session.list":
 		var in struct {
 			ProjectID string `json:"project_id"`

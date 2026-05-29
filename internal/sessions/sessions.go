@@ -35,6 +35,7 @@ type Runtime interface {
 	Interrupt(ctx context.Context, sessionID string) error
 	Stop(ctx context.Context, sessionID string) error
 	Capture(ctx context.Context, sessionID string) (string, error)
+	Alive(ctx context.Context, sessionID string) bool
 }
 
 type RuntimeSpec struct {
@@ -128,6 +129,64 @@ func (m *Manager) Stop(ctx context.Context, sessionID string) error {
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "lifecycle", Data: "stopped"})
 	return nil
+}
+
+// Delete stops the runtime (if still alive) and removes the session row and
+// its persisted event log. Live subscribers are dropped.
+func (m *Manager) Delete(ctx context.Context, sessionID string) error {
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	// Best-effort stop — ignore errors so a wedged tmux session can still
+	// be cleared from the UI.
+	_ = m.Runtime.Stop(ctx, sessionID)
+	if err := m.Store.DeleteSession(sessionID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	for ch := range m.subs[sessionID] {
+		delete(m.subs[sessionID], ch)
+		close(ch)
+	}
+	delete(m.subs, sessionID)
+	m.mu.Unlock()
+	return nil
+}
+
+// StartReaper periodically marks active sessions whose runtime has
+// disappeared as ended. Returns immediately; the goroutine exits when ctx
+// is cancelled.
+func (m *Manager) StartReaper(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.reapOnce(ctx)
+			}
+		}
+	}()
+}
+
+func (m *Manager) reapOnce(ctx context.Context) {
+	active, err := m.Store.ActiveSessions()
+	if err != nil {
+		return
+	}
+	for _, sess := range active {
+		if m.Runtime.Alive(ctx, sess.ID) {
+			continue
+		}
+		if err := m.Store.EndSession(sess.ID, m.Now()); err == nil {
+			_, _ = m.Publish(store.SessionEvent{SessionID: sess.ID, Type: "lifecycle", Data: "dead"})
+		}
+	}
 }
 
 func (m *Manager) List(projectID string) ([]store.Session, error) {
@@ -401,11 +460,78 @@ func (TmuxRuntime) Interrupt(ctx context.Context, sessionID string) error {
 }
 
 func (TmuxRuntime) Stop(ctx context.Context, sessionID string) error {
-	out, err := exec.CommandContext(ctx, "tmux", "kill-session", "-t", tmuxName(sessionID)).CombinedOutput()
+	name := tmuxName(sessionID)
+	// Snapshot pane PIDs *before* killing the tmux session so we can
+	// force-kill any descendants that ignore SIGHUP (codex notably does).
+	pids := tmuxPanePIDs(ctx, name)
+	out, err := exec.CommandContext(ctx, "tmux", "kill-session", "-t", name).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "can't find session") {
 		return fmt.Errorf("tmux stop: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	// SIGTERM, then SIGKILL stragglers (including their child trees).
+	for _, pid := range pids {
+		killTree(pid, syscall.SIGTERM)
+	}
+	if len(pids) > 0 {
+		time.Sleep(150 * time.Millisecond)
+		for _, pid := range pids {
+			killTree(pid, syscall.SIGKILL)
+		}
+	}
 	return nil
+}
+
+func (TmuxRuntime) Alive(ctx context.Context, sessionID string) bool {
+	err := exec.CommandContext(ctx, "tmux", "has-session", "-t", tmuxName(sessionID)).Run()
+	return err == nil
+}
+
+func tmuxPanePIDs(ctx context.Context, name string) []int {
+	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-t", name, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(line, "%d", &pid); err == nil && pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// killTree signals pid and every descendant process. Errors are ignored —
+// the process may already be gone, or we may lack permission, and the
+// caller has already given up on graceful shutdown.
+func killTree(pid int, sig syscall.Signal) {
+	for _, p := range append([]int{pid}, descendantPIDs(pid)...) {
+		_ = syscall.Kill(p, sig)
+	}
+}
+
+func descendantPIDs(root int) []int {
+	out, err := exec.Command("pgrep", "-P", fmt.Sprintf("%d", root)).Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(line, "%d", &pid); err == nil && pid > 0 {
+			pids = append(pids, pid)
+			pids = append(pids, descendantPIDs(pid)...)
+		}
+	}
+	return pids
 }
 
 func (TmuxRuntime) Capture(ctx context.Context, sessionID string) (string, error) {

@@ -19,6 +19,7 @@ type fakeRuntime struct {
 	interrupts  int
 	stops       int
 	captureText string
+	dead        bool
 }
 
 func (f *fakeRuntime) Start(_ context.Context, spec RuntimeSpec) error {
@@ -45,6 +46,9 @@ func (f *fakeRuntime) Stop(context.Context, string) error {
 }
 func (f *fakeRuntime) Capture(context.Context, string) (string, error) {
 	return f.captureText, nil
+}
+func (f *fakeRuntime) Alive(context.Context, string) bool {
+	return !f.dead
 }
 
 func newTestManager(t *testing.T) (*Manager, *fakeRuntime) {

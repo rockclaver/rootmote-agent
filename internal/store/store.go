@@ -419,6 +419,12 @@ func (s *Store) EndSession(id string, endedAt time.Time) error {
 	return err
 }
 
+// DeleteSession removes the session row; FK cascade drops session_events.
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	return err
+}
+
 // UpdateSessionUsage stores parsed agent token usage.
 func (s *Store) UpdateSessionUsage(id string, inputTokens, outputTokens int) error {
 	_, err := s.db.Exec(

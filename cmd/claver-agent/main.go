@@ -108,6 +108,7 @@ func main() {
 	if err := sessionMgr.Rehydrate(ctx); err != nil {
 		log.Printf("claver-agent: rehydrate sessions: %v", err)
 	}
+	sessionMgr.StartReaper(ctx, 0)
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}
