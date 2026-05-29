@@ -18,6 +18,7 @@ import (
 	"nhooyr.io/websocket"
 
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -53,6 +54,8 @@ type Config struct {
 	Review *review.Manager
 	// GitHub, when non-nil, enables github.* kinds.
 	GitHub *gh.Manager
+	// Previews, when non-nil, enables preview.* kinds.
+	Previews *previews.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -181,6 +184,16 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"auth.confirm",
 		"audit.list":
 		s.dispatchReview(ctx, c, writeMu, f)
+	case "preview.setup_domain",
+		"preview.get_domain",
+		"preview.dns_validate",
+		"preview.start",
+		"preview.stop",
+		"preview.restart",
+		"preview.list",
+		"preview.get",
+		"preview.active":
+		s.dispatchPreview(ctx, c, writeMu, f)
 	case "github.device_start",
 		"github.device_poll",
 		"github.repo_list",
@@ -868,6 +881,203 @@ func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, writeMu
 	default:
 		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
 	}
+}
+
+// PreviewDTO is the wire shape of one preview row.
+type PreviewDTO struct {
+	ID         string `json:"id"`
+	ProjectID  string `json:"project_id"`
+	Subdomain  string `json:"subdomain"`
+	BaseDomain string `json:"base_domain"`
+	URL        string `json:"url"`
+	Command    string `json:"command"`
+	Port       int    `json:"port"`
+	Status     string `json:"status"`
+	LastError  string `json:"last_error,omitempty"`
+	StartedAt  int64  `json:"started_at"`
+	EndedAt    *int64 `json:"ended_at,omitempty"`
+}
+
+func toPreviewDTO(p store.Preview) PreviewDTO {
+	var ended *int64
+	if p.EndedAt != nil {
+		v := p.EndedAt.Unix()
+		ended = &v
+	}
+	return PreviewDTO{
+		ID: p.ID, ProjectID: p.ProjectID,
+		Subdomain: p.Subdomain, BaseDomain: p.BaseDomain,
+		URL: p.URL, Command: p.Command, Port: p.Port,
+		Status: p.Status, LastError: p.LastError,
+		StartedAt: p.StartedAt.Unix(), EndedAt: ended,
+	}
+}
+
+func (s *Server) dispatchPreview(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.Previews == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "previews subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Previews
+	switch f.Kind {
+	case "preview.get_domain":
+		base, err := mgr.BaseDomain()
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{
+			"base_domain":  base,
+			"cert_warmup":  int64(mgr.CertWarmup().Seconds()),
+			"is_setup":     base != "",
+			"sample_host":  sampleHost(base),
+			"wildcard_dns": wildcardDNSHint(base),
+		})
+	case "preview.setup_domain":
+		var in struct {
+			BaseDomain string `json:"base_domain"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.BaseDomain == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "base_domain required")
+			return
+		}
+		base, err := mgr.SetupDomain(in.BaseDomain)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{
+			"base_domain":  base,
+			"wildcard_dns": wildcardDNSHint(base),
+		})
+	case "preview.dns_validate":
+		res, err := mgr.ValidateDNS(ctx)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, res)
+	case "preview.start":
+		var in struct {
+			ProjectID string `json:"project_id"`
+			Command   string `json:"command"`
+			Port      int    `json:"port"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		row, err := mgr.Start(ctx, previews.StartRequest{
+			ProjectID: in.ProjectID, Command: in.Command, Port: in.Port,
+		})
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
+	case "preview.stop":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		if err := mgr.Stop(ctx, in.ID); err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		row, _ := mgr.Get(in.ID)
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
+	case "preview.restart":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		row, err := mgr.Restart(ctx, in.ID)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
+	case "preview.list":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		rows, err := mgr.List(in.ProjectID)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		out := make([]PreviewDTO, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, toPreviewDTO(r))
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"previews": out})
+	case "preview.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		row, err := mgr.Get(in.ID)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
+	case "preview.active":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		row, err := mgr.Active(in.ProjectID)
+		if err != nil {
+			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
+	}
+}
+
+func (s *Server) writePreviewErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+	switch {
+	case errors.Is(err, previews.ErrBaseDomainUnset):
+		s.writeError(ctx, c, writeMu, id, "preview_no_domain", err.Error())
+	case errors.Is(err, previews.ErrDNSValidationFailed):
+		s.writeError(ctx, c, writeMu, id, "preview_dns_failed", err.Error())
+	case errors.Is(err, previews.ErrAlreadyRunning):
+		s.writeError(ctx, c, writeMu, id, "preview_already_running", err.Error())
+	case errors.Is(err, previews.ErrPortUnknown):
+		s.writeError(ctx, c, writeMu, id, "preview_port_unknown", err.Error())
+	case errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
+		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
+	default:
+		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
+	}
+}
+
+func sampleHost(base string) string {
+	if base == "" {
+		return ""
+	}
+	return "preview-abc123." + base
+}
+
+func wildcardDNSHint(base string) string {
+	if base == "" {
+		return ""
+	}
+	return "*." + base
 }
 
 func (s *Server) writeOK(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id, kind string, payload any) {

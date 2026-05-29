@@ -79,6 +79,31 @@ type DiffSummary struct {
 	CreatedAt time.Time
 }
 
+// Preview is the persisted record of a per-project dev-server preview.
+// One project may have at most one active preview at a time. Inactive rows
+// are retained so the UI can show preview history.
+type Preview struct {
+	ID         string
+	ProjectID  string
+	Subdomain  string
+	BaseDomain string
+	URL        string
+	Command    string
+	Port       int
+	PGID       int
+	Status     string // "starting" | "running" | "stopped" | "failed"
+	LastError  string
+	StartedAt  time.Time
+	EndedAt    *time.Time
+}
+
+// AgentSetting is one row in the agent's key/value config table. It is used
+// for sticky, agent-wide configuration like the user's preview base domain.
+type AgentSetting struct {
+	Key   string
+	Value string
+}
+
 // GitHubToken stores the encrypted OAuth access token material for one agent.
 // CiphertextPath points at the on-disk encrypted blob; token plaintext never
 // lives in SQLite.
@@ -186,6 +211,30 @@ CREATE TABLE IF NOT EXISTS github_tokens (
 	ciphertext_path TEXT NOT NULL,
 	created_at      INTEGER NOT NULL,
 	updated_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS previews (
+	id          TEXT PRIMARY KEY,
+	project_id  TEXT NOT NULL,
+	subdomain   TEXT NOT NULL,
+	base_domain TEXT NOT NULL,
+	url         TEXT NOT NULL,
+	command     TEXT NOT NULL DEFAULT '',
+	port        INTEGER NOT NULL DEFAULT 0,
+	pgid        INTEGER NOT NULL DEFAULT 0,
+	status      TEXT NOT NULL,
+	last_error  TEXT NOT NULL DEFAULT '',
+	started_at  INTEGER NOT NULL,
+	ended_at    INTEGER,
+	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS previews_project_idx ON previews(project_id);
+CREATE INDEX IF NOT EXISTS previews_status_idx  ON previews(status);
+
+CREATE TABLE IF NOT EXISTS agent_settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
 );
 `)
 	return err
@@ -617,6 +666,154 @@ func (s *Store) ListGitHubTokens() ([]GitHubToken, error) {
 // DeleteGitHubToken removes one token pointer.
 func (s *Store) DeleteGitHubToken(accountLogin string) error {
 	_, err := s.db.Exec(`DELETE FROM github_tokens WHERE account_login = ?`, accountLogin)
+	return err
+}
+
+// CreatePreview inserts a new preview row.
+func (s *Store) CreatePreview(p Preview) error {
+	if p.StartedAt.IsZero() {
+		p.StartedAt = time.Now()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO previews (id, project_id, subdomain, base_domain, url, command, port, pgid, status, last_error, started_at, ended_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.ProjectID, p.Subdomain, p.BaseDomain, p.URL, p.Command,
+		p.Port, p.PGID, p.Status, p.LastError, p.StartedAt.Unix(), nullableUnix(p.EndedAt),
+	)
+	return err
+}
+
+// UpdatePreview overwrites the mutable columns of a preview row.
+func (s *Store) UpdatePreview(p Preview) error {
+	_, err := s.db.Exec(
+		`UPDATE previews SET port = ?, pgid = ?, status = ?, last_error = ?, ended_at = ? WHERE id = ?`,
+		p.Port, p.PGID, p.Status, p.LastError, nullableUnix(p.EndedAt), p.ID,
+	)
+	return err
+}
+
+// GetPreview loads a preview row by ID.
+func (s *Store) GetPreview(id string) (Preview, error) {
+	row := s.db.QueryRow(
+		`SELECT id, project_id, subdomain, base_domain, url, command, port, pgid, status, last_error, started_at, ended_at
+		 FROM previews WHERE id = ?`, id,
+	)
+	return scanPreview(row)
+}
+
+// ActivePreviewForProject returns the currently running/starting preview for
+// the given project, if any. Returns ErrNotFound when no active row exists.
+func (s *Store) ActivePreviewForProject(projectID string) (Preview, error) {
+	row := s.db.QueryRow(
+		`SELECT id, project_id, subdomain, base_domain, url, command, port, pgid, status, last_error, started_at, ended_at
+		 FROM previews
+		 WHERE project_id = ? AND ended_at IS NULL
+		 ORDER BY started_at DESC LIMIT 1`, projectID,
+	)
+	return scanPreview(row)
+}
+
+// ListPreviews returns previews ordered newest first, optionally filtered by
+// project ID. Pass "" to list across all projects.
+func (s *Store) ListPreviews(projectID string) ([]Preview, error) {
+	rows, err := s.db.Query(
+		`SELECT id, project_id, subdomain, base_domain, url, command, port, pgid, status, last_error, started_at, ended_at
+		 FROM previews
+		 WHERE (? = '' OR project_id = ?)
+		 ORDER BY started_at DESC, id DESC`, projectID, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Preview, 0)
+	for rows.Next() {
+		p, err := scanPreviewRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ActivePreviews returns every preview that has not yet been marked stopped.
+// The agent uses this during rehydration after a restart.
+func (s *Store) ActivePreviews() ([]Preview, error) {
+	rows, err := s.db.Query(
+		`SELECT id, project_id, subdomain, base_domain, url, command, port, pgid, status, last_error, started_at, ended_at
+		 FROM previews WHERE ended_at IS NULL ORDER BY started_at ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Preview, 0)
+	for rows.Next() {
+		p, err := scanPreviewRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeletePreview removes a preview row entirely. Used when a preview is torn
+// down after a successful stop.
+func (s *Store) DeletePreview(id string) error {
+	_, err := s.db.Exec(`DELETE FROM previews WHERE id = ?`, id)
+	return err
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPreview(row rowScanner) (Preview, error) {
+	p, err := scanPreviewRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Preview{}, fmt.Errorf("preview: %w", ErrNotFound)
+	}
+	return p, err
+}
+
+func scanPreviewRow(row rowScanner) (Preview, error) {
+	var p Preview
+	var started int64
+	var ended sql.NullInt64
+	if err := row.Scan(&p.ID, &p.ProjectID, &p.Subdomain, &p.BaseDomain, &p.URL, &p.Command, &p.Port, &p.PGID, &p.Status, &p.LastError, &started, &ended); err != nil {
+		return Preview{}, err
+	}
+	p.StartedAt = time.Unix(started, 0)
+	if ended.Valid {
+		t := time.Unix(ended.Int64, 0)
+		p.EndedAt = &t
+	}
+	return p, nil
+}
+
+// GetAgentSetting reads one key from the agent_settings table. Returns
+// ErrNotFound when the key has never been set.
+func (s *Store) GetAgentSetting(key string) (string, error) {
+	row := s.db.QueryRow(`SELECT value FROM agent_settings WHERE key = ?`, key)
+	var v string
+	if err := row.Scan(&v); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("agent_setting %s: %w", key, ErrNotFound)
+		}
+		return "", err
+	}
+	return v, nil
+}
+
+// PutAgentSetting upserts one key.
+func (s *Store) PutAgentSetting(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO agent_settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value,
+	)
 	return err
 }
 

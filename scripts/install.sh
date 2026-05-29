@@ -18,6 +18,9 @@ RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver/releases/down
 BIN_DST="/usr/local/bin/claver-agent"
 UNIT_DST="/etc/systemd/system/claver-agent.service"
 STATE_DIR="/var/lib/claver"
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_FRAGMENTS_DIR="/etc/caddy/claver"
+CADDY_IMPORT_LINE="import ${CADDY_FRAGMENTS_DIR}/*.caddy"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +70,49 @@ systemctl enable claver-agent.service
 # `enable --now` only starts inactive units; on re-install we have just
 # overwritten the binary, so restart unconditionally to pick it up.
 systemctl restart claver-agent.service
+
+# --- Phase 7: Caddy for live previews -------------------------------------
+# Install Caddy if absent. The agent writes per-preview fragments into
+# /etc/caddy/claver/*.caddy; the main Caddyfile must `import` that glob.
+if ! command -v caddy >/dev/null 2>&1; then
+  echo "installing caddy" >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+      > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update
+    apt-get install -y caddy
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y 'dnf-command(copr)'
+    dnf copr enable -y @caddy/caddy
+    dnf install -y caddy
+  else
+    echo "warning: no supported package manager found; install caddy manually" >&2
+  fi
+fi
+
+install -d -o caddy -g caddy -m 0755 "$CADDY_FRAGMENTS_DIR" 2>/dev/null \
+  || install -d -m 0755 "$CADDY_FRAGMENTS_DIR"
+
+# Ensure the main Caddyfile exists and imports our fragments glob. The check
+# is intentionally a literal grep so re-runs of the installer are idempotent.
+if [[ ! -f "$CADDYFILE" ]]; then
+  mkdir -p "$(dirname "$CADDYFILE")"
+  cat > "$CADDYFILE" <<EOF
+# Managed by claver-agent installer.
+# Per-preview reverse-proxy site blocks live in $CADDY_FRAGMENTS_DIR.
+$CADDY_IMPORT_LINE
+EOF
+elif ! grep -Fq "$CADDY_IMPORT_LINE" "$CADDYFILE"; then
+  printf '\n# Added by claver-agent installer.\n%s\n' "$CADDY_IMPORT_LINE" >> "$CADDYFILE"
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl enable --now caddy 2>/dev/null || true
+  systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+fi
 
 # Phase 1 AC: print installed version to stdout.
 "$BIN_DST" --version
