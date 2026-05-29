@@ -22,9 +22,9 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-# Agent only listens on loopback; deny any attempt to reach the public net.
-IPAddressAllow=localhost
-IPAddressDeny=any
+# The agent's *listener* is locked to loopback by an in-process self-check
+# (assertLoopback). It still needs outbound network to clone repos, talk to
+# GitHub (Device Flow, Phase 6), etc., so we leave egress open here.
 ReadWritePaths=/var/lib/claver
 
 [Install]
