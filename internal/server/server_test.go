@@ -119,6 +119,143 @@ func TestServerHealth_ReturnsVersionAndUptime(t *testing.T) {
 	}
 }
 
+// Phase 9 AC1: a replayed request id arriving on the SAME connection is not
+// re-executed; the second arrival is answered with a replay marker.
+func TestServer_DedupesReplayedFrameID_SameConnection(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]string{"name": "demo"})
+	req, _ := json.Marshal(Frame{ID: "dup-1", Kind: "project.create", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, _ := c.Read(ctx)
+	var first Frame
+	_ = json.Unmarshal(data, &first)
+	if first.Kind != "project.create" {
+		t.Fatalf("first call: %s", first.Kind)
+	}
+
+	// Replay with the same id; should be answered without creating a second project.
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, _ = c.Read(ctx)
+	var second Frame
+	_ = json.Unmarshal(data, &second)
+	var pl struct {
+		Replay bool `json:"replay"`
+	}
+	_ = json.Unmarshal(second.Payload, &pl)
+	if !pl.Replay {
+		t.Fatalf("expected replay marker, got %s/%s", second.Kind, string(second.Payload))
+	}
+
+	listReq, _ := json.Marshal(Frame{ID: "list-1", Kind: "project.list"})
+	_ = c.Write(ctx, websocket.MessageText, listReq)
+	_, data, _ = c.Read(ctx)
+	var listFrame Frame
+	_ = json.Unmarshal(data, &listFrame)
+	var list struct {
+		Projects []ProjectDTO `json:"projects"`
+	}
+	_ = json.Unmarshal(listFrame.Payload, &list)
+	if len(list.Projects) != 1 {
+		t.Fatalf("replayed call double-created projects: %+v", list.Projects)
+	}
+}
+
+// Phase 9 AC1 (review #3324241271): a replayed request id arriving on a NEW
+// WebSocket — the realistic post-tunnel-drop case — must also dedupe, so the
+// dedupe cache has to live on Server, not per-connection.
+func TestServer_DedupesReplayedFrameID_AcrossReconnect(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First WebSocket: send project.create, then drop the connection.
+	c1, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"name": "demo"})
+	req, _ := json.Marshal(Frame{ID: "reconnect-1", Kind: "project.create", Payload: payload})
+	if err := c1.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, _ := c1.Read(ctx)
+	var first Frame
+	_ = json.Unmarshal(data, &first)
+	if first.Kind != "project.create" {
+		t.Fatalf("first call: %s", first.Kind)
+	}
+	_ = c1.Close(websocket.StatusNormalClosure, "")
+
+	// Second WebSocket: same id, simulating client-side replay after a drop.
+	c2, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close(websocket.StatusNormalClosure, "")
+	if err := c2.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, _ = c2.Read(ctx)
+	var second Frame
+	_ = json.Unmarshal(data, &second)
+	var pl struct {
+		Replay bool `json:"replay"`
+	}
+	_ = json.Unmarshal(second.Payload, &pl)
+	if !pl.Replay {
+		t.Fatalf("cross-connection replay was re-executed, got %s/%s", second.Kind, string(second.Payload))
+	}
+
+	listReq, _ := json.Marshal(Frame{ID: "list-rc", Kind: "project.list"})
+	_ = c2.Write(ctx, websocket.MessageText, listReq)
+	_, data, _ = c2.Read(ctx)
+	var listFrame Frame
+	_ = json.Unmarshal(data, &listFrame)
+	var list struct {
+		Projects []ProjectDTO `json:"projects"`
+	}
+	_ = json.Unmarshal(listFrame.Payload, &list)
+	if len(list.Projects) != 1 {
+		t.Fatalf("cross-connection replay double-created projects: %+v", list.Projects)
+	}
+}
+
 // AC: end-to-end wiring for project.create / project.list over WebSocket.
 func TestProject_CreateAndListOverWS(t *testing.T) {
 	dir := t.TempDir()
