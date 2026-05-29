@@ -84,6 +84,13 @@ func (m *Manager) CreateEmpty(name string) (store.Project, error) {
 
 // Import clones an existing repository by URL into the project's workspace.
 func (m *Manager) Import(name, url string) (store.Project, error) {
+	return m.ImportWithEnv(name, url, nil)
+}
+
+// ImportWithEnv clones an existing repository with additional git environment.
+// Callers use this for one-shot credentials such as GitHub extraHeader values;
+// persisted project state keeps only the clean remote URL.
+func (m *Manager) ImportWithEnv(name, url string, env []string) (store.Project, error) {
 	if url == "" {
 		return store.Project{}, errors.New("import: url is required")
 	}
@@ -92,7 +99,7 @@ func (m *Manager) Import(name, url string) (store.Project, error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return store.Project{}, err
 	}
-	if _, err := run(m.Root, "git", "clone", "--quiet", url, dir); err != nil {
+	if _, err := runWithEnv(m.Root, env, "git", "clone", "--quiet", url, dir); err != nil {
 		_ = os.RemoveAll(dir)
 		return store.Project{}, fmt.Errorf("git clone: %w", err)
 	}
@@ -215,6 +222,10 @@ func (m *Manager) Delete(id string, wipe bool) error {
 }
 
 func run(dir, name string, args ...string) (string, error) {
+	return runWithEnv(dir, nil, name, args...)
+}
+
+func runWithEnv(dir string, extraEnv []string, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	// Quieter, deterministic git: no pager, English messages.
@@ -223,6 +234,7 @@ func run(dir, name string, args ...string) (string, error) {
 		"LC_ALL=C",
 		"GIT_PAGER=cat",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))

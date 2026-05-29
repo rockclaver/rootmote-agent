@@ -17,6 +17,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -50,6 +51,8 @@ type Config struct {
 	// Review, when non-nil, enables the diff.*, review.*, auth.confirm,
 	// and audit.list kinds.
 	Review *review.Manager
+	// GitHub, when non-nil, enables github.* kinds.
+	GitHub *gh.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -178,6 +181,17 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"auth.confirm",
 		"audit.list":
 		s.dispatchReview(ctx, c, writeMu, f)
+	case "github.device_start",
+		"github.device_poll",
+		"github.repo_list",
+		"github.repo_import",
+		"github.commit",
+		"github.push",
+		"github.pr_draft",
+		"github.pr_create",
+		"github.pr_list",
+		"github.revoke":
+		s.dispatchGitHub(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -647,6 +661,185 @@ func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu 
 	case errors.Is(err, review.ErrSessionMismatch):
 		s.writeError(ctx, c, writeMu, id, "session_mismatch", err.Error())
 	case errors.Is(err, review.ErrNotFound), errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
+		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
+	default:
+		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
+	}
+}
+
+func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.GitHub == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "github subsystem not configured")
+		return
+	}
+	mgr := s.cfg.GitHub
+	switch f.Kind {
+	case "github.device_start":
+		out, err := mgr.StartDeviceFlow(ctx)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, out)
+	case "github.device_poll":
+		var in struct {
+			DeviceCode string `json:"device_code"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.DeviceCode == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "device_code required")
+			return
+		}
+		out, err := mgr.PollDeviceFlow(ctx, in.DeviceCode)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, out)
+	case "github.repo_list":
+		var in struct {
+			Account string `json:"account"`
+			Page    int    `json:"page"`
+			PerPage int    `json:"per_page"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		repos, hasNext, err := mgr.ListRepos(ctx, in.Account, in.Page, in.PerPage)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"repos": repos, "has_next": hasNext})
+	case "github.repo_import":
+		var in struct {
+			Account  string `json:"account"`
+			FullName string `json:"full_name"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.FullName == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "full_name required")
+			return
+		}
+		p, err := mgr.ImportRepo(ctx, in.Account, in.FullName)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toDTO(p))
+	case "github.commit":
+		var in struct {
+			ProjectID string   `json:"project_id"`
+			Message   string   `json:"message"`
+			Files     []string `json:"files"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || in.Message == "" || len(in.Files) == 0 {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id, message and files required")
+			return
+		}
+		sha, err := mgr.Commit(in.ProjectID, in.Message, in.Files)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]string{"sha": sha})
+	case "github.push":
+		var in struct {
+			ProjectID         string   `json:"project_id"`
+			Account           string   `json:"account"`
+			ConfirmationToken string   `json:"confirmation_token"`
+			Files             []string `json:"files"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		if err := mgr.Push(in.ProjectID, in.Account, in.ConfirmationToken, in.Files); err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]string{"project_id": in.ProjectID})
+	case "github.pr_draft":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		title, body, err := mgr.DraftPR(in.ProjectID)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]string{"title": title, "body": body})
+	case "github.pr_create":
+		var in struct {
+			Account string `json:"account"`
+			Repo    string `json:"repo"`
+			Head    string `json:"head"`
+			Base    string `json:"base"`
+			Title   string `json:"title"`
+			Body    string `json:"body"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Repo == "" || in.Head == "" || in.Base == "" || in.Title == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "repo, head, base and title required")
+			return
+		}
+		pr, err := mgr.CreatePR(ctx, in.Account, in.Repo, in.Head, in.Base, in.Title, in.Body)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, pr)
+	case "github.pr_list":
+		var in struct {
+			Account string `json:"account"`
+			Repo    string `json:"repo"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Repo == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "repo required")
+			return
+		}
+		prs, err := mgr.ListPRs(ctx, in.Account, in.Repo)
+		if err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"pull_requests": prs})
+	case "github.revoke":
+		var in struct {
+			Account string `json:"account"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Account == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "account required")
+			return
+		}
+		if err := mgr.Revoke(ctx, in.Account); err != nil {
+			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]string{"account": in.Account})
+	}
+}
+
+func (s *Server) writeGitHubErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+	switch {
+	case errors.Is(err, gh.ErrAuthPending):
+		s.writeError(ctx, c, writeMu, id, "github_pending", err.Error())
+	case errors.Is(err, gh.ErrSlowDown):
+		s.writeError(ctx, c, writeMu, id, "github_slow_down", err.Error())
+	case errors.Is(err, gh.ErrExpiredDeviceCode):
+		s.writeError(ctx, c, writeMu, id, "github_device_expired", err.Error())
+	case errors.Is(err, gh.ErrTokenMissing):
+		s.writeError(ctx, c, writeMu, id, "github_reauth_required", err.Error())
+	case errors.Is(err, gh.ErrUnapprovedChanges):
+		s.writeError(ctx, c, writeMu, id, "unapproved_changes", err.Error())
+	case errors.Is(err, gh.ErrConfirmationNeeded), errors.Is(err, review.ErrTokenInvalid):
+		s.writeError(ctx, c, writeMu, id, "token_invalid", err.Error())
+	case errors.Is(err, review.ErrTokenUsed):
+		s.writeError(ctx, c, writeMu, id, "token_used", err.Error())
+	case errors.Is(err, review.ErrTokenExpired):
+		s.writeError(ctx, c, writeMu, id, "token_expired", err.Error())
+	case errors.Is(err, review.ErrTokenMismatch):
+		s.writeError(ctx, c, writeMu, id, "token_mismatch", err.Error())
+	case errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
 		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
 	default:
 		s.writeError(ctx, c, writeMu, id, "internal", err.Error())

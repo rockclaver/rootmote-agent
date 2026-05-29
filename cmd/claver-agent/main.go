@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/server"
@@ -20,6 +21,7 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
+	githubClientID := flag.String("github-client-id", os.Getenv("CLAVER_GITHUB_CLIENT_ID"), "GitHub OAuth device-flow client ID")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -44,12 +46,15 @@ func main() {
 	}
 	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{})
 	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
+	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
+	githubMgr := gh.New(st, mgr, reviewMgr, vault, *githubClientID)
 
 	srv := server.New(server.Config{
 		Addr:     *addr,
 		Projects: mgr,
 		Sessions: sessionMgr,
 		Review:   reviewMgr,
+		GitHub:   githubMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {

@@ -79,6 +79,16 @@ type DiffSummary struct {
 	CreatedAt time.Time
 }
 
+// GitHubToken stores the encrypted OAuth access token material for one agent.
+// CiphertextPath points at the on-disk encrypted blob; token plaintext never
+// lives in SQLite.
+type GitHubToken struct {
+	AccountLogin   string
+	CiphertextPath string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -169,6 +179,13 @@ CREATE TABLE IF NOT EXISTS diff_summaries (
 	summary    TEXT NOT NULL,
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY(project_id, path, revision)
+);
+
+CREATE TABLE IF NOT EXISTS github_tokens (
+	account_login   TEXT PRIMARY KEY,
+	ciphertext_path TEXT NOT NULL,
+	created_at      INTEGER NOT NULL,
+	updated_at      INTEGER NOT NULL
 );
 `)
 	return err
@@ -530,6 +547,76 @@ func (s *Store) PutDiffSummary(d DiffSummary) error {
 		 ON CONFLICT(project_id, path, revision) DO UPDATE SET summary = excluded.summary`,
 		d.ProjectID, d.Path, d.Revision, d.Summary, d.CreatedAt.Unix(),
 	)
+	return err
+}
+
+// PutGitHubToken upserts the encrypted token pointer for the authenticated
+// GitHub account.
+func (s *Store) PutGitHubToken(t GitHubToken) error {
+	now := time.Now()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
+	}
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = now
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO github_tokens (account_login, ciphertext_path, created_at, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(account_login) DO UPDATE SET
+		   ciphertext_path = excluded.ciphertext_path,
+		   updated_at = excluded.updated_at`,
+		t.AccountLogin, t.CiphertextPath, t.CreatedAt.Unix(), t.UpdatedAt.Unix(),
+	)
+	return err
+}
+
+// GetGitHubToken loads the token pointer for one GitHub account.
+func (s *Store) GetGitHubToken(accountLogin string) (GitHubToken, error) {
+	row := s.db.QueryRow(
+		`SELECT account_login, ciphertext_path, created_at, updated_at
+		 FROM github_tokens WHERE account_login = ?`, accountLogin,
+	)
+	var t GitHubToken
+	var created, updated int64
+	if err := row.Scan(&t.AccountLogin, &t.CiphertextPath, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return GitHubToken{}, fmt.Errorf("github_token: %w", ErrNotFound)
+		}
+		return GitHubToken{}, err
+	}
+	t.CreatedAt = time.Unix(created, 0)
+	t.UpdatedAt = time.Unix(updated, 0)
+	return t, nil
+}
+
+// ListGitHubTokens returns all stored token pointers.
+func (s *Store) ListGitHubTokens() ([]GitHubToken, error) {
+	rows, err := s.db.Query(
+		`SELECT account_login, ciphertext_path, created_at, updated_at
+		 FROM github_tokens ORDER BY account_login ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GitHubToken
+	for rows.Next() {
+		var t GitHubToken
+		var created, updated int64
+		if err := rows.Scan(&t.AccountLogin, &t.CiphertextPath, &created, &updated); err != nil {
+			return nil, err
+		}
+		t.CreatedAt = time.Unix(created, 0)
+		t.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeleteGitHubToken removes one token pointer.
+func (s *Store) DeleteGitHubToken(accountLogin string) error {
+	_, err := s.db.Exec(`DELETE FROM github_tokens WHERE account_login = ?`, accountLogin)
 	return err
 }
 
