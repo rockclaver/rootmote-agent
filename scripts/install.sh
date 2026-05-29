@@ -63,7 +63,10 @@ else
 fi
 
 systemctl daemon-reload
-systemctl enable --now claver-agent.service
+systemctl enable claver-agent.service
+# `enable --now` only starts inactive units; on re-install we have just
+# overwritten the binary, so restart unconditionally to pick it up.
+systemctl restart claver-agent.service
 
 # Phase 1 AC: print installed version to stdout.
 "$BIN_DST" --version
