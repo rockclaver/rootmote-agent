@@ -11,6 +11,7 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/server"
+	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
@@ -40,8 +41,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init workspaces: %v", err)
 	}
+	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{})
 
-	srv := server.New(server.Config{Addr: *addr, Projects: mgr})
+	srv := server.New(server.Config{Addr: *addr, Projects: mgr, Sessions: sessionMgr})
 	ln, err := srv.Listen()
 	if err != nil {
 		log.Fatalf("claver-agent: %v", err)
@@ -50,6 +52,9 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	if err := sessionMgr.Rehydrate(ctx); err != nil {
+		log.Printf("claver-agent: rehydrate sessions: %v", err)
+	}
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}

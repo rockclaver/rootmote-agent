@@ -75,3 +75,90 @@ func TestStore_DeleteRemovesRow(t *testing.T) {
 		t.Fatal("expected not-found after delete")
 	}
 }
+
+// AC: "Disconnecting and reopening the app reattaches to the live session and
+// continues streaming from the correct sequence number."
+func TestStore_SessionEventsReplayFromSequence(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "x.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	_ = s.CreateProject(Project{ID: "p1", Name: "x"})
+	if err := s.CreateSession(Session{ID: "s1", ProjectID: "p1", Agent: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"one", "two", "three"} {
+		if _, err := s.AppendSessionEvent(SessionEvent{SessionID: "s1", Type: "stdout", Data: data}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.SessionEventsAfter("s1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Seq != 2 || got[0].Data != "two" || got[1].Seq != 3 {
+		t.Fatalf("replay mismatch: %+v", got)
+	}
+}
+
+// AC: "Session list shows started/ended timestamps and per-session token usage."
+func TestStore_SessionListIncludesTimestampsAndTokenUsage(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "x.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	_ = s.CreateProject(Project{ID: "p1", Name: "x"})
+	start := time.Unix(10, 0)
+	end := time.Unix(20, 0)
+	if err := s.CreateSession(Session{ID: "s1", ProjectID: "p1", Agent: "claude", StartedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateSessionUsage("s1", 123, 456); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndSession("s1", end); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListSessions("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d sessions", len(got))
+	}
+	if !got[0].StartedAt.Equal(start) || got[0].EndedAt == nil || !got[0].EndedAt.Equal(end) {
+		t.Fatalf("timestamps not preserved: %+v", got[0])
+	}
+	if got[0].InputTokens != 123 || got[0].OutputTokens != 456 {
+		t.Fatalf("usage not preserved: %+v", got[0])
+	}
+}
+
+// AC: "Killing and restarting the agent process rehydrates the in-flight session."
+func TestStore_ActiveSessionsSurviveReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "x.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CreateProject(Project{ID: "p1", Name: "x"})
+	if err := s.CreateSession(Session{ID: "s1", ProjectID: "p1", Agent: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	s2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	active, err := s2.ActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != "s1" {
+		t.Fatalf("active sessions mismatch: %+v", active)
+	}
+}

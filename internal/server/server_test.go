@@ -12,9 +12,21 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
+
+type fakeSessionRuntime struct{}
+
+func (fakeSessionRuntime) Start(_ context.Context, spec sessions.RuntimeSpec) error {
+	_, _ = spec.Output.Write([]byte("ready\n"))
+	return nil
+}
+func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error { return nil }
+func (fakeSessionRuntime) Interrupt(context.Context, string) error          { return nil }
+func (fakeSessionRuntime) Stop(context.Context, string) error               { return nil }
+func (fakeSessionRuntime) Capture(context.Context, string) (string, error)  { return "", nil }
 
 // startTestServer brings up a server on a real loopback port and returns the
 // ws URL plus a cancel function.
@@ -212,5 +224,111 @@ func TestServer_UnknownKindReturnsError(t *testing.T) {
 	_ = json.Unmarshal(data, &resp)
 	if !strings.HasPrefix(resp.Kind, "error.") {
 		t.Errorf("expected error.* kind, got %q", resp.Kind)
+	}
+}
+
+// AC: "Disconnecting and reopening the app reattaches to the live session and
+// continues streaming from the correct sequence number."
+func TestSession_SubscribeReplaysFromSequenceOverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	sm := sessions.New(st, pm, fakeSessionRuntime{})
+	sm.IDGen = func() string { return "s1" }
+	if _, err := sm.Start(context.Background(), "p1", "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "after\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Sessions: sm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]any{"session_id": "s1", "after_seq": 2})
+	req, _ := json.Marshal(Frame{ID: "sub", Kind: "session.subscribe", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "session.subscribe" {
+		t.Fatalf("subscribe ack kind %q", resp.Kind)
+	}
+	_, data, err = c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "session.event" {
+		t.Fatalf("event kind %q", resp.Kind)
+	}
+	var ev SessionEventDTO
+	_ = json.Unmarshal(resp.Payload, &ev)
+	if ev.Seq != 3 || ev.Data != "after\n" {
+		t.Fatalf("replay mismatch: %+v", ev)
+	}
+}
+
+// AC: "No code path exposes an arbitrary shell command to the mobile UI."
+func TestSessionStartRejectsArbitraryAgentOverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	sm := sessions.New(st, pm, fakeSessionRuntime{})
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Sessions: sm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]string{"project_id": "p1", "agent": "bash"})
+	req, _ := json.Marshal(Frame{ID: "x", Kind: "session.start", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "error.bad_agent" {
+		t.Fatalf("got %q want error.bad_agent", resp.Kind)
 	}
 }
