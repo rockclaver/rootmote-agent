@@ -62,6 +62,8 @@ type Client interface {
 	Info(ctx context.Context) (DaemonInfo, error)
 	ContainerLogs(ctx context.Context, id string, tail int) ([]LogEntry, error)
 	ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error
+	ContainerStats(ctx context.Context, id string) (StatsSample, error)
+	ContainerStatsStream(ctx context.Context, id string, emit func(StatsSample)) error
 }
 
 // Status is the typed daemon status returned by Manager.Status.
@@ -281,6 +283,138 @@ type LogEntry struct {
 	Stream      string `json:"stream"`
 	Timestamp   string `json:"timestamp,omitempty"`
 	Line        string `json:"line"`
+}
+
+// StatsSample is one raw datapoint from Docker's /containers/{id}/stats stream.
+// The Manager converts it into a StatsSnapshot; tests build samples by hand to
+// exercise the calculation without Docker.
+type StatsSample struct {
+	Read     string                  `json:"read"`
+	CPU      StatsCPU                `json:"cpu_stats"`
+	PreCPU   StatsCPU                `json:"precpu_stats"`
+	Memory   StatsMemory             `json:"memory_stats"`
+	Networks map[string]StatsNetwork `json:"networks"`
+}
+
+// StatsCPU mirrors Docker's cpu_stats / precpu_stats subset the agent needs.
+type StatsCPU struct {
+	CPUUsage struct {
+		TotalUsage  uint64   `json:"total_usage"`
+		PercpuUsage []uint64 `json:"percpu_usage,omitempty"`
+	} `json:"cpu_usage"`
+	SystemCPUUsage uint64 `json:"system_cpu_usage"`
+	OnlineCPUs     uint32 `json:"online_cpus"`
+}
+
+// StatsMemory mirrors Docker's memory_stats subset.
+type StatsMemory struct {
+	Usage uint64            `json:"usage"`
+	Limit uint64            `json:"limit"`
+	Stats map[string]uint64 `json:"stats,omitempty"`
+}
+
+// StatsNetwork mirrors per-interface rx/tx byte counters.
+type StatsNetwork struct {
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+// StatsSnapshot is the computed, wire-stable shape returned by Manager.Stats
+// and emitted on every SubscribeStats tick. Available distinguishes "no
+// stats available" (stopped container, missing memory limit) from a real
+// zero-usage sample so the UI does not collapse the two.
+type StatsSnapshot struct {
+	ContainerID       string  `json:"container_id"`
+	Timestamp         string  `json:"timestamp,omitempty"`
+	Available         bool    `json:"available"`
+	UnavailableReason string  `json:"unavailable_reason,omitempty"`
+	CPUPercent        float64 `json:"cpu_percent"`
+	MemUsageBytes     uint64  `json:"mem_usage_bytes"`
+	MemLimitBytes     uint64  `json:"mem_limit_bytes"`
+	MemPercent        float64 `json:"mem_percent"`
+	NetRxBytes        uint64  `json:"net_rx_bytes"`
+	NetTxBytes        uint64  `json:"net_tx_bytes"`
+}
+
+// StatsUnavailableStopped is the reason emitted when Docker returns a stats
+// payload with a zero memory limit — the documented signal that the container
+// is no longer running.
+const StatsUnavailableStopped = "stopped"
+
+// Stats samples Docker once and returns the computed snapshot. Samples are
+// never persisted; the agent forwards each call straight to the daemon.
+func (m *Manager) Stats(ctx context.Context, id string) (StatsSnapshot, error) {
+	if strings.TrimSpace(id) == "" {
+		return StatsSnapshot{}, errors.New("docker: container id required")
+	}
+	sample, err := m.client.ContainerStats(ctx, id)
+	if err != nil {
+		return StatsSnapshot{}, err
+	}
+	return computeStatsSnapshot(id, sample), nil
+}
+
+// SubscribeStats follows the Docker stats stream and invokes emit with a
+// computed snapshot per Docker sample. The call returns when ctx is cancelled
+// or the daemon closes the stream.
+func (m *Manager) SubscribeStats(ctx context.Context, id string, emit func(StatsSnapshot)) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("docker: container id required")
+	}
+	if emit == nil {
+		return errors.New("docker: stats emit callback required")
+	}
+	return m.client.ContainerStatsStream(ctx, id, func(sample StatsSample) {
+		emit(computeStatsSnapshot(id, sample))
+	})
+}
+
+// computeStatsSnapshot folds a raw Docker sample into the wire-stable
+// snapshot shape. The CPU/memory math mirrors the algorithm used by the
+// `docker stats` CLI so values match what operators see in a terminal.
+func computeStatsSnapshot(id string, s StatsSample) StatsSnapshot {
+	snap := StatsSnapshot{ContainerID: id, Timestamp: s.Read, Available: true}
+
+	// Docker emits a stats body with limit=0 for stopped containers. Treat
+	// that as the explicit "unavailable" signal rather than reporting zero
+	// usage, so the UI can show a distinct message.
+	if s.Memory.Limit == 0 {
+		snap.Available = false
+		snap.UnavailableReason = StatsUnavailableStopped
+		return snap
+	}
+
+	cpuDelta := float64(s.CPU.CPUUsage.TotalUsage) - float64(s.PreCPU.CPUUsage.TotalUsage)
+	sysDelta := float64(s.CPU.SystemCPUUsage) - float64(s.PreCPU.SystemCPUUsage)
+	online := float64(s.CPU.OnlineCPUs)
+	if online == 0 {
+		online = float64(len(s.CPU.CPUUsage.PercpuUsage))
+	}
+	if online == 0 {
+		online = 1
+	}
+	if cpuDelta > 0 && sysDelta > 0 {
+		snap.CPUPercent = (cpuDelta / sysDelta) * online * 100.0
+	}
+
+	used := s.Memory.Usage
+	// Match the docker CLI: subtract page cache when reported. cgroup v1
+	// exposes it as "cache"; cgroup v2 reports "inactive_file".
+	if cache, ok := s.Memory.Stats["cache"]; ok && cache <= used {
+		used -= cache
+	} else if inactive, ok := s.Memory.Stats["inactive_file"]; ok && inactive <= used {
+		used -= inactive
+	}
+	snap.MemUsageBytes = used
+	snap.MemLimitBytes = s.Memory.Limit
+	snap.MemPercent = float64(used) / float64(s.Memory.Limit) * 100.0
+
+	for _, n := range s.Networks {
+		snap.NetRxBytes += n.RxBytes
+		snap.NetTxBytes += n.TxBytes
+	}
+
+	return snap
 }
 
 // Images returns every local image with safe metadata.
@@ -663,6 +797,53 @@ func (c *SocketClient) readLogs(ctx context.Context, id, query string, client *h
 		return fmt.Errorf("docker: unexpected status %d", resp.StatusCode)
 	}
 	return decodeDockerLogs(resp.Body, id, emit)
+}
+
+// ContainerStats calls Docker's stats endpoint in non-streaming mode and
+// returns a single sample. The non-streaming endpoint already returns the
+// previous-sample fields in precpu_stats, so callers can compute CPU%
+// without keeping per-id state on the agent.
+func (c *SocketClient) ContainerStats(ctx context.Context, id string) (StatsSample, error) {
+	var sample StatsSample
+	if err := c.getJSON(ctx, "/containers/"+id+"/stats?stream=0&one-shot=1", &sample); err != nil {
+		return StatsSample{}, err
+	}
+	return sample, nil
+}
+
+// ContainerStatsStream follows /containers/{id}/stats until ctx is cancelled.
+// Docker streams a newline-delimited JSON object per sample (~1 Hz); each one
+// already carries precpu_stats so emit fires per Docker tick.
+func (c *SocketClient) ContainerStatsStream(ctx context.Context, id string, emit func(StatsSample)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/"+id+"/stats?stream=1", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.streamc.Do(req)
+	if err != nil {
+		return translateDialError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: docker returned %d", ErrPermissionDenied, resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("%w: docker returned %d", ErrDaemonDown, resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("docker: unexpected status %d", resp.StatusCode)
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var sample StatsSample
+		if err := dec.Decode(&sample); err != nil {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		emit(sample)
+	}
 }
 
 // Images calls GET /images/json and maps it into the agent's stable summary.

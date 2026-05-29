@@ -27,6 +27,14 @@ type fakeClient struct {
 	streamErr   error
 	lastTail    int
 	lastSince   time.Time
+
+	statsSample      StatsSample
+	statsErr         error
+	statsStream      []StatsSample
+	statsStreamErr   error
+	statsStreamBlock bool
+	statsStarted     chan struct{}
+	statsCancelled   chan struct{}
 }
 
 func (f fakeClient) Version(ctx context.Context) (VersionInfo, error) {
@@ -70,6 +78,27 @@ func (f fakeClient) ContainerLogStream(ctx context.Context, id string, since tim
 		emit(entry)
 	}
 	return f.streamErr
+}
+
+func (f fakeClient) ContainerStats(ctx context.Context, id string) (StatsSample, error) {
+	return f.statsSample, f.statsErr
+}
+
+func (f fakeClient) ContainerStatsStream(ctx context.Context, id string, emit func(StatsSample)) error {
+	if f.statsStreamBlock {
+		if f.statsStarted != nil {
+			close(f.statsStarted)
+		}
+		<-ctx.Done()
+		if f.statsCancelled != nil {
+			close(f.statsCancelled)
+		}
+		return ctx.Err()
+	}
+	for _, s := range f.statsStream {
+		emit(s)
+	}
+	return f.statsStreamErr
 }
 
 func newManager(t *testing.T, c Client) *Manager {
@@ -476,6 +505,126 @@ func writeDockerLogFrame(buf *bytes.Buffer, stream byte, line string) {
 	binary.BigEndian.PutUint32(header[4:8], uint32(len(line)))
 	buf.Write(header)
 	buf.WriteString(line)
+}
+
+// AC issue #28: docker.container.stats computes CPU%, memory usage (cache
+// subtracted), and aggregated network I/O from a raw Docker sample.
+func TestStatsCalculatesCPUMemAndNetwork(t *testing.T) {
+	sample := StatsSample{
+		Read: "2026-05-29T10:00:00Z",
+		CPU: StatsCPU{
+			CPUUsage: struct {
+				TotalUsage  uint64   `json:"total_usage"`
+				PercpuUsage []uint64 `json:"percpu_usage,omitempty"`
+			}{TotalUsage: 2_000_000_000},
+			SystemCPUUsage: 20_000_000_000,
+			OnlineCPUs:     4,
+		},
+		PreCPU: StatsCPU{
+			CPUUsage: struct {
+				TotalUsage  uint64   `json:"total_usage"`
+				PercpuUsage []uint64 `json:"percpu_usage,omitempty"`
+			}{TotalUsage: 1_500_000_000},
+			SystemCPUUsage: 10_000_000_000,
+		},
+		Memory: StatsMemory{
+			Usage: 600 * 1024 * 1024,
+			Limit: 2 * 1024 * 1024 * 1024,
+			Stats: map[string]uint64{"cache": 100 * 1024 * 1024},
+		},
+		Networks: map[string]StatsNetwork{
+			"eth0": {RxBytes: 1000, TxBytes: 2000},
+			"eth1": {RxBytes: 500, TxBytes: 300},
+		},
+	}
+	m := newManager(t, fakeClient{statsSample: sample})
+	snap, err := m.Stats(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Available {
+		t.Fatalf("expected available, got %+v", snap)
+	}
+	// (0.5e9 / 1.0e10) * 4 * 100 = 20
+	if snap.CPUPercent < 19.9 || snap.CPUPercent > 20.1 {
+		t.Errorf("CPUPercent = %v want ~20", snap.CPUPercent)
+	}
+	wantMem := uint64(500 * 1024 * 1024)
+	if snap.MemUsageBytes != wantMem {
+		t.Errorf("MemUsageBytes = %d want %d (usage - cache)", snap.MemUsageBytes, wantMem)
+	}
+	if snap.NetRxBytes != 1500 || snap.NetTxBytes != 2300 {
+		t.Errorf("net = %d/%d want 1500/2300", snap.NetRxBytes, snap.NetTxBytes)
+	}
+	if snap.Timestamp != "2026-05-29T10:00:00Z" {
+		t.Errorf("Timestamp = %q", snap.Timestamp)
+	}
+}
+
+// AC issue #28: a stopped container surfaces an explicit "unavailable" sample
+// so the UI can distinguish it from a real zero-usage reading.
+func TestStatsMarksStoppedContainerUnavailable(t *testing.T) {
+	m := newManager(t, fakeClient{statsSample: StatsSample{Memory: StatsMemory{Usage: 0, Limit: 0}}})
+	snap, err := m.Stats(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Available {
+		t.Fatalf("expected unavailable for stopped container, got %+v", snap)
+	}
+	if snap.UnavailableReason != StatsUnavailableStopped {
+		t.Errorf("reason = %q want %q", snap.UnavailableReason, StatsUnavailableStopped)
+	}
+}
+
+// AC issue #28: SubscribeStats forwards every Docker sample to the emit
+// callback and surfaces the underlying error.
+func TestSubscribeStatsEmitsSnapshotsAndError(t *testing.T) {
+	expectedErr := errors.New("stream broken")
+	sample := StatsSample{
+		CPU:    StatsCPU{OnlineCPUs: 1},
+		Memory: StatsMemory{Usage: 100, Limit: 1000},
+	}
+	m := newManager(t, fakeClient{statsStream: []StatsSample{sample, sample}, statsStreamErr: expectedErr})
+	var got []StatsSnapshot
+	err := m.SubscribeStats(context.Background(), "abc", func(s StatsSnapshot) {
+		got = append(got, s)
+	})
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("err = %v want %v", err, expectedErr)
+	}
+	if len(got) != 2 {
+		t.Fatalf("emit count = %d want 2", len(got))
+	}
+	if !got[0].Available || got[0].MemLimitBytes != 1000 {
+		t.Errorf("first snapshot = %+v", got[0])
+	}
+}
+
+// AC issue #28: cancelling the Subscribe context stops the underlying stream.
+func TestSubscribeStatsCancelStopsStream(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	m := newManager(t, fakeClient{
+		statsStreamBlock: true,
+		statsStarted:     started,
+		statsCancelled:   cancelled,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.SubscribeStats(ctx, "abc", func(StatsSnapshot) {})
+	}()
+	<-started
+	cancel()
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not observe cancellation")
+	}
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v want context.Canceled", err)
+	}
 }
 
 // SocketClient image list strips Docker's "<none>:<none>" placeholders so the

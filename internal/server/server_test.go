@@ -1177,6 +1177,150 @@ func TestDockerContainerLogsUnsubscribeCancelsStream(t *testing.T) {
 	}
 }
 
+func TestDockerContainerStats(t *testing.T) {
+	// AC issue #28: docker.container.stats returns a computed live sample.
+	sample := docker.StatsSample{
+		Read:   "2026-05-29T10:00:00Z",
+		CPU:    docker.StatsCPU{OnlineCPUs: 1},
+		Memory: docker.StatsMemory{Usage: 200, Limit: 1000},
+		Networks: map[string]docker.StatsNetwork{
+			"eth0": {RxBytes: 10, TxBytes: 20},
+		},
+	}
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{statsSample: sample}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"id": "abc"})
+	resp := dockerRoundTrip(t, mgr, "docker.container.stats", payload)
+	if resp.Kind != "docker.container.stats" {
+		t.Fatalf("kind = %q", resp.Kind)
+	}
+	var dto struct {
+		Sample docker.StatsSnapshot `json:"sample"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if !dto.Sample.Available || dto.Sample.MemLimitBytes != 1000 || dto.Sample.NetRxBytes != 10 {
+		t.Fatalf("sample = %+v", dto.Sample)
+	}
+}
+
+func TestDockerContainerStatsSubscribeTerminalState(t *testing.T) {
+	// AC issue #28: stats_subscribe streams events then emits a done frame.
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{statsStream: []docker.StatsSample{{
+		CPU:    docker.StatsCPU{OnlineCPUs: 1},
+		Memory: docker.StatsMemory{Usage: 1, Limit: 100},
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	t.Cleanup(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
+	payload, _ := json.Marshal(map[string]any{"id": "abc", "subscription_id": "stat-1"})
+	req, _ := json.Marshal(Frame{ID: "sub", Kind: "docker.container.stats_subscribe", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	var seen []Frame
+	for len(seen) < 3 {
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f Frame
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		seen = append(seen, f)
+	}
+	if seen[0].Kind != "docker.container.stats_subscribe" ||
+		seen[1].Kind != "docker.container.stats_event" ||
+		seen[2].Kind != "docker.container.stats_done" {
+		t.Fatalf("stream frames = %+v", seen)
+	}
+}
+
+func TestDockerContainerStatsUnsubscribeCancelsStream(t *testing.T) {
+	// AC issue #28: cancelling a stats stream must stop the agent-side Docker
+	// follow goroutine. Mirrors the logs unsubscribe contract so the UI can
+	// stop sampling when the detail screen disappears.
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{
+		statsBlockStream: true,
+		statsStarted:     started,
+		statsCancelled:   cancelled,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	t.Cleanup(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
+	subPayload, _ := json.Marshal(map[string]any{"id": "abc", "subscription_id": "stat-1"})
+	req, _ := json.Marshal(Frame{ID: "sub", Kind: "docker.container.stats_subscribe", Payload: subPayload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack Frame
+	if err := json.Unmarshal(data, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.Kind != "docker.container.stats_subscribe" {
+		t.Fatalf("ack kind = %q", ack.Kind)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("stream did not start")
+	}
+	unsubPayload, _ := json.Marshal(map[string]any{"subscription_id": "stat-1"})
+	unsub, _ := json.Marshal(Frame{ID: "unsub", Kind: "docker.container.stats_unsubscribe", Payload: unsubPayload})
+	if err := c.Write(ctx, websocket.MessageText, unsub); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f Frame
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		if f.ID == "unsub" {
+			if f.Kind != "docker.container.stats_unsubscribe" {
+				t.Fatalf("unsubscribe kind = %q", f.Kind)
+			}
+			break
+		}
+	}
+	select {
+	case <-cancelled:
+	case <-ctx.Done():
+		t.Fatal("stream was not cancelled")
+	}
+}
+
 func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []byte) Frame {
 	t.Helper()
 	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
@@ -1217,6 +1361,14 @@ type fakeDockerClient struct {
 	blockStream     bool
 	streamStarted   chan struct{}
 	streamCancelled chan struct{}
+
+	statsSample      docker.StatsSample
+	statsErr         error
+	statsStream      []docker.StatsSample
+	statsStreamErr   error
+	statsBlockStream bool
+	statsStarted     chan struct{}
+	statsCancelled   chan struct{}
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -1270,6 +1422,27 @@ func (f fakeDockerClient) ContainerLogStream(ctx context.Context, id string, sin
 		emit(entry)
 	}
 	return f.streamErr
+}
+
+func (f fakeDockerClient) ContainerStats(context.Context, string) (docker.StatsSample, error) {
+	return f.statsSample, f.statsErr
+}
+
+func (f fakeDockerClient) ContainerStatsStream(ctx context.Context, id string, emit func(docker.StatsSample)) error {
+	if f.statsBlockStream {
+		if f.statsStarted != nil {
+			close(f.statsStarted)
+		}
+		<-ctx.Done()
+		if f.statsCancelled != nil {
+			close(f.statsCancelled)
+		}
+		return ctx.Err()
+	}
+	for _, s := range f.statsStream {
+		emit(s)
+	}
+	return f.statsStreamErr
 }
 
 type fakeErr struct{ cause error }

@@ -80,6 +80,10 @@ type Server struct {
 	dockerLogMu      sync.Mutex
 	dockerLogNextGen int64
 	dockerLogCancels map[string]dockerLogCancel
+
+	dockerStatsMu      sync.Mutex
+	dockerStatsNextGen int64
+	dockerStatsCancels map[string]dockerLogCancel
 }
 
 type dockerLogCancel struct {
@@ -101,7 +105,8 @@ func New(cfg Config) *Server {
 		cfg:              cfg,
 		startAt:          cfg.Now(),
 		seen:             newIDSet(1024, replayWindow, cfg.Now),
-		dockerLogCancels: make(map[string]dockerLogCancel),
+		dockerLogCancels:   make(map[string]dockerLogCancel),
+		dockerStatsCancels: make(map[string]dockerLogCancel),
 	}
 }
 
@@ -311,6 +316,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"docker.container.logs",
 		"docker.container.logs_subscribe",
 		"docker.container.logs_unsubscribe",
+		"docker.container.stats",
+		"docker.container.stats_subscribe",
+		"docker.container.stats_unsubscribe",
 		"docker.image.list",
 		"docker.image.get",
 		"docker.volume.list",
@@ -1343,6 +1351,91 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 		}
 		s.dockerLogMu.Unlock()
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs_unsubscribe", map[string]any{
+			"subscription_id": in.SubscriptionID,
+			"cancelled":       cancelEntry.cancel != nil,
+		})
+	case "docker.container.stats":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		snap, err := s.cfg.Docker.Stats(ctx, in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.stats", map[string]any{"sample": snap})
+	case "docker.container.stats_subscribe":
+		var in struct {
+			ID             string `json:"id"`
+			SubscriptionID string `json:"subscription_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id and subscription_id required")
+			return
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		s.dockerStatsMu.Lock()
+		if previous := s.dockerStatsCancels[in.SubscriptionID]; previous.cancel != nil {
+			previous.cancel()
+		}
+		s.dockerStatsNextGen++
+		gen := s.dockerStatsNextGen
+		s.dockerStatsCancels[in.SubscriptionID] = dockerLogCancel{gen: gen, cancel: cancel}
+		s.dockerStatsMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.stats_subscribe", map[string]any{
+			"container_id":    in.ID,
+			"subscription_id": in.SubscriptionID,
+		})
+		go func() {
+			defer func() {
+				s.dockerStatsMu.Lock()
+				if current := s.dockerStatsCancels[in.SubscriptionID]; current.gen == gen {
+					delete(s.dockerStatsCancels, in.SubscriptionID)
+				}
+				s.dockerStatsMu.Unlock()
+				cancel()
+			}()
+			err := s.cfg.Docker.SubscribeStats(streamCtx, in.ID, func(snap docker.StatsSnapshot) {
+				s.writeOK(ctx, c, writeMu, "", "docker.container.stats_event", map[string]any{
+					"subscription_id": in.SubscriptionID,
+					"sample":          snap,
+				})
+			})
+			if err != nil && !errors.Is(err, context.Canceled) {
+				s.writeOK(ctx, c, writeMu, "", "docker.container.stats_done", map[string]any{
+					"subscription_id": in.SubscriptionID,
+					"container_id":    in.ID,
+					"ok":              false,
+					"error":           err.Error(),
+				})
+				return
+			}
+			s.writeOK(ctx, c, writeMu, "", "docker.container.stats_done", map[string]any{
+				"subscription_id": in.SubscriptionID,
+				"container_id":    in.ID,
+				"ok":              true,
+			})
+		}()
+	case "docker.container.stats_unsubscribe":
+		var in struct {
+			SubscriptionID string `json:"subscription_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "subscription_id required")
+			return
+		}
+		s.dockerStatsMu.Lock()
+		cancelEntry := s.dockerStatsCancels[in.SubscriptionID]
+		if cancelEntry.cancel != nil {
+			cancelEntry.cancel()
+			delete(s.dockerStatsCancels, in.SubscriptionID)
+		}
+		s.dockerStatsMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.stats_unsubscribe", map[string]any{
 			"subscription_id": in.SubscriptionID,
 			"cancelled":       cancelEntry.cancel != nil,
 		})
