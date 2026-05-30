@@ -11,6 +11,7 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
+	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
@@ -115,6 +116,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init process inspector: %v", err)
 	}
+	socketReader := firewall.NewSSCommandReader()
+	firewallMgr, err := firewall.New(firewall.Config{
+		Backends: []firewall.Backend{firewall.NewUFWBackend(), firewall.NewFirewalldBackend()},
+		Sockets:  socketReader,
+		SSH:      firewall.SSHFromSockets{Reader: socketReader},
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init firewall: %v", err)
+	}
 
 	srv := server.New(server.Config{
 		Addr:      *addr,
@@ -129,6 +139,7 @@ func main() {
 		Infra:     infraMgr,
 		Systemd:   systemdMgr,
 		Processes: processMgr,
+		Firewall:  firewallMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {

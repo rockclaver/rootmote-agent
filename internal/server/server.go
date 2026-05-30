@@ -19,6 +19,7 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
+	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
@@ -74,6 +75,8 @@ type Config struct {
 	Systemd *systemd.Manager
 	// Processes, when non-nil, enables infra.process.* kinds.
 	Processes *agentprocess.Manager
+	// Firewall, when non-nil, enables infra.firewall.* kinds.
+	Firewall *firewall.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -411,6 +414,10 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "infra.process.list",
 		"infra.process.kill":
 		s.dispatchProcess(ctx, c, writeMu, f)
+	case "infra.firewall.status",
+		"infra.firewall.rule_add",
+		"infra.firewall.rule_remove":
+		s.dispatchFirewall(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -2018,6 +2025,125 @@ func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.process.kill", map[string]any{
 			"pid":      in.PID,
 			"signal":   in.Signal,
+			"audit_id": audit.ID,
+		})
+	}
+}
+
+func firewallRuleTokenBinding(verb string, rule firewall.Rule) (string, string, []string) {
+	return "infra.firewall." + verb, "infra", []string{fmt.Sprintf("%s/%s/%d", rule.Action, rule.Protocol, rule.Port)}
+}
+
+func (s *Server) auditFirewallRule(verb string, rule firewall.Rule, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"verb":    verb,
+		"rule":    rule,
+		"ok":      ok,
+		"summary": summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "infra.firewall." + verb,
+		ProjectID: "infra",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("firewall %s %s for %s/%s/%d: %s", verb, status, rule.Action, rule.Protocol, rule.Port, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) dispatchFirewall(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Firewall == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "firewall subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.firewall.status":
+		st, err := s.cfg.Firewall.Status(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "firewall_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.firewall.status", map[string]any{
+			"backend":             string(st.Backend),
+			"available":           st.Available,
+			"unavailable_reason":  st.UnavailableReason,
+			"unavailable_message": st.UnavailableMessage,
+			"rules":               st.Rules,
+			"sockets":             st.Sockets,
+			"ssh_ports":           st.SSHPorts,
+		})
+	case "infra.firewall.rule_add", "infra.firewall.rule_remove":
+		var in struct {
+			Action            string `json:"action"`
+			Protocol          string `json:"protocol"`
+			Port              int    `json:"port"`
+			Source            string `json:"source"`
+			Comment           string `json:"comment"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Port <= 0 {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "action, protocol, and port required")
+			return
+		}
+		if in.Protocol == "" {
+			in.Protocol = string(firewall.ProtoTCP)
+		}
+		rule := firewall.Rule{
+			Action:   firewall.Action(in.Action),
+			Protocol: firewall.Protocol(in.Protocol),
+			Port:     in.Port,
+			Source:   in.Source,
+			Comment:  in.Comment,
+		}
+		verb := "rule_add"
+		if f.Kind == "infra.firewall.rule_remove" {
+			verb = "rule_remove"
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := firewallRuleTokenBinding(verb, rule)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditFirewallRule(verb, rule, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		var opErr error
+		if verb == "rule_add" {
+			opErr = s.cfg.Firewall.RuleAdd(ctx, rule)
+		} else {
+			opErr = s.cfg.Firewall.RuleRemove(ctx, rule)
+		}
+		if opErr != nil {
+			s.auditFirewallRule(verb, rule, false, opErr.Error())
+			var ale *firewall.AntiLockoutError
+			if errors.As(opErr, &ale) {
+				s.writeError(ctx, c, writeMu, f.ID, "anti_lockout", opErr.Error())
+				return
+			}
+			if errors.Is(opErr, firewall.ErrReadOnly) {
+				s.writeError(ctx, c, writeMu, f.ID, "firewall_read_only", opErr.Error())
+				return
+			}
+			if errors.Is(opErr, firewall.ErrUnsupportedAction) {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", opErr.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "firewall_error", opErr.Error())
+			return
+		}
+		audit := s.auditFirewallRule(verb, rule, true, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.firewall."+verb, map[string]any{
+			"rule":     rule,
 			"audit_id": audit.ID,
 		})
 	}

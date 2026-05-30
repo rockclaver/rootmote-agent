@@ -16,6 +16,7 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
+	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
@@ -2138,4 +2139,206 @@ func writeProcFixture(t *testing.T, root string, pid int, comm, uid, cmdline str
 	mustWriteFile(t, filepath.Join(dir, "cmdline"), cmdline)
 	mustWriteFile(t, filepath.Join(dir, "statm"), "100 "+fmt.Sprintf("%d", rss)+" 0 0 0 0 0\n")
 	mustWriteFile(t, filepath.Join(dir, "comm"), comm+"\n")
+}
+
+// --- issue #44 firewall dispatch tests ---
+
+type fakeFWBackend struct {
+	kind      firewall.BackendKind
+	available error
+	rules     []firewall.Rule
+	added     []firewall.Rule
+	removed   []firewall.Rule
+}
+
+func (f *fakeFWBackend) Kind() firewall.BackendKind        { return f.kind }
+func (f *fakeFWBackend) Available(_ context.Context) error { return f.available }
+func (f *fakeFWBackend) Rules(_ context.Context) ([]firewall.Rule, error) {
+	return append([]firewall.Rule(nil), f.rules...), nil
+}
+func (f *fakeFWBackend) Add(_ context.Context, r firewall.Rule) error {
+	f.added = append(f.added, r)
+	f.rules = append(f.rules, r)
+	return nil
+}
+func (f *fakeFWBackend) Remove(_ context.Context, r firewall.Rule) error {
+	f.removed = append(f.removed, r)
+	return nil
+}
+
+type fakeFWSockets struct{ sockets []firewall.Socket }
+
+func (f fakeFWSockets) Listening(_ context.Context) ([]firewall.Socket, error) {
+	return append([]firewall.Socket(nil), f.sockets...), nil
+}
+
+type fakeFWSSH struct{ ports []int }
+
+func (f fakeFWSSH) SSHPorts(_ context.Context) []int { return append([]int(nil), f.ports...) }
+
+func newFirewallTestMgr(t *testing.T, b firewall.Backend, sshPorts []int, sockets []firewall.Socket) *firewall.Manager {
+	t.Helper()
+	mgr, err := firewall.New(firewall.Config{
+		Backends: []firewall.Backend{b},
+		Sockets:  fakeFWSockets{sockets: sockets},
+		SSH:      fakeFWSSH{ports: sshPorts},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mgr
+}
+
+// AC #44.1: infra.firewall.status returns sockets, rules, and the detected backend.
+func TestFirewallStatus_ReturnsSocketsRulesAndBackend(t *testing.T) {
+	b := &fakeFWBackend{kind: firewall.BackendUFW, rules: []firewall.Rule{
+		{Action: firewall.ActionAllow, Protocol: firewall.ProtoTCP, Port: 22},
+	}}
+	sockets := []firewall.Socket{{Protocol: firewall.ProtoTCP, Address: "0.0.0.0", Port: 22, Process: "sshd", PID: 100}}
+	fwm := newFirewallTestMgr(t, b, []int{22}, sockets)
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Firewall: fwm}, "infra.firewall.status", nil)
+	if resp.Kind != "infra.firewall.status" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Backend   string            `json:"backend"`
+		Available bool              `json:"available"`
+		Rules     []firewall.Rule   `json:"rules"`
+		Sockets   []firewall.Socket `json:"sockets"`
+		SSHPorts  []int             `json:"ssh_ports"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Backend != "ufw" || !out.Available || len(out.Rules) != 1 || len(out.Sockets) != 1 || len(out.SSHPorts) != 1 {
+		t.Fatalf("unexpected status: %+v", out)
+	}
+}
+
+// AC #44.2: read-only fallback when neither backend is present.
+func TestFirewallStatus_ReadOnlyFallback(t *testing.T) {
+	mgr, err := firewall.New(firewall.Config{
+		Backends: []firewall.Backend{
+			&fakeFWBackend{kind: firewall.BackendUFW, available: errors.New("ufw absent")},
+			&fakeFWBackend{kind: firewall.BackendFirewalld, available: errors.New("firewalld absent")},
+		},
+		Sockets: fakeFWSockets{sockets: []firewall.Socket{{Protocol: firewall.ProtoTCP, Port: 22, Process: "sshd"}}},
+		SSH:     fakeFWSSH{ports: []int{22}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Firewall: mgr}, "infra.firewall.status", nil)
+	if resp.Kind != "infra.firewall.status" {
+		t.Fatalf("kind = %q", resp.Kind)
+	}
+	var out struct {
+		Backend   string            `json:"backend"`
+		Available bool              `json:"available"`
+		Reason    string            `json:"unavailable_reason"`
+		Sockets   []firewall.Socket `json:"sockets"`
+	}
+	_ = json.Unmarshal(resp.Payload, &out)
+	if out.Available || out.Backend != "none" || out.Reason != "no_backend" {
+		t.Fatalf("unexpected: %+v", out)
+	}
+	if len(out.Sockets) != 1 {
+		t.Fatalf("sockets should still be reported: %+v", out.Sockets)
+	}
+}
+
+// AC #44.3: rule_add requires a valid confirmation token, mutates the
+// detected backend, and produces an audit row.
+func TestFirewallRuleAdd_TokenAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	b := &fakeFWBackend{kind: firewall.BackendUFW}
+	fwm := newFirewallTestMgr(t, b, []int{22}, nil)
+	cfg := Config{Addr: "127.0.0.1:0", Firewall: fwm, Review: rm}
+
+	rule := firewall.Rule{Action: firewall.ActionAllow, Protocol: firewall.ProtoTCP, Port: 80}
+	payload, _ := json.Marshal(map[string]any{"action": "allow", "protocol": "tcp", "port": 80})
+	resp := systemdRoundTrip(t, cfg, "infra.firewall.rule_add", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token kind = %q", resp.Kind)
+	}
+	if len(b.added) != 0 {
+		t.Fatal("backend Add called without valid token")
+	}
+	tokAction, projectID, files := firewallRuleTokenBinding("rule_add", rule)
+	tok, err := rm.MintConfirmationToken(tokAction, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"action": "allow", "protocol": "tcp", "port": 80, "confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.firewall.rule_add", payload)
+	if resp.Kind != "infra.firewall.rule_add" {
+		t.Fatalf("ok kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if len(b.added) != 1 || b.added[0] != rule {
+		t.Fatalf("backend not mutated: %+v", b.added)
+	}
+	entries, err := rm.ListAudit("infra.firewall.rule_add", "infra", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 || !strings.Contains(entries[0].Summary, "succeeded") {
+		t.Fatalf("missing success audit: %+v", entries)
+	}
+}
+
+// AC #44.4: anti-lockout guard refuses any edit that would deny the
+// active SSH port — resolved from the live connection (the SSHResolver),
+// not user input — and the backend is never called.
+func TestFirewall_AntiLockoutOnSSHPort_RefusedBeforeBackend(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	b := &fakeFWBackend{kind: firewall.BackendUFW, rules: []firewall.Rule{
+		{Action: firewall.ActionAllow, Protocol: firewall.ProtoTCP, Port: 2222},
+	}}
+	// SSH resolved from "live connection" to a non-default port.
+	fwm := newFirewallTestMgr(t, b, []int{2222}, nil)
+	cfg := Config{Addr: "127.0.0.1:0", Firewall: fwm, Review: rm}
+
+	// Adding a deny rule covering the SSH port: refused.
+	denyRule := firewall.Rule{Action: firewall.ActionDeny, Protocol: firewall.ProtoTCP, Port: 2222}
+	tokAction, projectID, files := firewallRuleTokenBinding("rule_add", denyRule)
+	tok, err := rm.MintConfirmationToken(tokAction, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"action": "deny", "protocol": "tcp", "port": 2222, "confirmation_token": tok.Token})
+	resp := systemdRoundTrip(t, cfg, "infra.firewall.rule_add", payload)
+	if resp.Kind != "error.anti_lockout" {
+		t.Fatalf("deny add kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if len(b.added) != 0 {
+		t.Fatal("backend Add called despite anti-lockout")
+	}
+
+	// Removing the allow rule covering the SSH port: refused.
+	allowRule := firewall.Rule{Action: firewall.ActionAllow, Protocol: firewall.ProtoTCP, Port: 2222}
+	tokAction, projectID, files = firewallRuleTokenBinding("rule_remove", allowRule)
+	tok, err = rm.MintConfirmationToken(tokAction, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"action": "allow", "protocol": "tcp", "port": 2222, "confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.firewall.rule_remove", payload)
+	if resp.Kind != "error.anti_lockout" {
+		t.Fatalf("remove kind = %q", resp.Kind)
+	}
+	if len(b.removed) != 0 {
+		t.Fatal("backend Remove called despite anti-lockout")
+	}
 }
