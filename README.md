@@ -92,12 +92,21 @@ go test ./...
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rockclaver/claver/main/agent/scripts/install.sh \
-  | sudo bash -s -- --version 0.1.0
+  | sudo bash
+```
+
+By default the installer resolves the latest GitHub release. To pin a specific
+version, pass `--version`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rockclaver/claver/main/agent/scripts/install.sh \
+  | sudo bash -s -- --version 0.1.2
 ```
 
 The installer creates a `claver` system user, drops the binary at
 `/usr/local/bin/claver-agent`, installs the systemd unit, enables and starts
-the service, and prints the installed version on stdout.
+the service, and prints the installed version on stdout. It also installs the
+OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH.
 
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,

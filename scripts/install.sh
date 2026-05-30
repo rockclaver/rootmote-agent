@@ -2,7 +2,9 @@
 # Claver VPS agent installer.
 #
 # Idempotent. Designed to be invoked over SSH by the mobile app as:
-#     curl -fsSL https://.../install.sh | sudo bash -s -- --version 0.1.0
+#     curl -fsSL https://.../install.sh | sudo bash
+# or pin to a specific version:
+#     curl -fsSL https://.../install.sh | sudo bash -s -- --version 0.1.2
 #
 # Steps:
 #   1. Ensure a `claver` system user exists.
@@ -13,8 +15,9 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-latest}"
 RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver/releases/download}"
+RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/claver/releases/latest}"
 BIN_DST="/usr/local/bin/claver-agent"
 UNIT_DST="/etc/systemd/system/claver-agent.service"
 STATE_DIR="/var/lib/claver"
@@ -35,6 +38,20 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
+if [[ "$VERSION" == "latest" ]]; then
+  echo "resolving latest claver-agent release" >&2
+  # Follow the /releases/latest redirect to find the current tag without
+  # hitting the rate-limited GitHub API.
+  resolved="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$RELEASES_LATEST_URL" || true)"
+  VERSION="${resolved##*/tag/v}"
+  if [[ -z "$VERSION" || "$VERSION" == "$resolved" ]]; then
+    echo "failed to resolve latest release from $RELEASES_LATEST_URL" >&2
+    echo "pass --version X.Y.Z to pin a specific release" >&2
+    exit 1
+  fi
+  echo "latest release: v${VERSION}" >&2
+fi
+
 arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) arch=amd64 ;;
@@ -46,6 +63,20 @@ if ! id claver >/dev/null 2>&1; then
   useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin claver
 fi
 install -d -o claver -g claver -m 0750 "$STATE_DIR"
+
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "installing bubblewrap" >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y bubblewrap
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y bubblewrap
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache bubblewrap
+  else
+    echo "warning: no supported package manager found; install bubblewrap manually" >&2
+  fi
+fi
 
 if ! command -v gh >/dev/null 2>&1; then
   echo "installing GitHub CLI" >&2
