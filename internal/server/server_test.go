@@ -15,6 +15,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -27,6 +28,125 @@ type fakeSessionRuntime struct{}
 func (fakeSessionRuntime) Start(_ context.Context, spec sessions.RuntimeSpec) error {
 	_, _ = spec.Output.Write([]byte("ready\n"))
 	return nil
+}
+
+func TestIssue41InfraMetricsSampleOverWS(t *testing.T) {
+	mgr, err := infra.New(infra.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Infra: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	req, _ := json.Marshal(Frame{ID: "infra-sample", Kind: "infra.metrics.sample"})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kind != "infra.metrics.sample" {
+		t.Fatalf("kind = %s payload=%s", resp.Kind, string(resp.Payload))
+	}
+	var out struct {
+		Sample infra.HostMetrics `json:"sample"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Sample.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIssue41InfraMetricsSubscribeUnsubscribeOverWS(t *testing.T) {
+	mgr, err := infra.New(infra.Config{Cadence: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Infra: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]string{"subscription_id": "sub-1"})
+	req, _ := json.Marshal(Frame{ID: "infra-sub", Kind: "infra.metrics.subscribe", Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack Frame
+	if err := json.Unmarshal(data, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.Kind != "infra.metrics.subscribe" {
+		t.Fatalf("ack kind = %s payload=%s", ack.Kind, string(ack.Payload))
+	}
+	_, data, err = c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event Frame
+	if err := json.Unmarshal(data, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Kind != "infra.metrics.event" {
+		t.Fatalf("event kind = %s payload=%s", event.Kind, string(event.Payload))
+	}
+
+	unsubPayload, _ := json.Marshal(map[string]string{"subscription_id": "sub-1"})
+	unsub, _ := json.Marshal(Frame{ID: "infra-unsub", Kind: "infra.metrics.unsubscribe", Payload: unsubPayload})
+	if err := c.Write(ctx, websocket.MessageText, unsub); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, data, err = c.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp Frame
+		if err := json.Unmarshal(data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.ID != "infra-unsub" {
+			continue
+		}
+		if resp.Kind != "infra.metrics.unsubscribe" {
+			t.Fatalf("unsubscribe kind = %s payload=%s", resp.Kind, string(resp.Payload))
+		}
+		var body struct {
+			Cancelled bool `json:"cancelled"`
+		}
+		if err := json.Unmarshal(resp.Payload, &body); err != nil {
+			t.Fatal(err)
+		}
+		if !body.Cancelled {
+			t.Fatal("subscription was not cancelled")
+		}
+		break
+	}
 }
 func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
 func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }

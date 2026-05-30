@@ -20,6 +20,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
@@ -65,6 +66,8 @@ type Config struct {
 	Auth *cliauth.Manager
 	// Docker, when non-nil, enables docker.* kinds.
 	Docker *docker.Manager
+	// Infra, when non-nil, enables infra.* host metrics kinds.
+	Infra *infra.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -84,6 +87,10 @@ type Server struct {
 	dockerStatsMu      sync.Mutex
 	dockerStatsNextGen int64
 	dockerStatsCancels map[string]dockerLogCancel
+
+	infraMetricsMu      sync.Mutex
+	infraMetricsNextGen int64
+	infraMetricsCancels map[string]dockerLogCancel
 }
 
 type dockerLogCancel struct {
@@ -102,11 +109,12 @@ func New(cfg Config) *Server {
 		cfg.Now = time.Now
 	}
 	return &Server{
-		cfg:                cfg,
-		startAt:            cfg.Now(),
-		seen:               newIDSet(1024, replayWindow, cfg.Now),
-		dockerLogCancels:   make(map[string]dockerLogCancel),
-		dockerStatsCancels: make(map[string]dockerLogCancel),
+		cfg:                 cfg,
+		startAt:             cfg.Now(),
+		seen:                newIDSet(1024, replayWindow, cfg.Now),
+		dockerLogCancels:    make(map[string]dockerLogCancel),
+		dockerStatsCancels:  make(map[string]dockerLogCancel),
+		infraMetricsCancels: make(map[string]dockerLogCancel),
 	}
 }
 
@@ -386,6 +394,10 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"docker.network.list",
 		"docker.info":
 		s.dispatchDocker(ctx, c, writeMu, f)
+	case "infra.metrics.sample",
+		"infra.metrics.subscribe",
+		"infra.metrics.unsubscribe":
+		s.dispatchInfra(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -1667,6 +1679,86 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.info", map[string]any{"info": info})
+	}
+}
+
+func (s *Server) dispatchInfra(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Infra == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "infra subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.metrics.sample":
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.metrics.sample", map[string]any{
+			"sample": s.cfg.Infra.Sample(ctx),
+		})
+	case "infra.metrics.subscribe":
+		var in struct {
+			SubscriptionID string `json:"subscription_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "subscription_id required")
+			return
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		s.infraMetricsMu.Lock()
+		if previous := s.infraMetricsCancels[in.SubscriptionID]; previous.cancel != nil {
+			previous.cancel()
+		}
+		s.infraMetricsNextGen++
+		gen := s.infraMetricsNextGen
+		s.infraMetricsCancels[in.SubscriptionID] = dockerLogCancel{gen: gen, cancel: cancel}
+		s.infraMetricsMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.metrics.subscribe", map[string]any{
+			"subscription_id": in.SubscriptionID,
+		})
+		go func() {
+			defer func() {
+				s.infraMetricsMu.Lock()
+				if current := s.infraMetricsCancels[in.SubscriptionID]; current.gen == gen {
+					delete(s.infraMetricsCancels, in.SubscriptionID)
+				}
+				s.infraMetricsMu.Unlock()
+				cancel()
+			}()
+			err := s.cfg.Infra.Subscribe(streamCtx, func(sample infra.HostMetrics) {
+				s.writeOK(ctx, c, writeMu, "", "infra.metrics.event", map[string]any{
+					"subscription_id": in.SubscriptionID,
+					"sample":          sample,
+				})
+			})
+			if err != nil && !errors.Is(err, context.Canceled) {
+				s.writeOK(ctx, c, writeMu, "", "infra.metrics.done", map[string]any{
+					"subscription_id": in.SubscriptionID,
+					"ok":              false,
+					"error":           err.Error(),
+				})
+				return
+			}
+			s.writeOK(ctx, c, writeMu, "", "infra.metrics.done", map[string]any{
+				"subscription_id": in.SubscriptionID,
+				"ok":              true,
+			})
+		}()
+	case "infra.metrics.unsubscribe":
+		var in struct {
+			SubscriptionID string `json:"subscription_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "subscription_id required")
+			return
+		}
+		s.infraMetricsMu.Lock()
+		cancelEntry := s.infraMetricsCancels[in.SubscriptionID]
+		if cancelEntry.cancel != nil {
+			cancelEntry.cancel()
+			delete(s.infraMetricsCancels, in.SubscriptionID)
+		}
+		s.infraMetricsMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.metrics.unsubscribe", map[string]any{
+			"subscription_id": in.SubscriptionID,
+			"cancelled":       cancelEntry.cancel != nil,
+		})
 	}
 }
 

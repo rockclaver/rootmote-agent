@@ -12,6 +12,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
@@ -100,6 +101,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init docker: %v", err)
 	}
+	infraMgr, err := infra.New(infra.Config{})
+	if err != nil {
+		log.Fatalf("claver-agent: init infra: %v", err)
+	}
 
 	srv := server.New(server.Config{
 		Addr:     *addr,
@@ -111,6 +116,7 @@ func main() {
 		Tooling:  toolingMgr,
 		Auth:     authMgr,
 		Docker:   dockerMgr,
+		Infra:    infraMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
