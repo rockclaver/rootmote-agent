@@ -19,6 +19,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/server"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/systemd"
 	"github.com/rockclaver/claver/agent/internal/tooling"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
@@ -105,6 +106,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init infra: %v", err)
 	}
+	systemdMgr, err := systemd.New(systemd.Config{Client: systemd.NewSystemctlClient()})
+	if err != nil {
+		log.Fatalf("claver-agent: init systemd: %v", err)
+	}
 
 	srv := server.New(server.Config{
 		Addr:     *addr,
@@ -117,6 +122,7 @@ func main() {
 		Auth:     authMgr,
 		Docker:   dockerMgr,
 		Infra:    infraMgr,
+		Systemd:  systemdMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {

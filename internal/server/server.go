@@ -26,6 +26,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/systemd"
 	"github.com/rockclaver/claver/agent/internal/tooling"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
@@ -68,6 +69,8 @@ type Config struct {
 	Docker *docker.Manager
 	// Infra, when non-nil, enables infra.* host metrics kinds.
 	Infra *infra.Manager
+	// Systemd, when non-nil, enables infra.service.* kinds.
+	Systemd *systemd.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -398,6 +401,10 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"infra.metrics.subscribe",
 		"infra.metrics.unsubscribe":
 		s.dispatchInfra(ctx, c, writeMu, f)
+	case "infra.service.list",
+		"infra.service.get",
+		"infra.service.action":
+		s.dispatchSystemd(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -1758,6 +1765,139 @@ func (s *Server) dispatchInfra(ctx context.Context, c *websocket.Conn, writeMu *
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.metrics.unsubscribe", map[string]any{
 			"subscription_id": in.SubscriptionID,
 			"cancelled":       cancelEntry.cancel != nil,
+		})
+	}
+}
+
+func serviceLifecycleTokenBinding(unit string, action systemd.Action) (string, string, []string) {
+	return "infra.service.action." + string(action), "infra", []string{unit}
+}
+
+func (s *Server) auditServiceLifecycle(unit, action string, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"unit":    unit,
+		"action":  action,
+		"ok":      ok,
+		"summary": summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "infra.service.action",
+		ProjectID: "infra",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("systemd %s %s for %s: %s", action, status, unit, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) dispatchSystemd(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Systemd == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "systemd subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.service.list":
+		st := s.cfg.Systemd.Status(ctx)
+		if !st.Available {
+			s.writeOK(ctx, c, writeMu, f.ID, "infra.service.list", map[string]any{
+				"available":           false,
+				"unavailable_reason":  st.UnavailableReason,
+				"unavailable_message": st.UnavailableMessage,
+				"units":               []systemd.Unit{},
+			})
+			return
+		}
+		units, err := s.cfg.Systemd.List(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "systemd_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.service.list", map[string]any{
+			"available": true,
+			"units":     units,
+		})
+	case "infra.service.get":
+		var in struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Name == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "name required")
+			return
+		}
+		st := s.cfg.Systemd.Status(ctx)
+		if !st.Available {
+			s.writeOK(ctx, c, writeMu, f.ID, "infra.service.get", map[string]any{
+				"available":           false,
+				"unavailable_reason":  st.UnavailableReason,
+				"unavailable_message": st.UnavailableMessage,
+			})
+			return
+		}
+		detail, err := s.cfg.Systemd.Get(ctx, in.Name)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "systemd_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.service.get", map[string]any{
+			"available": true,
+			"unit":      detail,
+		})
+	case "infra.service.action":
+		var in struct {
+			Name              string `json:"name"`
+			Action            string `json:"action"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Name == "" || in.Action == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "name and action required")
+			return
+		}
+		action := systemd.Action(in.Action)
+		// Run the protected-unit guard BEFORE consuming the token so the
+		// caller can't burn a token attempting to stop sshd.
+		if s.cfg.Systemd.IsProtected(in.Name) && (action == systemd.ActionStop || action == systemd.ActionDisable) {
+			audit := s.auditServiceLifecycle(in.Name, in.Action, false, "protected unit")
+			s.writeError(ctx, c, writeMu, f.ID, "protected_unit", fmt.Sprintf("refused %s on protected unit %s", action, in.Name))
+			_ = audit
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := serviceLifecycleTokenBinding(in.Name, action)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditServiceLifecycle(in.Name, in.Action, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		if err := s.cfg.Systemd.Action(ctx, in.Name, action); err != nil {
+			s.auditServiceLifecycle(in.Name, in.Action, false, err.Error())
+			var pe *systemd.ProtectedUnitError
+			if errors.As(err, &pe) {
+				s.writeError(ctx, c, writeMu, f.ID, "protected_unit", err.Error())
+				return
+			}
+			if errors.Is(err, systemd.ErrUnsupportedAction) {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "systemd_error", err.Error())
+			return
+		}
+		audit := s.auditServiceLifecycle(in.Name, in.Action, true, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.service.action", map[string]any{
+			"name":     in.Name,
+			"action":   in.Action,
+			"audit_id": audit.ID,
 		})
 	}
 }

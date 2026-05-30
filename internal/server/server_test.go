@@ -20,6 +20,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/systemd"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
 
@@ -1717,6 +1718,220 @@ type fakeErr struct{ cause error }
 
 func (e fakeErr) Error() string { return "fake: " + e.cause.Error() }
 func (e fakeErr) Unwrap() error { return e.cause }
+
+type fakeSystemdClient struct {
+	units   []systemd.Unit
+	details map[string]systemd.UnitDetail
+	available error
+	actions []string
+	actionErr error
+}
+
+func (f *fakeSystemdClient) Available(_ context.Context) error { return f.available }
+func (f *fakeSystemdClient) List(_ context.Context) ([]systemd.Unit, error) {
+	return append([]systemd.Unit(nil), f.units...), nil
+}
+func (f *fakeSystemdClient) Get(_ context.Context, name string) (systemd.UnitDetail, error) {
+	if d, ok := f.details[name]; ok {
+		return d, nil
+	}
+	return systemd.UnitDetail{}, errors.New("not found")
+}
+func (f *fakeSystemdClient) Action(_ context.Context, name string, action systemd.Action) error {
+	f.actions = append(f.actions, name+":"+string(action))
+	return f.actionErr
+}
+
+func systemdRoundTrip(t *testing.T, cfg Config, kind string, payload []byte) Frame {
+	t.Helper()
+	return dockerRoundTripConfig(t, cfg, kind, payload)
+}
+
+// AC issue #42: infra.service.list returns units; degrades on non-systemd hosts.
+func TestSystemdServiceList(t *testing.T) {
+	fc := &fakeSystemdClient{units: []systemd.Unit{
+		{Name: "nginx.service", LoadState: "loaded", ActiveState: "active", SubState: "running", EnabledOnBoot: "enabled"},
+		{Name: "sshd.service", LoadState: "loaded", ActiveState: "active", SubState: "running", EnabledOnBoot: "enabled"},
+	}}
+	mgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Systemd: mgr}, "infra.service.list", nil)
+	if resp.Kind != "infra.service.list" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Available bool           `json:"available"`
+		Units     []systemd.Unit `json:"units"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available || len(out.Units) != 2 {
+		t.Fatalf("unexpected list: %+v", out)
+	}
+	if !out.Units[1].Protected || out.Units[1].ProtectReason == "" {
+		t.Fatalf("sshd not decorated protected: %+v", out.Units[1])
+	}
+}
+
+// AC issue #42: list degrades to typed unavailable reason on non-systemd host.
+func TestSystemdServiceList_NonSystemd(t *testing.T) {
+	mgr, err := systemd.New(systemd.Config{Client: &fakeSystemdClient{available: systemd.ErrNotSystemd}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Systemd: mgr}, "infra.service.list", nil)
+	if resp.Kind != "infra.service.list" {
+		t.Fatalf("kind = %q", resp.Kind)
+	}
+	var out struct {
+		Available bool   `json:"available"`
+		Reason    string `json:"unavailable_reason"`
+	}
+	_ = json.Unmarshal(resp.Payload, &out)
+	if out.Available || out.Reason != systemd.ReasonNotSystemd {
+		t.Fatalf("expected unavailable not_systemd, got %+v", out)
+	}
+}
+
+// AC issue #42: infra.service.get returns single-unit detail.
+func TestSystemdServiceGet(t *testing.T) {
+	fc := &fakeSystemdClient{details: map[string]systemd.UnitDetail{
+		"nginx.service": {Unit: systemd.Unit{Name: "nginx.service", Description: "Nginx", ActiveState: "active", SubState: "running", LoadState: "loaded", EnabledOnBoot: "enabled"}},
+	}}
+	mgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"name": "nginx.service"})
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Systemd: mgr}, "infra.service.get", payload)
+	if resp.Kind != "infra.service.get" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Available bool              `json:"available"`
+		Unit      systemd.UnitDetail `json:"unit"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available || out.Unit.Name != "nginx.service" || out.Unit.Description != "Nginx" {
+		t.Fatalf("unexpected get: %+v", out)
+	}
+}
+
+// AC issue #42: action rejected without valid token; token single-use; audit row on success.
+func TestSystemdServiceAction_TokenSingleUseAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	fc := &fakeSystemdClient{}
+	mgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Systemd: mgr, Review: rm}
+
+	// Missing token -> rejected, no client call.
+	payload, _ := json.Marshal(map[string]any{"name": "nginx.service", "action": "restart"})
+	resp := systemdRoundTrip(t, cfg, "infra.service.action", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token kind = %q", resp.Kind)
+	}
+	if len(fc.actions) != 0 {
+		t.Fatalf("client called without token: %v", fc.actions)
+	}
+
+	// Valid token -> action runs; audit recorded.
+	action, projectID, files := serviceLifecycleTokenBinding("nginx.service", systemd.ActionRestart)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"name": "nginx.service", "action": "restart", "confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.service.action", payload)
+	if resp.Kind != "infra.service.action" {
+		t.Fatalf("ok kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if len(fc.actions) != 1 || fc.actions[0] != "nginx.service:restart" {
+		t.Fatalf("client not called once: %v", fc.actions)
+	}
+
+	// Single-use: replay same token -> token_used.
+	resp = systemdRoundTrip(t, cfg, "infra.service.action", payload)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("reused token kind = %q", resp.Kind)
+	}
+	if len(fc.actions) != 1 {
+		t.Fatalf("reused token re-invoked client: %v", fc.actions)
+	}
+
+	entries, err := rm.ListAudit("infra.service.action", "infra", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("expected audit row, got none")
+	}
+	var sawSuccess bool
+	for _, e := range entries {
+		if strings.Contains(e.Summary, "succeeded") && strings.Contains(e.Summary, "restart") && strings.Contains(e.Summary, "nginx.service") {
+			sawSuccess = true
+		}
+	}
+	if !sawSuccess {
+		t.Fatalf("missing success audit row: %+v", entries)
+	}
+}
+
+// AC issue #42: protected-unit guard rejects stop/disable BEFORE token consumed.
+func TestSystemdServiceAction_ProtectedUnitRejectedBeforeToken(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	fc := &fakeSystemdClient{}
+	mgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Systemd: mgr, Review: rm}
+
+	// Mint a valid token for stop on sshd to prove the guard refuses BEFORE
+	// the token is consumed (token remains valid afterwards).
+	action, projectID, files := serviceLifecycleTokenBinding("sshd.service", systemd.ActionStop)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"name":               "sshd.service",
+		"action":             "stop",
+		"confirmation_token": tok.Token,
+	})
+	resp := systemdRoundTrip(t, cfg, "infra.service.action", payload)
+	if resp.Kind != "error.protected_unit" {
+		t.Fatalf("protected kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if len(fc.actions) != 0 {
+		t.Fatalf("guard let action through to client: %v", fc.actions)
+	}
+
+	// The token was NOT consumed: same token can still mint a legitimate
+	// (non-protected) action. Verify by consuming it directly.
+	if err := rm.ConsumeToken(tok.Token, action, projectID, files, ""); err != nil {
+		t.Fatalf("guard consumed token: %v", err)
+	}
+}
 
 func mustWriteFile(t *testing.T, path, body string) {
 	t.Helper()
