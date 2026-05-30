@@ -18,6 +18,7 @@ type fakeRuntime struct {
 	started     []RuntimeSpec
 	attached    []RuntimeSpec
 	prompts     []string
+	inputs      []string
 	interrupts  int
 	resizes     [][2]int
 	stops       int
@@ -37,6 +38,10 @@ func (f *fakeRuntime) Attach(_ context.Context, spec RuntimeSpec) error {
 }
 func (f *fakeRuntime) SendPrompt(_ context.Context, sessionID, prompt string) error {
 	f.prompts = append(f.prompts, sessionID+":"+prompt)
+	return nil
+}
+func (f *fakeRuntime) SendInput(_ context.Context, sessionID, data string) error {
+	f.inputs = append(f.inputs, sessionID+":"+data)
 	return nil
 }
 func (f *fakeRuntime) Interrupt(context.Context, string) error {
@@ -224,6 +229,27 @@ func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
 	}
 	if len(rt.prompts) != 1 || rt.prompts[0] != "s1:explain" {
 		t.Fatalf("prompt not delivered: %+v", rt.prompts)
+	}
+}
+
+func TestSendInput_ForwardsRawBytesAndSkipsEmpty(t *testing.T) {
+	m, rt := newTestManager(t)
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	// An empty payload is a no-op and must not reach the runtime.
+	if err := m.SendInput(context.Background(), "s1", ""); err != nil {
+		t.Fatal(err)
+	}
+	// A scroll escape sequence (arrow-down) is forwarded verbatim.
+	if err := m.SendInput(context.Background(), "s1", "\x1b[B"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.inputs) != 1 || rt.inputs[0] != "s1:\x1b[B" {
+		t.Fatalf("input not delivered verbatim: %+v", rt.inputs)
+	}
+	if err := m.SendInput(context.Background(), "missing", "x"); err == nil {
+		t.Fatal("expected error for unknown session")
 	}
 }
 

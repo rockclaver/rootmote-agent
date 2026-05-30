@@ -34,6 +34,7 @@ type Runtime interface {
 	Start(ctx context.Context, spec RuntimeSpec) error
 	Attach(ctx context.Context, spec RuntimeSpec) error
 	SendPrompt(ctx context.Context, sessionID, prompt string) error
+	SendInput(ctx context.Context, sessionID, data string) error
 	Interrupt(ctx context.Context, sessionID string) error
 	Resize(ctx context.Context, sessionID string, cols, rows int) error
 	Stop(ctx context.Context, sessionID string) error
@@ -132,6 +133,20 @@ func (m *Manager) SendPrompt(ctx context.Context, sessionID, prompt string) erro
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "prompt", Data: prompt})
 	return m.Runtime.SendPrompt(ctx, sessionID, prompt)
+}
+
+// SendInput forwards raw bytes (e.g. the arrow-key or mouse-wheel escape
+// sequences the client's terminal emits when the user scrolls a full-screen
+// TUI) straight into the pty. Unlike SendPrompt it neither appends Enter nor
+// records a prompt event — it is a transparent keystroke channel.
+func (m *Manager) SendInput(ctx context.Context, sessionID, data string) error {
+	if data == "" {
+		return nil
+	}
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	return m.Runtime.SendInput(ctx, sessionID, data)
 }
 
 // Resize sets the session's pty grid so the agent TUI redraws for the client's
@@ -744,6 +759,24 @@ func (TmuxRuntime) SendPrompt(ctx context.Context, sessionID, prompt string) err
 	}
 	if out, err := exec.CommandContext(ctx, "tmux", "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send enter: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// SendInput writes raw bytes into the pane. We use send-keys -H (hex) so
+// arbitrary control bytes — ESC, CSI, SGR mouse-wheel reports — reach the pty
+// verbatim instead of being interpreted as tmux key names.
+func (TmuxRuntime) SendInput(ctx context.Context, sessionID, data string) error {
+	if data == "" {
+		return nil
+	}
+	target := tmuxName(sessionID) + ":0.0"
+	args := []string{"send-keys", "-t", target, "-H"}
+	for _, b := range []byte(data) {
+		args = append(args, fmt.Sprintf("%02x", b))
+	}
+	if out, err := exec.CommandContext(ctx, "tmux", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux send input: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

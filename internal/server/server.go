@@ -330,6 +330,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchProject(ctx, c, writeMu, f)
 	case "session.start",
 		"session.prompt",
+		"session.input",
 		"session.interrupt",
 		"session.resize",
 		"session.stop",
@@ -582,6 +583,20 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.prompt", map[string]any{"session_id": in.SessionID})
+	case "session.input":
+		var in struct {
+			SessionID string `json:"session_id"`
+			Data      string `json:"data"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		if err := mgr.SendInput(ctx, in.SessionID, in.Data); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.input", map[string]any{"session_id": in.SessionID})
 	case "session.interrupt":
 		var in struct {
 			SessionID string `json:"session_id"`

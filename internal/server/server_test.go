@@ -30,6 +30,7 @@ func (fakeSessionRuntime) Start(_ context.Context, spec sessions.RuntimeSpec) er
 }
 func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
 func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }
+func (fakeSessionRuntime) SendInput(context.Context, string, string) error    { return nil }
 func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
 func (fakeSessionRuntime) Resize(context.Context, string, int, int) error     { return nil }
 func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
