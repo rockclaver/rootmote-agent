@@ -324,6 +324,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"project.import",
 		"project.list",
 		"project.status",
+		"project.history",
 		"project.branch_create",
 		"project.branch_switch",
 		"project.delete":
@@ -507,6 +508,22 @@ func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "project.status", st)
+	case "project.history":
+		var in struct {
+			ID     string `json:"id"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		commits, err := mgr.History(in.ID, in.Limit, in.Offset)
+		if err != nil {
+			s.writeProjectErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "project.history", map[string]any{"commits": commits})
 	case "project.branch_create", "project.branch_switch":
 		var in struct {
 			ID     string `json:"id"`

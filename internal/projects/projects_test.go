@@ -139,6 +139,60 @@ func TestStatus_BranchDirtyAheadBehind(t *testing.T) {
 	}
 }
 
+func TestHistory_ReturnsRecentCommits(t *testing.T) {
+	m := newManager(t)
+	p, err := m.CreateEmpty("hist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := m.WorkspaceDir(p.ID)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", ".")
+	mustGit(t, dir, "commit", "-m", "first", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "commit", "-am", "second", "--quiet")
+
+	commits, err := m.History(p.ID, 1, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(commits) != 1 {
+		t.Fatalf("len: got %d want 1", len(commits))
+	}
+	if commits[0].Subject != "second" {
+		t.Fatalf("subject: got %q want second", commits[0].Subject)
+	}
+	next, err := m.History(p.ID, 1, 1)
+	if err != nil {
+		t.Fatalf("history offset: %v", err)
+	}
+	if len(next) != 1 || next[0].Subject != "first" {
+		t.Fatalf("offset history: got %+v want first", next)
+	}
+	if commits[0].SHA == "" || commits[0].ShortSHA == "" || commits[0].UnixTime == 0 {
+		t.Fatalf("incomplete commit: %+v", commits[0])
+	}
+}
+
+func TestHistory_EmptyRepoReturnsNoCommits(t *testing.T) {
+	m := newManager(t)
+	p, err := m.CreateEmpty("empty-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits, err := m.History(p.ID, 20, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(commits) != 0 {
+		t.Fatalf("commits: got %+v want none", commits)
+	}
+}
+
 // AC: "Branch create/switch operations succeed for both clean and dirty
 // trees, with explicit UI for the dirty case." — at this layer, the explicit
 // signal is ErrDirtyTree (UI translates that into a confirmation prompt).

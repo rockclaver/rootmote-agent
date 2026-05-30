@@ -42,6 +42,16 @@ type Status struct {
 	Behind      int    `json:"behind"`
 }
 
+// Commit is one entry from a project's local git history.
+type Commit struct {
+	SHA         string `json:"sha"`
+	ShortSHA    string `json:"short_sha"`
+	AuthorName  string `json:"author_name"`
+	AuthorEmail string `json:"author_email"`
+	UnixTime    int64  `json:"unix_time"`
+	Subject     string `json:"subject"`
+}
+
 // Manager owns the workspace root and the State Store.
 type Manager struct {
 	Root  string
@@ -170,6 +180,52 @@ func (m *Manager) Status(id string) (Status, error) {
 	return st, nil
 }
 
+// History returns recent commits from the project's local git repository.
+func (m *Manager) History(id string, limit int, offset int) ([]Commit, error) {
+	if _, err := m.Store.GetProject(id); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	dir := m.WorkspaceDir(id)
+	out, err := run(dir, "git", "log", "--skip", strconv.Itoa(offset), "-n", strconv.Itoa(limit), "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%s%x1e")
+	if err != nil {
+		if isNoCommitsError(out) {
+			return []Commit{}, nil
+		}
+		return nil, fmt.Errorf("history: %w", err)
+	}
+	records := strings.Split(out, "\x1e")
+	commits := make([]Commit, 0, len(records))
+	for _, record := range records {
+		record = strings.TrimSpace(record)
+		if record == "" {
+			continue
+		}
+		parts := strings.SplitN(record, "\x1f", 6)
+		if len(parts) != 6 {
+			return nil, fmt.Errorf("history: malformed git log record")
+		}
+		ts, err := strconv.ParseInt(parts[4], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("history: parse commit time: %w", err)
+		}
+		commits = append(commits, Commit{
+			SHA:         parts[0],
+			ShortSHA:    parts[1],
+			AuthorName:  parts[2],
+			AuthorEmail: parts[3],
+			UnixTime:    ts,
+			Subject:     parts[5],
+		})
+	}
+	return commits, nil
+}
+
 // BranchCreate creates a new branch and switches to it. If force is false and
 // the tree is dirty, returns ErrDirtyTree so the UI can confirm.
 func (m *Manager) BranchCreate(id, branch string, force bool) error {
@@ -266,6 +322,12 @@ func isAuthError(out string) bool {
 		return true
 	}
 	return false
+}
+
+func isNoCommitsError(out string) bool {
+	s := strings.ToLower(out)
+	return strings.Contains(s, "does not have any commits yet") ||
+		strings.Contains(s, "your current branch") && strings.Contains(s, "does not have any commits")
 }
 
 func countNonEmptyLines(s string) int {
