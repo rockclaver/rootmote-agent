@@ -38,7 +38,7 @@ func TestIssue43ProcessList_MapsProcFixturesAndSorts(t *testing.T) {
 	if len(byCPU) != 2 {
 		t.Fatalf("len = %d", len(byCPU))
 	}
-	if byCPU[0].PID != 100 || byCPU[0].User != "app" || byCPU[0].Command != "node server.js" {
+	if byCPU[0].PID != 100 || byCPU[0].User != "app" || byCPU[0].Command != "node server.js" || byCPU[0].StartTimeTicks != 1000 {
 		t.Fatalf("bad cpu first: %+v", byCPU[0])
 	}
 	if byCPU[0].CPUPercent <= byCPU[1].CPUPercent {
@@ -84,7 +84,7 @@ func TestIssue43ProtectedPIDGuardRejectsBeforeSignal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = mgr.Kill(context.Background(), tc.pid, SignalTerm)
+			err = mgr.Kill(context.Background(), tc.pid, 1, SignalTerm)
 			if !errors.Is(err, ErrProtectedPID) {
 				t.Fatalf("err = %v, want protected", err)
 			}
@@ -115,14 +115,41 @@ func TestIssue43ProcessKillUsesTermByDefaultAndKillEscalation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.Kill(context.Background(), 77, ""); err != nil {
+	if err := mgr.Kill(context.Background(), 77, 1, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.Kill(context.Background(), 77, SignalKill); err != nil {
+	if err := mgr.Kill(context.Background(), 77, 1, SignalKill); err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 || got[0] != syscall.SIGTERM || got[1] != syscall.SIGKILL {
 		t.Fatalf("signals = %v", got)
+	}
+}
+
+func TestIssue43ProcessKillRejectsPIDReuseBeforeSignal(t *testing.T) {
+	root := t.TempDir()
+	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1000, 1)
+	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
+	var signalled bool
+	mgr, err := New(Config{
+		ProcRoot:     root,
+		AgentPID:     999,
+		TmuxPanePIDs: func(context.Context) []int { return nil },
+		Signal: func(pid int, sig syscall.Signal) error {
+			signalled = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProc(t, root, 77, "other", "1000", "other\x00", 1, 1, 2000, 1)
+	err = mgr.Kill(context.Background(), 77, 1000, SignalTerm)
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("err = %v, want identity mismatch", err)
+	}
+	if signalled {
+		t.Fatal("signal called for reused pid")
 	}
 }
 

@@ -28,6 +28,7 @@ const (
 var (
 	ErrProtectedPID      = errors.New("process: protected pid")
 	ErrUnsupportedSignal = errors.New("process: unsupported signal")
+	ErrIdentityMismatch  = errors.New("process: identity mismatch")
 )
 
 type ProtectedPIDError struct {
@@ -42,13 +43,14 @@ func (e *ProtectedPIDError) Error() string {
 func (e *ProtectedPIDError) Unwrap() error { return ErrProtectedPID }
 
 type Process struct {
-	PID           int     `json:"pid"`
-	User          string  `json:"user"`
-	Command       string  `json:"command"`
-	CPUPercent    float64 `json:"cpu_percent"`
-	RSSBytes      uint64  `json:"rss_bytes"`
-	Protected     bool    `json:"protected"`
-	ProtectReason string  `json:"protect_reason,omitempty"`
+	PID            int     `json:"pid"`
+	User           string  `json:"user"`
+	Command        string  `json:"command"`
+	CPUPercent     float64 `json:"cpu_percent"`
+	RSSBytes       uint64  `json:"rss_bytes"`
+	StartTimeTicks uint64  `json:"start_time_ticks"`
+	Protected      bool    `json:"protected"`
+	ProtectReason  string  `json:"protect_reason,omitempty"`
 }
 
 type FileReader interface {
@@ -181,9 +183,12 @@ func (m *Manager) List(ctx context.Context, sortBy string, limit int) ([]Process
 	return out, nil
 }
 
-func (m *Manager) Kill(ctx context.Context, pid int, signalName string) error {
+func (m *Manager) Kill(ctx context.Context, pid int, startTimeTicks uint64, signalName string) error {
 	if pid <= 0 {
 		return errors.New("process: pid required")
+	}
+	if startTimeTicks == 0 {
+		return errors.New("process: start_time_ticks required")
 	}
 	sig, err := parseSignal(signalName)
 	if err != nil {
@@ -191,6 +196,13 @@ func (m *Manager) Kill(ctx context.Context, pid int, signalName string) error {
 	}
 	if reason, ok := m.protected(ctx)[pid]; ok {
 		return &ProtectedPIDError{PID: pid, Reason: reason}
+	}
+	p, err := m.readProcess(pid, 0)
+	if err != nil {
+		return err
+	}
+	if p.StartTimeTicks != startTimeTicks {
+		return fmt.Errorf("%w: pid %d start_time_ticks changed from %d to %d", ErrIdentityMismatch, pid, startTimeTicks, p.StartTimeTicks)
 	}
 	return m.signal(pid, sig)
 }
@@ -264,11 +276,12 @@ func (m *Manager) readProcess(pid int, uptime float64) (Process, error) {
 		rssBytes = uint64(stat.rssPages) * m.pageSize
 	}
 	return Process{
-		PID:        pid,
-		User:       m.lookupUser(uid),
-		Command:    cmd,
-		CPUPercent: cpuPercent(stat, uptime, m.clockTicks, m.numCPU),
-		RSSBytes:   rssBytes,
+		PID:            pid,
+		User:           m.lookupUser(uid),
+		Command:        cmd,
+		CPUPercent:     cpuPercent(stat, uptime, m.clockTicks, m.numCPU),
+		RSSBytes:       rssBytes,
+		StartTimeTicks: stat.startTicks,
 	}, nil
 }
 
@@ -280,7 +293,7 @@ type procStat struct {
 	command    string
 	utime      float64
 	stime      float64
-	startTicks float64
+	startTicks uint64
 	rssPages   int64
 }
 
@@ -303,7 +316,7 @@ func parseStat(raw string) (procStat, error) {
 	if err != nil {
 		return procStat{}, err
 	}
-	start, err := strconv.ParseFloat(fields[19], 64)
+	start, err := strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {
 		return procStat{}, err
 	}
@@ -379,7 +392,7 @@ func cpuPercent(st procStat, uptime, clockTicks float64, numCPU int) float64 {
 	if uptime <= 0 || clockTicks <= 0 {
 		return 0
 	}
-	elapsed := uptime - (st.startTicks / clockTicks)
+	elapsed := uptime - (float64(st.startTicks) / clockTicks)
 	if elapsed <= 0 {
 		return 0
 	}

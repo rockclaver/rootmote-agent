@@ -1996,7 +1996,7 @@ func TestProcessKill_TokenRequiredAndAudit(t *testing.T) {
 	}
 	cfg := Config{Addr: "127.0.0.1:0", Processes: pm, Review: rm}
 
-	payload, _ := json.Marshal(map[string]any{"pid": 77})
+	payload, _ := json.Marshal(map[string]any{"pid": 77, "start_time_ticks": 1})
 	resp := systemdRoundTrip(t, cfg, "infra.process.kill", payload)
 	if resp.Kind != "error.token_invalid" {
 		t.Fatalf("missing token kind = %q", resp.Kind)
@@ -2005,12 +2005,12 @@ func TestProcessKill_TokenRequiredAndAudit(t *testing.T) {
 		t.Fatalf("signal without token: %v", signals)
 	}
 
-	action, projectID, files := processKillTokenBinding(77, agentprocess.SignalTerm)
+	action, projectID, files := processKillTokenBinding(77, 1, agentprocess.SignalTerm)
 	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, _ = json.Marshal(map[string]any{"pid": 77, "confirmation_token": tok.Token})
+	payload, _ = json.Marshal(map[string]any{"pid": 77, "start_time_ticks": 1, "confirmation_token": tok.Token})
 	resp = systemdRoundTrip(t, cfg, "infra.process.kill", payload)
 	if resp.Kind != "infra.process.kill" {
 		t.Fatalf("ok kind = %q payload = %s", resp.Kind, resp.Payload)
@@ -2024,6 +2024,49 @@ func TestProcessKill_TokenRequiredAndAudit(t *testing.T) {
 	}
 	if len(entries) == 0 || !strings.Contains(entries[0].Summary, "succeeded") {
 		t.Fatalf("missing success audit: %+v", entries)
+	}
+}
+
+// Review #3329181602: confirmation binding includes start_time_ticks so a
+// token cannot authorize a reused PID.
+func TestProcessKill_RejectsPIDReuseAfterConfirmation(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	root := filepath.Join(dir, "proc")
+	writeProcFixture(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1000, 1)
+	mustWriteFile(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
+	var signalled bool
+	pm, err := agentprocess.New(agentprocess.Config{
+		ProcRoot:     root,
+		AgentPID:     999,
+		TmuxPanePIDs: func(context.Context) []int { return nil },
+		Signal: func(int, syscall.Signal) error {
+			signalled = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Processes: pm, Review: rm}
+	action, projectID, files := processKillTokenBinding(77, 1000, agentprocess.SignalTerm)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProcFixture(t, root, 77, "other", "1000", "other\x00", 1, 1, 2000, 1)
+	payload, _ := json.Marshal(map[string]any{"pid": 77, "start_time_ticks": 1000, "confirmation_token": tok.Token})
+	resp := systemdRoundTrip(t, cfg, "infra.process.kill", payload)
+	if resp.Kind != "error.process_identity_mismatch" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if signalled {
+		t.Fatal("reused pid was signalled")
 	}
 }
 
@@ -2055,12 +2098,12 @@ func TestProcessKill_ProtectedPIDRejectedBeforeSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{Addr: "127.0.0.1:0", Processes: pm, Review: rm}
-	action, projectID, files := processKillTokenBinding(66, agentprocess.SignalTerm)
+	action, projectID, files := processKillTokenBinding(66, 1, agentprocess.SignalTerm)
 	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, _ := json.Marshal(map[string]any{"pid": 66, "confirmation_token": tok.Token})
+	payload, _ := json.Marshal(map[string]any{"pid": 66, "start_time_ticks": 1, "confirmation_token": tok.Token})
 	resp := systemdRoundTrip(t, cfg, "infra.process.kill", payload)
 	if resp.Kind != "error.protected_pid" {
 		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)

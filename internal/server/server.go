@@ -1908,11 +1908,11 @@ func (s *Server) dispatchSystemd(ctx context.Context, c *websocket.Conn, writeMu
 	}
 }
 
-func processKillTokenBinding(pid int, signal string) (string, string, []string) {
+func processKillTokenBinding(pid int, startTimeTicks uint64, signal string) (string, string, []string) {
 	if signal == "" {
 		signal = agentprocess.SignalTerm
 	}
-	return "infra.process.kill." + signal, "infra", []string{fmt.Sprintf("pid:%d", pid)}
+	return "infra.process.kill." + signal, "infra", []string{fmt.Sprintf("pid:%d:start:%d", pid, startTimeTicks)}
 }
 
 func (s *Server) auditProcessKill(pid int, signal string, ok bool, summary string) store.AuditEntry {
@@ -1969,11 +1969,12 @@ func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu
 	case "infra.process.kill":
 		var in struct {
 			PID               int    `json:"pid"`
+			StartTimeTicks    uint64 `json:"start_time_ticks"`
 			Signal            string `json:"signal"`
 			ConfirmationToken string `json:"confirmation_token"`
 		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.PID <= 0 {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "pid required")
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.PID <= 0 || in.StartTimeTicks == 0 {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "pid and start_time_ticks required")
 			return
 		}
 		if in.Signal == "" {
@@ -1989,13 +1990,13 @@ func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu
 			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
 			return
 		}
-		tokenAction, projectID, files := processKillTokenBinding(in.PID, in.Signal)
+		tokenAction, projectID, files := processKillTokenBinding(in.PID, in.StartTimeTicks, in.Signal)
 		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
 			s.auditProcessKill(in.PID, in.Signal, false, err.Error())
 			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
 			return
 		}
-		if err := s.cfg.Processes.Kill(ctx, in.PID, in.Signal); err != nil {
+		if err := s.cfg.Processes.Kill(ctx, in.PID, in.StartTimeTicks, in.Signal); err != nil {
 			s.auditProcessKill(in.PID, in.Signal, false, err.Error())
 			var pe *agentprocess.ProtectedPIDError
 			if errors.As(err, &pe) {
@@ -2004,6 +2005,10 @@ func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu
 			}
 			if errors.Is(err, agentprocess.ErrUnsupportedSignal) {
 				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrIdentityMismatch) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", err.Error())
 				return
 			}
 			s.writeError(ctx, c, writeMu, f.ID, "process_error", err.Error())
