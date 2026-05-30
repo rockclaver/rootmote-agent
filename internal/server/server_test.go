@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
+	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -1933,9 +1936,163 @@ func TestSystemdServiceAction_ProtectedUnitRejectedBeforeToken(t *testing.T) {
 	}
 }
 
+// AC issue #43: infra.process.list returns mapped process rows from /proc.
+func TestProcessListOverWS(t *testing.T) {
+	root := t.TempDir()
+	writeProcFixture(t, root, 100, "worker", "1000", "worker\x00--serve\x00", 200, 100, 1000, 12)
+	mustWriteFile(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
+	mgr, err := agentprocess.New(agentprocess.Config{
+		ProcRoot:     root,
+		PageSize:     1024,
+		ClockTicks:   100,
+		NumCPU:       1,
+		AgentPID:     999,
+		TmuxPanePIDs: func(context.Context) []int { return nil },
+		LookupUser:   func(string) string { return "app" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"sort": "cpu", "limit": 5})
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Processes: mgr}, "infra.process.list", payload)
+	if resp.Kind != "infra.process.list" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Processes []agentprocess.Process `json:"processes"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Processes) != 1 || out.Processes[0].PID != 100 || out.Processes[0].User != "app" {
+		t.Fatalf("unexpected processes: %+v", out.Processes)
+	}
+}
+
+// AC issue #43: guarded process kill rejects missing token and audits success.
+func TestProcessKill_TokenRequiredAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	root := filepath.Join(dir, "proc")
+	writeProcFixture(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1, 1)
+	mustWriteFile(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
+	var signals []syscall.Signal
+	pm, err := agentprocess.New(agentprocess.Config{
+		ProcRoot:     root,
+		AgentPID:     999,
+		TmuxPanePIDs: func(context.Context) []int { return nil },
+		Signal: func(pid int, sig syscall.Signal) error {
+			signals = append(signals, sig)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Processes: pm, Review: rm}
+
+	payload, _ := json.Marshal(map[string]any{"pid": 77})
+	resp := systemdRoundTrip(t, cfg, "infra.process.kill", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token kind = %q", resp.Kind)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("signal without token: %v", signals)
+	}
+
+	action, projectID, files := processKillTokenBinding(77, agentprocess.SignalTerm)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"pid": 77, "confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.process.kill", payload)
+	if resp.Kind != "infra.process.kill" {
+		t.Fatalf("ok kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if len(signals) != 1 || signals[0] != syscall.SIGTERM {
+		t.Fatalf("signals = %v", signals)
+	}
+	entries, err := rm.ListAudit("infra.process.kill", "infra", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 || !strings.Contains(entries[0].Summary, "succeeded") {
+		t.Fatalf("missing success audit: %+v", entries)
+	}
+}
+
+// AC issue #43: protected PID guard rejects before token consumption/signalling.
+func TestProcessKill_ProtectedPIDRejectedBeforeSignal(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	root := filepath.Join(dir, "proc")
+	writeProcFixture(t, root, 66, "bash", "1000", "bash\x00", 1, 1, 1, 1)
+	mustWriteFile(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
+	var signalled bool
+	pm, err := agentprocess.New(agentprocess.Config{
+		ProcRoot: root,
+		AgentPID: 999,
+		TmuxPanePIDs: func(context.Context) []int {
+			return []int{66}
+		},
+		Signal: func(int, syscall.Signal) error {
+			signalled = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Processes: pm, Review: rm}
+	action, projectID, files := processKillTokenBinding(66, agentprocess.SignalTerm)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"pid": 66, "confirmation_token": tok.Token})
+	resp := systemdRoundTrip(t, cfg, "infra.process.kill", payload)
+	if resp.Kind != "error.protected_pid" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if signalled {
+		t.Fatal("protected pid was signalled")
+	}
+	if err := rm.ConsumeToken(tok.Token, action, projectID, files, ""); err != nil {
+		t.Fatalf("guard consumed token: %v", err)
+	}
+}
+
 func mustWriteFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeProcFixture(t *testing.T, root string, pid int, comm, uid, cmdline string, utime, stime, start, rss int) {
+	t.Helper()
+	dir := filepath.Join(root, fmt.Sprintf("%d", pid))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{
+		"S", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+		fmt.Sprintf("%d", utime), fmt.Sprintf("%d", stime), "0", "0", "20", "0", "1", "0", fmt.Sprintf("%d", start), "0", fmt.Sprintf("%d", rss),
+	}
+	mustWriteFile(t, filepath.Join(dir, "stat"), fmt.Sprintf("%d (%s) %s\n", pid, comm, strings.Join(fields, " ")))
+	mustWriteFile(t, filepath.Join(dir, "status"), "Name:\t"+comm+"\nUid:\t"+uid+"\t"+uid+"\t"+uid+"\t"+uid+"\n")
+	mustWriteFile(t, filepath.Join(dir, "cmdline"), cmdline)
+	mustWriteFile(t, filepath.Join(dir, "statm"), "100 "+fmt.Sprintf("%d", rss)+" 0 0 0 0 0\n")
+	mustWriteFile(t, filepath.Join(dir, "comm"), comm+"\n")
 }

@@ -22,6 +22,7 @@ import (
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
+	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
@@ -71,6 +72,8 @@ type Config struct {
 	Infra *infra.Manager
 	// Systemd, when non-nil, enables infra.service.* kinds.
 	Systemd *systemd.Manager
+	// Processes, when non-nil, enables infra.process.* kinds.
+	Processes *agentprocess.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -405,6 +408,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"infra.service.get",
 		"infra.service.action":
 		s.dispatchSystemd(ctx, c, writeMu, f)
+	case "infra.process.list",
+		"infra.process.kill":
+		s.dispatchProcess(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -1897,6 +1903,116 @@ func (s *Server) dispatchSystemd(ctx context.Context, c *websocket.Conn, writeMu
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.service.action", map[string]any{
 			"name":     in.Name,
 			"action":   in.Action,
+			"audit_id": audit.ID,
+		})
+	}
+}
+
+func processKillTokenBinding(pid int, signal string) (string, string, []string) {
+	if signal == "" {
+		signal = agentprocess.SignalTerm
+	}
+	return "infra.process.kill." + signal, "infra", []string{fmt.Sprintf("pid:%d", pid)}
+}
+
+func (s *Server) auditProcessKill(pid int, signal string, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	if signal == "" {
+		signal = agentprocess.SignalTerm
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"pid":     pid,
+		"signal":  signal,
+		"ok":      ok,
+		"summary": summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "infra.process.kill",
+		ProjectID: "infra",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("process %s %s for pid %d: %s", signal, status, pid, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Processes == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "process subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.process.list":
+		var in struct {
+			Sort  string `json:"sort"`
+			Limit int    `json:"limit"`
+		}
+		if len(f.Payload) > 0 {
+			if err := json.Unmarshal(f.Payload, &in); err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "invalid process list payload")
+				return
+			}
+		}
+		processes, err := s.cfg.Processes.List(ctx, in.Sort, in.Limit)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "process_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.process.list", map[string]any{"processes": processes})
+	case "infra.process.kill":
+		var in struct {
+			PID               int    `json:"pid"`
+			Signal            string `json:"signal"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.PID <= 0 {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "pid required")
+			return
+		}
+		if in.Signal == "" {
+			in.Signal = agentprocess.SignalTerm
+		}
+		// The protected-PID guard runs before token consumption or signalling.
+		if reason, ok := s.cfg.Processes.IsProtected(ctx, in.PID); ok {
+			s.auditProcessKill(in.PID, in.Signal, false, "protected pid")
+			s.writeError(ctx, c, writeMu, f.ID, "protected_pid", fmt.Sprintf("refused %s on protected pid %d: %s", in.Signal, in.PID, reason))
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := processKillTokenBinding(in.PID, in.Signal)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditProcessKill(in.PID, in.Signal, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		if err := s.cfg.Processes.Kill(ctx, in.PID, in.Signal); err != nil {
+			s.auditProcessKill(in.PID, in.Signal, false, err.Error())
+			var pe *agentprocess.ProtectedPIDError
+			if errors.As(err, &pe) {
+				s.writeError(ctx, c, writeMu, f.ID, "protected_pid", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrUnsupportedSignal) {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "process_error", err.Error())
+			return
+		}
+		audit := s.auditProcessKill(in.PID, in.Signal, true, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.process.kill", map[string]any{
+			"pid":      in.PID,
+			"signal":   in.Signal,
 			"audit_id": audit.ID,
 		})
 	}

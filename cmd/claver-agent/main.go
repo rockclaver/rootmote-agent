@@ -14,6 +14,7 @@ import (
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/previews"
+	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/server"
@@ -110,19 +111,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init systemd: %v", err)
 	}
+	processMgr, err := agentprocess.New(agentprocess.Config{})
+	if err != nil {
+		log.Fatalf("claver-agent: init process inspector: %v", err)
+	}
 
 	srv := server.New(server.Config{
-		Addr:     *addr,
-		Projects: mgr,
-		Sessions: sessionMgr,
-		Review:   reviewMgr,
-		GitHub:   githubMgr,
-		Previews: previewMgr,
-		Tooling:  toolingMgr,
-		Auth:     authMgr,
-		Docker:   dockerMgr,
-		Infra:    infraMgr,
-		Systemd:  systemdMgr,
+		Addr:      *addr,
+		Projects:  mgr,
+		Sessions:  sessionMgr,
+		Review:    reviewMgr,
+		GitHub:    githubMgr,
+		Previews:  previewMgr,
+		Tooling:   toolingMgr,
+		Auth:      authMgr,
+		Docker:    dockerMgr,
+		Infra:     infraMgr,
+		Systemd:   systemdMgr,
+		Processes: processMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
