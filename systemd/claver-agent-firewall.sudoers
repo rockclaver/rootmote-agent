@@ -1,0 +1,11 @@
+# Installed by claver-agent installer at /etc/sudoers.d/claver-agent-firewall.
+#
+# The agent runs as the unprivileged `claver` user. Firewall management
+# (ufw / firewall-cmd) requires root, so we grant passwordless NOPASSWD
+# access to just those two binaries. All mutations still go through the
+# agent's biometric + confirmation-token + anti-lockout pipeline before
+# this sudo call is ever made.
+#
+# Visudo syntax: use `Defaults!cmnd setenv` would re-enable env leakage;
+# keep the default env_reset.
+claver ALL=(root) NOPASSWD: /usr/sbin/ufw, /sbin/ufw, /usr/bin/firewall-cmd, /bin/firewall-cmd

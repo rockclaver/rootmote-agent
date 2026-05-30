@@ -12,8 +12,14 @@ ExecStart=/usr/local/bin/claver-agent --addr 127.0.0.1:7676
 Restart=on-failure
 RestartSec=2s
 
-# Hardening
-NoNewPrivileges=true
+# Hardening.
+# NoNewPrivileges is intentionally NOT set: firewall management
+# (ufw / firewall-cmd, issue #44) requires root and the agent escalates
+# via a sudoers.d fragment scoped to just those two binaries
+# (/etc/sudoers.d/claver-agent-firewall). NoNewPrivileges blocks setuid
+# which would break that path. All firewall mutations still pass through
+# the agent's biometric + confirmation-token + anti-lockout pipeline
+# before sudo is invoked.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

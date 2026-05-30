@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -18,18 +19,37 @@ func defaultRunner(ctx context.Context, name string, args ...string) ([]byte, er
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-// UFWBackend wraps the `ufw` CLI.
+// UFWBackend wraps the `ufw` CLI. When Sudo is true, commands are run via
+// `sudo -n ufw …` so the unprivileged agent user can call into a binary
+// that requires root. The packaged install ships a /etc/sudoers.d
+// fragment granting passwordless NOPASSWD access to ufw and firewall-cmd.
 type UFWBackend struct {
 	Run     runner
 	LookBin func(string) (string, error)
+	Sudo    bool
 }
 
-// NewUFWBackend returns a ufw Backend using exec.CommandContext.
+// NewUFWBackend returns a ufw Backend using exec.CommandContext. Sudo is
+// auto-enabled when the agent is not running as root, matching the
+// packaged install where the agent runs as `claver`.
 func NewUFWBackend() *UFWBackend {
-	return &UFWBackend{Run: defaultRunner, LookBin: exec.LookPath}
+	return &UFWBackend{Run: defaultRunner, LookBin: exec.LookPath, Sudo: needsSudo()}
 }
 
 func (u *UFWBackend) Kind() BackendKind { return BackendUFW }
+
+func (u *UFWBackend) run(ctx context.Context, args ...string) ([]byte, error) {
+	run := u.Run
+	if run == nil {
+		run = defaultRunner
+	}
+	name := "ufw"
+	if u.Sudo {
+		name = "sudo"
+		args = append([]string{"-n", "ufw"}, args...)
+	}
+	return run(ctx, name, args...)
+}
 
 func (u *UFWBackend) Available(ctx context.Context) error {
 	lookup := u.LookBin
@@ -39,22 +59,19 @@ func (u *UFWBackend) Available(ctx context.Context) error {
 	if _, err := lookup("ufw"); err != nil {
 		return fmt.Errorf("ufw not installed: %w", err)
 	}
-	run := u.Run
-	if run == nil {
-		run = defaultRunner
+	if u.Sudo {
+		if _, err := lookup("sudo"); err != nil {
+			return fmt.Errorf("sudo required to manage ufw as non-root: %w", err)
+		}
 	}
-	if _, err := run(ctx, "ufw", "status"); err != nil {
+	if _, err := u.run(ctx, "status"); err != nil {
 		return fmt.Errorf("ufw status: %w", err)
 	}
 	return nil
 }
 
 func (u *UFWBackend) Rules(ctx context.Context) ([]Rule, error) {
-	run := u.Run
-	if run == nil {
-		run = defaultRunner
-	}
-	out, err := run(ctx, "ufw", "status", "numbered")
+	out, err := u.run(ctx, "status", "numbered")
 	if err != nil {
 		return nil, fmt.Errorf("ufw status: %w", err)
 	}
@@ -62,30 +79,22 @@ func (u *UFWBackend) Rules(ctx context.Context) ([]Rule, error) {
 }
 
 func (u *UFWBackend) Add(ctx context.Context, r Rule) error {
-	run := u.Run
-	if run == nil {
-		run = defaultRunner
-	}
 	args := []string{string(r.Action), strconv.Itoa(r.Port)}
 	if r.Protocol == ProtoTCP || r.Protocol == ProtoUDP {
 		args[1] = fmt.Sprintf("%d/%s", r.Port, r.Protocol)
 	}
-	if _, err := run(ctx, "ufw", args...); err != nil {
+	if _, err := u.run(ctx, args...); err != nil {
 		return fmt.Errorf("ufw add: %w", err)
 	}
 	return nil
 }
 
 func (u *UFWBackend) Remove(ctx context.Context, r Rule) error {
-	run := u.Run
-	if run == nil {
-		run = defaultRunner
-	}
 	port := strconv.Itoa(r.Port)
 	if r.Protocol == ProtoTCP || r.Protocol == ProtoUDP {
 		port = fmt.Sprintf("%d/%s", r.Port, r.Protocol)
 	}
-	if _, err := run(ctx, "ufw", "delete", string(r.Action), port); err != nil {
+	if _, err := u.run(ctx, "delete", string(r.Action), port); err != nil {
 		return fmt.Errorf("ufw delete: %w", err)
 	}
 	return nil
@@ -145,16 +154,21 @@ func splitPortProto(tok string) (int, Protocol, bool) {
 	return port, proto, true
 }
 
-// FirewalldBackend wraps the `firewall-cmd` CLI.
+// FirewalldBackend wraps the `firewall-cmd` CLI. When Sudo is true,
+// commands are run via `sudo -n firewall-cmd …`.
 type FirewalldBackend struct {
 	Run     runner
 	LookBin func(string) (string, error)
+	Sudo    bool
 	// Zone is the firewalld zone the agent operates in; defaults to "public".
 	Zone string
 }
 
+// NewFirewalldBackend returns a firewalld Backend using
+// exec.CommandContext. Sudo is auto-enabled when the agent is not
+// running as root.
 func NewFirewalldBackend() *FirewalldBackend {
-	return &FirewalldBackend{Run: defaultRunner, LookBin: exec.LookPath}
+	return &FirewalldBackend{Run: defaultRunner, LookBin: exec.LookPath, Sudo: needsSudo()}
 }
 
 func (f *FirewalldBackend) Kind() BackendKind { return BackendFirewalld }
@@ -166,6 +180,19 @@ func (f *FirewalldBackend) zone() string {
 	return f.Zone
 }
 
+func (f *FirewalldBackend) run(ctx context.Context, args ...string) ([]byte, error) {
+	run := f.Run
+	if run == nil {
+		run = defaultRunner
+	}
+	name := "firewall-cmd"
+	if f.Sudo {
+		name = "sudo"
+		args = append([]string{"-n", "firewall-cmd"}, args...)
+	}
+	return run(ctx, name, args...)
+}
+
 func (f *FirewalldBackend) Available(ctx context.Context) error {
 	lookup := f.LookBin
 	if lookup == nil {
@@ -174,11 +201,12 @@ func (f *FirewalldBackend) Available(ctx context.Context) error {
 	if _, err := lookup("firewall-cmd"); err != nil {
 		return fmt.Errorf("firewall-cmd not installed: %w", err)
 	}
-	run := f.Run
-	if run == nil {
-		run = defaultRunner
+	if f.Sudo {
+		if _, err := lookup("sudo"); err != nil {
+			return fmt.Errorf("sudo required to manage firewalld as non-root: %w", err)
+		}
 	}
-	out, err := run(ctx, "firewall-cmd", "--state")
+	out, err := f.run(ctx, "--state")
 	if err != nil {
 		return fmt.Errorf("firewalld not running: %w", err)
 	}
@@ -189,11 +217,7 @@ func (f *FirewalldBackend) Available(ctx context.Context) error {
 }
 
 func (f *FirewalldBackend) Rules(ctx context.Context) ([]Rule, error) {
-	run := f.Run
-	if run == nil {
-		run = defaultRunner
-	}
-	out, err := run(ctx, "firewall-cmd", "--zone="+f.zone(), "--list-ports")
+	out, err := f.run(ctx, "--zone="+f.zone(), "--list-ports")
 	if err != nil {
 		return nil, fmt.Errorf("firewalld list-ports: %w", err)
 	}
@@ -209,10 +233,6 @@ func (f *FirewalldBackend) Rules(ctx context.Context) ([]Rule, error) {
 }
 
 func (f *FirewalldBackend) Add(ctx context.Context, r Rule) error {
-	run := f.Run
-	if run == nil {
-		run = defaultRunner
-	}
 	if r.Action != ActionAllow {
 		// firewalld models exposed ports as allow-list entries; deny is
 		// implicit. Reject explicit deny rules to keep the model honest.
@@ -223,28 +243,32 @@ func (f *FirewalldBackend) Add(ctx context.Context, r Rule) error {
 		proto = "tcp"
 	}
 	port := fmt.Sprintf("%d/%s", r.Port, proto)
-	if _, err := run(ctx, "firewall-cmd", "--zone="+f.zone(), "--add-port="+port, "--permanent"); err != nil {
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--add-port="+port, "--permanent"); err != nil {
 		return fmt.Errorf("firewalld add-port: %w", err)
 	}
-	_, _ = run(ctx, "firewall-cmd", "--reload")
+	_, _ = f.run(ctx, "--reload")
 	return nil
 }
 
 func (f *FirewalldBackend) Remove(ctx context.Context, r Rule) error {
-	run := f.Run
-	if run == nil {
-		run = defaultRunner
-	}
 	proto := strings.ToLower(string(r.Protocol))
 	if proto == string(ProtoAny) {
 		proto = "tcp"
 	}
 	port := fmt.Sprintf("%d/%s", r.Port, proto)
-	if _, err := run(ctx, "firewall-cmd", "--zone="+f.zone(), "--remove-port="+port, "--permanent"); err != nil {
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--remove-port="+port, "--permanent"); err != nil {
 		return fmt.Errorf("firewalld remove-port: %w", err)
 	}
-	_, _ = run(ctx, "firewall-cmd", "--reload")
+	_, _ = f.run(ctx, "--reload")
 	return nil
+}
+
+// needsSudo returns true when the current process is not running as
+// root. The packaged install runs the agent as `claver`, and ufw /
+// firewall-cmd require root, so we wrap with `sudo -n` via a
+// /etc/sudoers.d fragment shipped by the installer.
+func needsSudo() bool {
+	return os.Geteuid() != 0
 }
 
 // SSCommandReader is a SocketReader backed by `ss -tulnp`.

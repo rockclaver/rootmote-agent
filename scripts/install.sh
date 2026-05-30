@@ -129,6 +129,34 @@ else
   chmod 0644 "$UNIT_DST"
 fi
 
+# Install the firewall sudoers fragment so the agent (running as `claver`)
+# can call ufw / firewall-cmd through `sudo -n`. visudo --check ensures we
+# do not lay down a broken file that could lock out sudo entirely.
+SUDOERS_SRC="$(dirname "$0")/../systemd/claver-agent-firewall.sudoers"
+SUDOERS_DST="/etc/sudoers.d/claver-agent-firewall"
+if [[ -f "$SUDOERS_SRC" ]]; then
+  install -m 0440 "$SUDOERS_SRC" "$SUDOERS_DST.new"
+  if visudo -c -f "$SUDOERS_DST.new" >/dev/null; then
+    mv "$SUDOERS_DST.new" "$SUDOERS_DST"
+  else
+    rm -f "$SUDOERS_DST.new"
+    echo "warning: claver-agent-firewall sudoers fragment failed visudo check; firewall management will be read-only" >&2
+  fi
+else
+  sudoers_url="${RELEASE_BASE}/v${VERSION}/claver-agent-firewall.sudoers"
+  if curl -fsSL "$sudoers_url" -o "$SUDOERS_DST.new"; then
+    chmod 0440 "$SUDOERS_DST.new"
+    if visudo -c -f "$SUDOERS_DST.new" >/dev/null; then
+      mv "$SUDOERS_DST.new" "$SUDOERS_DST"
+    else
+      rm -f "$SUDOERS_DST.new"
+      echo "warning: claver-agent-firewall sudoers fragment failed visudo check; firewall management will be read-only" >&2
+    fi
+  else
+    echo "warning: claver-agent-firewall sudoers fragment not found; firewall management will be read-only" >&2
+  fi
+fi
+
 systemctl daemon-reload
 systemctl enable claver-agent.service
 # `enable --now` only starts inactive units; on re-install we have just

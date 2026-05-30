@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -345,6 +346,45 @@ func TestParseUFWRules(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("parseUFWRules = %+v\nwant %+v", got, want)
+	}
+}
+
+// Review comment #3329218455: in the packaged install the agent runs as
+// `claver`, so ufw / firewall-cmd must be invoked through a privileged
+// path. When Sudo=true the backends must prepend `sudo -n`.
+func TestBackends_SudoWraps_RealCommand(t *testing.T) {
+	var calls []string
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return []byte("running"), nil
+	}
+	lookup := func(string) (string, error) { return "/usr/bin/x", nil }
+
+	u := &UFWBackend{Run: run, LookBin: lookup, Sudo: true}
+	if err := u.Available(context.Background()); err != nil {
+		t.Fatalf("ufw available: %v", err)
+	}
+	if err := u.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 80}); err != nil {
+		t.Fatalf("ufw add: %v", err)
+	}
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "sudo -n ufw ") {
+			t.Fatalf("ufw call not wrapped with sudo -n: %q", c)
+		}
+	}
+
+	calls = nil
+	f := &FirewalldBackend{Run: run, LookBin: lookup, Sudo: true}
+	if err := f.Available(context.Background()); err != nil {
+		t.Fatalf("firewalld available: %v", err)
+	}
+	if err := f.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 80}); err != nil {
+		t.Fatalf("firewalld add: %v", err)
+	}
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "sudo -n firewall-cmd ") {
+			t.Fatalf("firewalld call not wrapped with sudo -n: %q", c)
+		}
 	}
 }
 
