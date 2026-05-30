@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"path/filepath"
@@ -214,6 +215,32 @@ func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
 	}
 	if len(rt.prompts) != 1 || rt.prompts[0] != "s1:explain" {
 		t.Fatalf("prompt not delivered: %+v", rt.prompts)
+	}
+}
+
+func TestClaudeFirstRunAdvancer_SelectsDefaultThemeOnce(t *testing.T) {
+	var out bytes.Buffer
+	var sends []string
+	w := newClaudeFirstRunAdvancer(&out, "s1", func(_ context.Context, sessionID string) error {
+		sends = append(sends, sessionID)
+		return nil
+	})
+
+	if _, err := w.Write([]byte("\x1b[2mChoose the text ")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("style that looks best with your terminal\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("Syntax theme: Monokai Extended\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := out.String(); !strings.Contains(got, "Choose the text style") {
+		t.Fatalf("output was not forwarded: %q", got)
+	}
+	if len(sends) != 1 || sends[0] != "s1" {
+		t.Fatalf("enter sends mismatch: %+v", sends)
 	}
 }
 

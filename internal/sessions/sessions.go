@@ -3,7 +3,6 @@
 package sessions
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -339,6 +338,8 @@ func (w *eventWriter) Write(p []byte) (int, error) {
 
 var usageRE = regexp.MustCompile(`(?i)(input|prompt)[^0-9]*(\d+).*?(output|completion)[^0-9]*(\d+)`)
 
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)`)
+
 func parseUsage(s string) (int, int, bool) {
 	m := usageRE.FindStringSubmatch(s)
 	if len(m) != 5 {
@@ -348,6 +349,27 @@ func parseUsage(s string) (int, int, bool) {
 	_, _ = fmt.Sscanf(m[2], "%d", &in)
 	_, _ = fmt.Sscanf(m[4], "%d", &out)
 	return in, out, true
+}
+
+func cleanTerminalText(s string) string {
+	s = ansiRE.ReplaceAllString(s, "")
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, s)
+}
+
+func isClaudeFirstRunSetup(s string) bool {
+	compact := strings.ToLower(strings.ReplaceAll(s, " ", ""))
+	return strings.Contains(compact, "choosethetextstyle") ||
+		strings.Contains(compact, "syntaxtheme:") ||
+		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted"))
 }
 
 // TmuxRuntime exec's tmux to host agent CLIs. ExtraPath, when set, is
@@ -418,21 +440,85 @@ func (r TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
 			return
 		}
 		defer f.Close()
-		scanPipe(f, spec.Output)
+		output := spec.Output
+		if spec.Agent == "claude" {
+			output = newClaudeFirstRunAdvancer(spec.Output, spec.SessionID, sendTmuxEnter)
+		}
+		scanPipe(f, output)
 	}()
 	pipeCmd := "cat > " + shellQuote(fifo)
 	if out, err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", target, "-o", pipeCmd).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux pipe-pane: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	if spec.Agent == "claude" {
+		r.advanceClaudeFirstRunSetup(ctx, spec.SessionID)
+	}
 	return nil
 }
 
+func (r TmuxRuntime) advanceClaudeFirstRunSetup(ctx context.Context, sessionID string) {
+	data, err := r.Capture(ctx, sessionID)
+	if err != nil || data == "" {
+		return
+	}
+	if isClaudeFirstRunSetup(cleanTerminalText(data)) {
+		_ = sendTmuxEnter(ctx, sessionID)
+	}
+}
+
+type claudeFirstRunAdvancer struct {
+	out       io.Writer
+	sessionID string
+	sendEnter func(context.Context, string) error
+
+	mu       sync.Mutex
+	advanced bool
+	buffer   string
+}
+
+func newClaudeFirstRunAdvancer(out io.Writer, sessionID string, sendEnter func(context.Context, string) error) io.Writer {
+	return &claudeFirstRunAdvancer{
+		out:       out,
+		sessionID: sessionID,
+		sendEnter: sendEnter,
+	}
+}
+
+func (w *claudeFirstRunAdvancer) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	if len(p) == 0 {
+		return n, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.advanced {
+		return n, err
+	}
+	clean := cleanTerminalText(string(p))
+	if clean == "" {
+		return n, err
+	}
+	w.buffer += clean
+	if len(w.buffer) > 4096 {
+		w.buffer = w.buffer[len(w.buffer)-4096:]
+	}
+	if isClaudeFirstRunSetup(w.buffer) {
+		w.advanced = true
+		_ = w.sendEnter(context.Background(), w.sessionID)
+	}
+	return n, err
+}
+
+// scanPipe forwards pty bytes from the tmux pipe as soon as they arrive.
+// Codex (and Claude) are full-screen TUIs that emit ANSI redraws with no
+// newlines between frames, so a newline-gated reader would stall and the
+// pane would appear frozen on the client.
 func scanPipe(r io.Reader, w io.Writer) {
-	br := bufio.NewReader(r)
+	buf := make([]byte, 4096)
 	for {
-		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			_, _ = w.Write(line)
+		n, err := r.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
 		}
 		if err != nil {
 			return
@@ -445,6 +531,14 @@ func (TmuxRuntime) SendPrompt(ctx context.Context, sessionID, prompt string) err
 	if out, err := exec.CommandContext(ctx, "tmux", "send-keys", "-t", target, "-l", prompt).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send prompt: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	if out, err := exec.CommandContext(ctx, "tmux", "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux send enter: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func sendTmuxEnter(ctx context.Context, sessionID string) error {
+	target := tmuxName(sessionID) + ":0.0"
 	if out, err := exec.CommandContext(ctx, "tmux", "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send enter: %w: %s", err, strings.TrimSpace(string(out)))
 	}
