@@ -142,6 +142,67 @@ func TestStreamHub_NoEventLossWithSlowClient(t *testing.T) {
 	}
 }
 
+// Issue #57 AC: "Every started session loads relevant memory into the agent
+// prompt context." Start injects the MemorySource block as the agent's first
+// prompt and records it as a "memory" event.
+func TestStartSession_InjectsProjectMemory(t *testing.T) {
+	m, rt := newTestManager(t)
+	m.MemorySource = func(projectID string) string {
+		if projectID != "p1" {
+			t.Fatalf("memory requested for wrong project: %q", projectID)
+		}
+		return "# Project memory\nUse tabs.\n"
+	}
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.prompts) != 1 || !strings.Contains(rt.prompts[0], "Use tabs") {
+		t.Fatalf("memory not injected as prompt: %+v", rt.prompts)
+	}
+	evs, _ := m.Store.SessionEventsAfter("s1", 0)
+	var sawMemory bool
+	for _, ev := range evs {
+		if ev.Type == "memory" && strings.Contains(ev.Data, "Use tabs") {
+			sawMemory = true
+		}
+	}
+	if !sawMemory {
+		t.Fatalf("memory event not recorded: %+v", evs)
+	}
+}
+
+// Empty memory must not inject any prompt.
+func TestStartSession_NoMemoryNoPrompt(t *testing.T) {
+	m, rt := newTestManager(t)
+	m.MemorySource = func(string) string { return "  " }
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.prompts) != 0 {
+		t.Fatalf("expected no injected prompt, got %+v", rt.prompts)
+	}
+}
+
+// Stop fires the OnEnd hook with the ended session row (EndedAt populated).
+func TestStop_FiresOnEndHook(t *testing.T) {
+	m, _ := newTestManager(t)
+	var got store.Session
+	called := 0
+	m.OnEnd = func(_ context.Context, sess store.Session) {
+		called++
+		got = sess
+	}
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 || got.ID != "s1" || got.EndedAt == nil {
+		t.Fatalf("OnEnd not fired correctly: called=%d sess=%+v", called, got)
+	}
+}
+
 // Review comment #3323370015: replaying more events than the subscriber buffer
 // must not block Subscribe before the caller can start reading.
 func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {

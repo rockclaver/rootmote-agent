@@ -25,6 +25,7 @@ import (
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/inbox"
 	"github.com/rockclaver/claver/agent/internal/infra"
+	"github.com/rockclaver/claver/agent/internal/memory"
 	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
@@ -97,6 +98,9 @@ type Config struct {
 	// PushDevices, when non-nil, enables push.register / push.unregister
 	// for FCM device-token management.
 	PushDevices *store.Store
+	// Memory, when non-nil, enables memory.* and journal.* kinds (Stickiness
+	// #5: per-project agent memory + project journal).
+	Memory *memory.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -472,6 +476,16 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchRunbook(ctx, c, writeMu, f)
 	case "push.register", "push.unregister", "push.list":
 		s.dispatchPush(ctx, c, writeMu, f)
+	case "memory.list",
+		"memory.create",
+		"memory.update",
+		"memory.delete",
+		"memory.proposals",
+		"memory.confirm",
+		"memory.reject",
+		"journal.list",
+		"journal.export":
+		s.dispatchMemory(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -3005,6 +3019,226 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "push.list", map[string]any{"devices": devices})
+	}
+}
+
+// MemoryDTO is the wire shape of a project_memory row.
+type MemoryDTO struct {
+	ID              string `json:"id"`
+	ProjectID       string `json:"project_id"`
+	Kind            string `json:"kind"`
+	Title           string `json:"title"`
+	Body            string `json:"body"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+	SourceSessionID string `json:"source_session_id,omitempty"`
+}
+
+func toMemoryDTO(m store.ProjectMemory) MemoryDTO {
+	return MemoryDTO{
+		ID: m.ID, ProjectID: m.ProjectID, Kind: m.Kind, Title: m.Title, Body: m.Body,
+		CreatedAt: m.CreatedAt.Unix(), UpdatedAt: m.UpdatedAt.Unix(), SourceSessionID: m.SourceSessionID,
+	}
+}
+
+// MemoryProposalDTO is the wire shape of a pending AI-proposed memory entry.
+type MemoryProposalDTO struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"project_id"`
+	SessionID string `json:"session_id,omitempty"`
+	Kind      string `json:"kind"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func toProposalDTO(p memory.Proposal) MemoryProposalDTO {
+	return MemoryProposalDTO{
+		ID: p.ID, ProjectID: p.ProjectID, SessionID: p.SessionID,
+		Kind: p.Kind, Title: p.Title, Body: p.Body, CreatedAt: p.CreatedAt.Unix(),
+	}
+}
+
+// JournalEntryDTO is the wire shape of a project_journal_entry row.
+type JournalEntryDTO struct {
+	ID         int64  `json:"id"`
+	ProjectID  string `json:"project_id"`
+	Kind       string `json:"kind"`
+	Summary    string `json:"summary"`
+	OccurredAt int64  `json:"occurred_at"`
+	RefID      string `json:"ref_id,omitempty"`
+}
+
+func toJournalDTO(e store.JournalEntry) JournalEntryDTO {
+	return JournalEntryDTO{
+		ID: e.ID, ProjectID: e.ProjectID, Kind: e.Kind, Summary: e.Summary,
+		OccurredAt: e.OccurredAt.Unix(), RefID: e.RefID,
+	}
+}
+
+func (s *Server) dispatchMemory(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Memory == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "memory subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Memory
+	switch f.Kind {
+	case "memory.list":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		rows, err := mgr.ListMemory(in.ProjectID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		out := make([]MemoryDTO, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, toMemoryDTO(r))
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.list", map[string]any{"memories": out})
+	case "memory.create":
+		var in struct {
+			ProjectID string `json:"project_id"`
+			Kind      string `json:"kind"`
+			Title     string `json:"title"`
+			Body      string `json:"body"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		row, err := mgr.CreateMemory(in.ProjectID, in.Kind, in.Title, in.Body, "")
+		if err != nil {
+			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.create", toMemoryDTO(row))
+	case "memory.update":
+		var in struct {
+			ID    string `json:"id"`
+			Kind  string `json:"kind"`
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		row, err := mgr.UpdateMemory(in.ID, in.Kind, in.Title, in.Body)
+		if err != nil {
+			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.update", toMemoryDTO(row))
+	case "memory.delete":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		if err := mgr.DeleteMemory(in.ID); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.delete", map[string]any{"id": in.ID})
+	case "memory.proposals":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		props := mgr.ListProposals(in.ProjectID)
+		out := make([]MemoryProposalDTO, 0, len(props))
+		for _, p := range props {
+			out = append(out, toProposalDTO(p))
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.proposals", map[string]any{"proposals": out})
+	case "memory.confirm":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		row, err := mgr.ConfirmProposal(in.ID)
+		if err != nil {
+			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.confirm", toMemoryDTO(row))
+	case "memory.reject":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		if err := mgr.RejectProposal(in.ID); err != nil {
+			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "memory.reject", map[string]any{"id": in.ID})
+	case "journal.list":
+		var in struct {
+			ProjectID string `json:"project_id"`
+			Kind      string `json:"kind"`
+			Cursor    int64  `json:"cursor"`
+			Limit     int    `json:"limit"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		entries, next, err := mgr.ListJournal(in.ProjectID, in.Kind, in.Cursor, in.Limit)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		out := make([]JournalEntryDTO, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, toJournalDTO(e))
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "journal.list", map[string]any{"entries": out, "next_cursor": next})
+	case "journal.export":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		name := ""
+		if s.cfg.Projects != nil {
+			if p, err := s.cfg.Projects.Get(in.ProjectID); err == nil {
+				name = p.Name
+			}
+		}
+		md, err := mgr.ExportJournalMarkdown(in.ProjectID, name)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "journal.export", map[string]any{"markdown": md})
+	}
+}
+
+func (s *Server) writeMemoryErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
+	switch {
+	case errors.Is(err, memory.ErrNotFound), errors.Is(err, memory.ErrNoProposal):
+		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
+	case errors.Is(err, memory.ErrBadKind), errors.Is(err, memory.ErrEmptyTitle),
+		errors.Is(err, memory.ErrNoProject), errors.Is(err, memory.ErrBadJournal):
+		s.writeError(ctx, c, writeMu, id, "bad_payload", err.Error())
+	default:
+		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
 	}
 }
 

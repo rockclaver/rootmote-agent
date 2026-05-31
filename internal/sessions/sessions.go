@@ -57,6 +57,14 @@ type Manager struct {
 	Now      func() time.Time
 	IDGen    func() string
 	AuthOK   func(context.Context, string) bool
+	// MemorySource, when set, returns a token-bounded block of project memory
+	// to inject as the agent's first context turn on session start. An empty
+	// string means "nothing to inject". Wired to memory.Manager.Render.
+	MemorySource func(projectID string) string
+	// OnEnd, when set, is invoked once after a session is marked ended (via
+	// Stop or the reaper). Wired to the project-journal summarizer. It must
+	// not block the caller for long; production wraps it in a goroutine.
+	OnEnd func(ctx context.Context, sess store.Session)
 
 	mu   sync.Mutex
 	subs map[string]map[*subscriber]struct{}
@@ -114,7 +122,25 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (
 		return store.Session{}, err
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: id, Type: "lifecycle", Data: "started"})
+	m.injectMemory(ctx, id, projectID)
 	return sess, nil
+}
+
+// injectMemory primes a freshly started session with the project's
+// accumulated memory. It is best-effort: a missing or empty memory block is
+// silently skipped, and a send failure is non-fatal to the start. The block is
+// recorded as a "memory" event so the client transcript and the persisted log
+// show what context the agent was given.
+func (m *Manager) injectMemory(ctx context.Context, sessionID, projectID string) {
+	if m.MemorySource == nil {
+		return
+	}
+	block := m.MemorySource(projectID)
+	if strings.TrimSpace(block) == "" {
+		return
+	}
+	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "memory", Data: block})
+	_ = m.Runtime.SendPrompt(ctx, sessionID, block)
 }
 
 func normalizeRunMode(mode string) string {
@@ -184,7 +210,21 @@ func (m *Manager) Stop(ctx context.Context, sessionID string) error {
 		return err
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "lifecycle", Data: "stopped"})
+	m.notifyEnded(ctx, sessionID)
 	return nil
+}
+
+// notifyEnded invokes the OnEnd hook with the freshly-ended session row. The
+// row is reloaded so EndedAt is populated for the journal timestamp.
+func (m *Manager) notifyEnded(ctx context.Context, sessionID string) {
+	if m.OnEnd == nil {
+		return
+	}
+	sess, err := m.Store.GetSession(sessionID)
+	if err != nil {
+		return
+	}
+	m.OnEnd(ctx, sess)
 }
 
 // Delete stops the runtime (if still alive) and removes the session row and
@@ -241,6 +281,7 @@ func (m *Manager) reapOnce(ctx context.Context) {
 		}
 		if err := m.Store.EndSession(sess.ID, m.Now()); err == nil {
 			_, _ = m.Publish(store.SessionEvent{SessionID: sess.ID, Type: "lifecycle", Data: "dead"})
+			m.notifyEnded(ctx, sess.ID)
 		}
 	}
 }

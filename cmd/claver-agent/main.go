@@ -17,6 +17,7 @@ import (
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/inbox"
 	"github.com/rockclaver/claver/agent/internal/infra"
+	"github.com/rockclaver/claver/agent/internal/memory"
 	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
@@ -91,6 +92,29 @@ func main() {
 	sessionMgr.AuthOK = func(ctx context.Context, agent string) bool {
 		st, err := authMgr.Status(ctx, agent)
 		return err == nil && st.LoggedIn
+	}
+
+	// Per-project agent memory + project journal (Stickiness #5). Sessions load
+	// rendered memory as context on start, and a session-end summarizer shells
+	// out to the same authenticated CLI to write a journal entry and propose
+	// new memory entries (which require one-tap user confirmation).
+	memoryMgr := memory.New(st)
+	memoryMgr.Transcript = sessionMgr.Log
+	memoryMgr.Summarizer = memory.CLISummarizer{
+		Agent:   *runbookAgent,
+		BinDir:  toolingMgr.BinDir(),
+		HomeDir: homeDirOr(*dataDir),
+		Secrets: authMgr.Secrets,
+	}
+	sessionMgr.MemorySource = memoryMgr.Render
+	// Summarization shells out to a CLI (seconds), so run it off the Stop path
+	// with a fresh context that outlives the request connection.
+	sessionMgr.OnEnd = func(_ context.Context, sess store.Session) {
+		go func() {
+			if err := memoryMgr.OnSessionEnd(context.Background(), sess); err != nil {
+				log.Printf("claver-agent: session %s journal: %v", sess.ID, err)
+			}
+		}()
 	}
 
 	previewMgr, err := previews.New(previews.Config{
@@ -217,6 +241,7 @@ func main() {
 		Inbox:         inboxMgr,
 		Runbook:       runbookMgr,
 		PushDevices:   st,
+		Memory:        memoryMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {

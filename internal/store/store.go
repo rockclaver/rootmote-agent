@@ -148,6 +148,35 @@ type CliToken struct {
 	UpdatedAt      time.Time
 }
 
+// ProjectMemory is one long-lived note the agent reuses across sessions for a
+// project: a convention, a gotcha, a decision, or a file-level note. Rows are
+// user-owned and rendered only by Claver. SourceSessionID, when set, records
+// which AI session proposed the entry.
+type ProjectMemory struct {
+	ID              string
+	ProjectID       string
+	Kind            string // convention | gotcha | decision | file_note
+	Title           string
+	Body            string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	SourceSessionID string
+}
+
+// JournalEntry is one item in a project's auto-summarized timeline: a finished
+// session, a PR, a deploy, a fired alert, or an approval. ID is an
+// autoincrement rowid so it doubles as a stable pagination cursor (occurred_at
+// alone is not unique). RefID points back at the originating record (e.g. a
+// session id) when one exists.
+type JournalEntry struct {
+	ID         int64
+	ProjectID  string
+	Kind       string // session | pr | deploy | alert | approval
+	Summary    string
+	OccurredAt time.Time
+	RefID      string
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -295,6 +324,32 @@ CREATE TABLE IF NOT EXISTS push_devices (
 	registered_at INTEGER NOT NULL,
 	last_seen_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_memory (
+	id                TEXT PRIMARY KEY,
+	project_id        TEXT NOT NULL,
+	kind              TEXT NOT NULL,
+	title             TEXT NOT NULL,
+	body              TEXT NOT NULL DEFAULT '',
+	created_at        INTEGER NOT NULL,
+	updated_at        INTEGER NOT NULL,
+	source_session_id TEXT NOT NULL DEFAULT '',
+	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS project_memory_project_idx ON project_memory(project_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS project_journal_entry (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	project_id  TEXT NOT NULL,
+	kind        TEXT NOT NULL,
+	summary     TEXT NOT NULL,
+	occurred_at INTEGER NOT NULL,
+	ref_id      TEXT NOT NULL DEFAULT '',
+	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS project_journal_project_idx ON project_journal_entry(project_id, id DESC);
 `)
 	return err
 }
@@ -1058,6 +1113,163 @@ func (s *Store) ListPushDevices() ([]PushDevice, error) {
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// CreateMemory inserts a new project memory row. CreatedAt/UpdatedAt default
+// to now when zero.
+func (s *Store) CreateMemory(m ProjectMemory) error {
+	now := time.Now()
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = now
+	}
+	if m.UpdatedAt.IsZero() {
+		m.UpdatedAt = m.CreatedAt
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO project_memory (id, project_id, kind, title, body, created_at, updated_at, source_session_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ProjectID, m.Kind, m.Title, m.Body, m.CreatedAt.Unix(), m.UpdatedAt.Unix(), m.SourceSessionID,
+	)
+	return err
+}
+
+// GetMemory loads one memory row by ID.
+func (s *Store) GetMemory(id string) (ProjectMemory, error) {
+	row := s.db.QueryRow(
+		`SELECT id, project_id, kind, title, body, created_at, updated_at, source_session_id
+		 FROM project_memory WHERE id = ?`, id,
+	)
+	var m ProjectMemory
+	var created, updated int64
+	if err := row.Scan(&m.ID, &m.ProjectID, &m.Kind, &m.Title, &m.Body, &created, &updated, &m.SourceSessionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProjectMemory{}, fmt.Errorf("memory %s: %w", id, ErrNotFound)
+		}
+		return ProjectMemory{}, err
+	}
+	m.CreatedAt = time.Unix(created, 0)
+	m.UpdatedAt = time.Unix(updated, 0)
+	return m, nil
+}
+
+// UpdateMemory overwrites the mutable columns (kind, title, body) and bumps
+// updated_at. Returns ErrNotFound if the row does not exist.
+func (s *Store) UpdateMemory(id, kind, title, body string, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		`UPDATE project_memory SET kind = ?, title = ?, body = ?, updated_at = ? WHERE id = ?`,
+		kind, title, body, updatedAt.Unix(), id,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("memory %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// DeleteMemory removes one memory row. Missing rows are not an error.
+func (s *Store) DeleteMemory(id string) error {
+	_, err := s.db.Exec(`DELETE FROM project_memory WHERE id = ?`, id)
+	return err
+}
+
+// ListMemory returns a project's memory rows ordered most-recently-updated
+// first. Pass "" to list across all projects.
+func (s *Store) ListMemory(projectID string) ([]ProjectMemory, error) {
+	rows, err := s.db.Query(
+		`SELECT id, project_id, kind, title, body, created_at, updated_at, source_session_id
+		 FROM project_memory
+		 WHERE (? = '' OR project_id = ?)
+		 ORDER BY updated_at DESC, id DESC`, projectID, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ProjectMemory, 0)
+	for rows.Next() {
+		var m ProjectMemory
+		var created, updated int64
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.Kind, &m.Title, &m.Body, &created, &updated, &m.SourceSessionID); err != nil {
+			return nil, err
+		}
+		m.CreatedAt = time.Unix(created, 0)
+		m.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// AppendJournalEntry inserts a timeline entry, assigns its rowid, and returns
+// the stored row. OccurredAt defaults to now when zero.
+func (s *Store) AppendJournalEntry(e JournalEntry) (JournalEntry, error) {
+	if e.OccurredAt.IsZero() {
+		e.OccurredAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO project_journal_entry (project_id, kind, summary, occurred_at, ref_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		e.ProjectID, e.Kind, e.Summary, e.OccurredAt.Unix(), e.RefID,
+	)
+	if err != nil {
+		return JournalEntry{}, err
+	}
+	e.ID, _ = res.LastInsertId()
+	return e, nil
+}
+
+// ListJournal returns a page of journal entries newest-first. An empty kind
+// means "any". cursor is the id returned as the previous page's next cursor;
+// pass 0 to start from the newest entry. limit is clamped to [1, 200]. The
+// returned nextCursor is 0 when there are no further rows.
+func (s *Store) ListJournal(projectID, kind string, cursor int64, limit int) ([]JournalEntry, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	// cursor == 0 means "from the top". Use a sentinel above any real rowid so
+	// the same "id < cursor" predicate covers the first page too.
+	if cursor <= 0 {
+		cursor = 1<<62 - 1
+	}
+	rows, err := s.db.Query(
+		`SELECT id, project_id, kind, summary, occurred_at, ref_id
+		 FROM project_journal_entry
+		 WHERE project_id = ? AND (? = '' OR kind = ?) AND id < ?
+		 ORDER BY id DESC
+		 LIMIT ?`,
+		projectID, kind, kind, cursor, limit+1,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := make([]JournalEntry, 0, limit)
+	for rows.Next() {
+		var e JournalEntry
+		var occurred int64
+		if err := rows.Scan(&e.ID, &e.ProjectID, &e.Kind, &e.Summary, &occurred, &e.RefID); err != nil {
+			return nil, 0, err
+		}
+		e.OccurredAt = time.Unix(occurred, 0)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	// We fetched limit+1 to detect a further page without a second query.
+	var next int64
+	if len(out) > limit {
+		out = out[:limit]
+		next = out[len(out)-1].ID
+	}
+	return out, next, nil
 }
 
 func nullableUnix(t *time.Time) any {
