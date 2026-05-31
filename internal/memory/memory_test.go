@@ -133,7 +133,7 @@ func TestSessionEndWritesJournalAndProposesMemory(t *testing.T) {
 	}
 
 	// Journal entry written.
-	entries, _, err := m.ListJournal("p1", "", 0, 50)
+	entries, _, err := m.ListJournal("p1", "", "", 50)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("journal entries = %d err=%v", len(entries), err)
 	}
@@ -204,7 +204,7 @@ func TestSessionEndIdempotent(t *testing.T) {
 	sess := store.Session{ID: "s1", ProjectID: "p1", Agent: "claude"}
 	_ = m.OnSessionEnd(context.Background(), sess)
 	_ = m.OnSessionEnd(context.Background(), sess)
-	entries, _, _ := m.ListJournal("p1", "", 0, 50)
+	entries, _, _ := m.ListJournal("p1", "", "", 50)
 	if len(entries) != 1 {
 		t.Fatalf("expected idempotent single entry, got %d", len(entries))
 	}
@@ -216,7 +216,7 @@ func TestSessionEndWithoutSummarizerStillJournals(t *testing.T) {
 	if err := m.OnSessionEnd(context.Background(), store.Session{ID: "s1", ProjectID: "p1", Agent: "codex"}); err != nil {
 		t.Fatalf("OnSessionEnd: %v", err)
 	}
-	entries, _, _ := m.ListJournal("p1", "", 0, 50)
+	entries, _, _ := m.ListJournal("p1", "", "", 50)
 	if len(entries) != 1 || !strings.Contains(entries[0].Summary, "codex") {
 		t.Fatalf("fallback journal entry missing: %+v", entries)
 	}

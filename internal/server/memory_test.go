@@ -178,11 +178,11 @@ func TestMemoryRPC_ProposalConfirmFlow(t *testing.T) {
 	resp = roundTrip(t, wsURL, "journal.list", map[string]any{"project_id": "p1", "limit": 10})
 	var jl struct {
 		Entries    []JournalEntryDTO `json:"entries"`
-		NextCursor int64             `json:"next_cursor"`
+		NextCursor string            `json:"next_cursor"`
 	}
 	_ = json.Unmarshal(resp.Payload, &jl)
-	if len(jl.Entries) != 1 || jl.NextCursor != 0 {
-		t.Fatalf("journal.list = %+v next=%d", jl.Entries, jl.NextCursor)
+	if len(jl.Entries) != 1 || jl.NextCursor != "" {
+		t.Fatalf("journal.list = %+v next=%q", jl.Entries, jl.NextCursor)
 	}
 }
 

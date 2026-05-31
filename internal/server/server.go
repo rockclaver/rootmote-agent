@@ -3190,7 +3190,7 @@ func (s *Server) dispatchMemory(ctx context.Context, c *websocket.Conn, writeMu 
 		var in struct {
 			ProjectID string `json:"project_id"`
 			Kind      string `json:"kind"`
-			Cursor    int64  `json:"cursor"`
+			Cursor    string `json:"cursor"`
 			Limit     int    `json:"limit"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
@@ -3199,7 +3199,7 @@ func (s *Server) dispatchMemory(ctx context.Context, c *websocket.Conn, writeMu 
 		}
 		entries, next, err := mgr.ListJournal(in.ProjectID, in.Kind, in.Cursor, in.Limit)
 		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
 			return
 		}
 		out := make([]JournalEntryDTO, 0, len(entries))

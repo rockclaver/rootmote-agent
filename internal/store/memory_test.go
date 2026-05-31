@@ -85,30 +85,57 @@ func TestJournalCursorPagination(t *testing.T) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
-	// First page of 2, newest-first.
-	page1, next, err := st.ListJournal("p1", "", 0, 2)
+	// First page of 2, newest-first by occurred_at.
+	page1, next, err := st.ListJournal("p1", "", "", 2)
 	if err != nil {
 		t.Fatalf("page1: %v", err)
 	}
-	if len(page1) != 2 || page1[0].ID <= page1[1].ID {
+	if len(page1) != 2 || !page1[0].OccurredAt.After(page1[1].OccurredAt) {
 		t.Fatalf("page1 wrong order/size: %+v", page1)
 	}
-	if next == 0 {
+	if next == "" {
 		t.Fatal("expected a next cursor")
 	}
 	page2, next2, err := st.ListJournal("p1", "", next, 2)
 	if err != nil || len(page2) != 2 {
 		t.Fatalf("page2: %v size=%d", err, len(page2))
 	}
-	if page2[0].ID >= page1[1].ID {
+	if !page1[1].OccurredAt.After(page2[0].OccurredAt) {
 		t.Fatalf("page2 overlaps page1: %+v vs %+v", page2, page1)
 	}
 	page3, next3, _ := st.ListJournal("p1", "", next2, 2)
 	if len(page3) != 1 {
 		t.Fatalf("page3 size = %d, want 1", len(page3))
 	}
-	if next3 != 0 {
-		t.Fatalf("next3 = %d, want 0 (end)", next3)
+	if next3 != "" {
+		t.Fatalf("next3 = %q, want empty (end)", next3)
+	}
+}
+
+// Regression for the Codex review: a journal entry inserted later (larger
+// rowid) but with an earlier occurred_at — as happens when an earlier
+// session's async summarizer finishes after a later session's, or when a
+// PR/deploy event is backfilled — must not jump to the top of the timeline.
+func TestJournalOrdersByOccurredNotInsertion(t *testing.T) {
+	st := openTestStore(t)
+	// Insert the OLDER-occurring event LAST so it gets the larger rowid.
+	newer, _ := st.AppendJournalEntry(JournalEntry{
+		ProjectID: "p1", Kind: "session", Summary: "newer",
+		OccurredAt: time.Unix(2000, 0),
+	})
+	older, _ := st.AppendJournalEntry(JournalEntry{
+		ProjectID: "p1", Kind: "session", Summary: "older",
+		OccurredAt: time.Unix(1000, 0),
+	})
+	if older.ID <= newer.ID {
+		t.Fatalf("test setup: expected older row to have the larger id (%d vs %d)", older.ID, newer.ID)
+	}
+	page, _, err := st.ListJournal("p1", "", "", 50)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(page) != 2 || page[0].Summary != "newer" || page[1].Summary != "older" {
+		t.Fatalf("timeline not ordered by occurred_at: %+v", page)
 	}
 }
 
@@ -116,11 +143,18 @@ func TestJournalKindFilter(t *testing.T) {
 	st := openTestStore(t)
 	_, _ = st.AppendJournalEntry(JournalEntry{ProjectID: "p1", Kind: "session", Summary: "s"})
 	_, _ = st.AppendJournalEntry(JournalEntry{ProjectID: "p1", Kind: "pr", Summary: "p"})
-	only, _, err := st.ListJournal("p1", "pr", 0, 50)
+	only, _, err := st.ListJournal("p1", "pr", "", 50)
 	if err != nil {
 		t.Fatalf("filter: %v", err)
 	}
 	if len(only) != 1 || only[0].Kind != "pr" {
 		t.Fatalf("kind filter wrong: %+v", only)
+	}
+}
+
+func TestJournalRejectsBadCursor(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.ListJournal("p1", "", "not-a-cursor", 10); err == nil {
+		t.Fatal("expected error for malformed cursor")
 	}
 }

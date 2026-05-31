@@ -221,8 +221,10 @@ func (m *Manager) AppendJournal(projectID, kind, summary, refID string, occurred
 	})
 }
 
-// ListJournal returns a cursor-paginated page of the project's timeline.
-func (m *Manager) ListJournal(projectID, kind string, cursor int64, limit int) ([]store.JournalEntry, int64, error) {
+// ListJournal returns a cursor-paginated page of the project's timeline,
+// ordered by occurrence time. cursor is the opaque token from a prior page
+// ("" for the newest page); nextCursor is "" at the end of history.
+func (m *Manager) ListJournal(projectID, kind, cursor string, limit int) ([]store.JournalEntry, string, error) {
 	return m.Store.ListJournal(projectID, kind, cursor, limit)
 }
 
@@ -443,7 +445,7 @@ func (m *Manager) ExportJournalMarkdown(projectID, projectName string) (string, 
 	b.WriteString(title)
 	b.WriteString("\n")
 
-	var cursor int64
+	var cursor string
 	wrote := false
 	for {
 		page, next, err := m.Store.ListJournal(projectID, "", cursor, 200)
@@ -462,7 +464,7 @@ func (m *Manager) ExportJournalMarkdown(projectID, projectName string) (string, 
 				b.WriteString("\n")
 			}
 		}
-		if next == 0 {
+		if next == "" {
 			break
 		}
 		cursor = next

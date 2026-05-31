@@ -349,7 +349,7 @@ CREATE TABLE IF NOT EXISTS project_journal_entry (
 	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS project_journal_project_idx ON project_journal_entry(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS project_journal_occurred_idx ON project_journal_entry(project_id, occurred_at DESC, id DESC);
 `)
 	return err
 }
@@ -1222,32 +1222,45 @@ func (s *Store) AppendJournalEntry(e JournalEntry) (JournalEntry, error) {
 	return e, nil
 }
 
-// ListJournal returns a page of journal entries newest-first. An empty kind
-// means "any". cursor is the id returned as the previous page's next cursor;
-// pass 0 to start from the newest entry. limit is clamped to [1, 200]. The
-// returned nextCursor is 0 when there are no further rows.
-func (s *Store) ListJournal(projectID, kind string, cursor int64, limit int) ([]JournalEntry, int64, error) {
+// ListJournal returns a page of journal entries ordered by occurrence time,
+// newest first. An empty kind means "any". limit is clamped to [1, 200].
+//
+// Pagination is keyset-based on (occurred_at, id) rather than on the insertion
+// rowid: a journal entry can be inserted with an explicit, backdated
+// occurred_at (the session-end summarizer runs asynchronously, and future
+// PR/deploy/alert sources append events after the fact), so a larger id does
+// not imply a later event. Ordering by id alone would let a delayed insert
+// jump to the top of the timeline. cursor is the opaque token returned as the
+// previous page's nextCursor; pass "" to start from the newest entry. The
+// returned nextCursor is "" when there are no further rows.
+func (s *Store) ListJournal(projectID, kind, cursor string, limit int) ([]JournalEntry, string, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	// cursor == 0 means "from the top". Use a sentinel above any real rowid so
-	// the same "id < cursor" predicate covers the first page too.
-	if cursor <= 0 {
-		cursor = 1<<62 - 1
+	// An empty cursor means "from the top". A sentinel above any real
+	// occurred_at lets the same keyset predicate cover the first page too.
+	curOccurred, curID := int64(1)<<62-1, int64(1)<<62-1
+	if cursor != "" {
+		o, i, ok := decodeJournalCursor(cursor)
+		if !ok {
+			return nil, "", fmt.Errorf("invalid journal cursor %q", cursor)
+		}
+		curOccurred, curID = o, i
 	}
 	rows, err := s.db.Query(
 		`SELECT id, project_id, kind, summary, occurred_at, ref_id
 		 FROM project_journal_entry
-		 WHERE project_id = ? AND (? = '' OR kind = ?) AND id < ?
-		 ORDER BY id DESC
+		 WHERE project_id = ? AND (? = '' OR kind = ?)
+		   AND (occurred_at < ? OR (occurred_at = ? AND id < ?))
+		 ORDER BY occurred_at DESC, id DESC
 		 LIMIT ?`,
-		projectID, kind, kind, cursor, limit+1,
+		projectID, kind, kind, curOccurred, curOccurred, curID, limit+1,
 	)
 	if err != nil {
-		return nil, 0, err
+		return nil, "", err
 	}
 	defer rows.Close()
 	out := make([]JournalEntry, 0, limit)
@@ -1255,21 +1268,35 @@ func (s *Store) ListJournal(projectID, kind string, cursor int64, limit int) ([]
 		var e JournalEntry
 		var occurred int64
 		if err := rows.Scan(&e.ID, &e.ProjectID, &e.Kind, &e.Summary, &occurred, &e.RefID); err != nil {
-			return nil, 0, err
+			return nil, "", err
 		}
 		e.OccurredAt = time.Unix(occurred, 0)
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, err
+		return nil, "", err
 	}
 	// We fetched limit+1 to detect a further page without a second query.
-	var next int64
+	var next string
 	if len(out) > limit {
 		out = out[:limit]
-		next = out[len(out)-1].ID
+		last := out[len(out)-1]
+		next = encodeJournalCursor(last.OccurredAt.Unix(), last.ID)
 	}
 	return out, next, nil
+}
+
+// encodeJournalCursor packs the keyset (occurred_at unix, id) into the opaque
+// "<occurred>:<id>" token the client echoes back to page through history.
+func encodeJournalCursor(occurred, id int64) string {
+	return fmt.Sprintf("%d:%d", occurred, id)
+}
+
+func decodeJournalCursor(s string) (occurred, id int64, ok bool) {
+	if _, err := fmt.Sscanf(s, "%d:%d", &occurred, &id); err != nil {
+		return 0, 0, false
+	}
+	return occurred, id, true
 }
 
 func nullableUnix(t *time.Time) any {
