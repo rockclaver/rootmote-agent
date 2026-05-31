@@ -146,6 +146,12 @@ func main() {
 	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
 	inboxMgr.AddSource(&inbox.AlertSource{Mgr: alertMgr})
 	inboxMgr.AddSource(&inbox.SessionSource{Store: st})
+	githubSource := &inbox.GitHubSource{
+		GitHub:  githubMgr,
+		Store:   st,
+		Publish: inboxMgr.Publish,
+	}
+	inboxMgr.AddSource(githubSource)
 	inboxBridgeCleanup := inbox.BridgeAlertNotifications(notificationHub, inboxMgr)
 	defer inboxBridgeCleanup()
 
@@ -181,6 +187,7 @@ func main() {
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
+	githubSource.Start(ctx)
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}
