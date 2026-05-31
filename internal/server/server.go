@@ -23,6 +23,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/inbox"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
@@ -87,6 +88,8 @@ type Config struct {
 	AIProposals *aiproposal.Manager
 	// Notifications fans background task.notification events to connected clients.
 	Notifications *notifications.Hub
+	// Inbox, when non-nil, enables inbox.* kinds (unified triage feed).
+	Inbox *inbox.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -455,6 +458,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"github.pr_list",
 		"github.revoke":
 		s.dispatchGitHub(ctx, c, writeMu, f)
+	case "inbox.list", "inbox.stream":
+		s.dispatchInbox(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -2907,4 +2912,48 @@ func (s *Server) executeProposal(ctx context.Context, p aiproposal.Proposal) err
 		return s.cfg.Firewall.RuleRemove(ctx, rule)
 	}
 	return fmt.Errorf("unknown proposal kind %q", p.Kind)
+}
+
+func (s *Server) dispatchInbox(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Inbox == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "inbox subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Inbox
+	switch f.Kind {
+	case "inbox.list":
+		var in struct {
+			Cursor string `json:"cursor"`
+			Limit  int    `json:"limit"`
+		}
+		if len(f.Payload) > 0 {
+			if err := json.Unmarshal(f.Payload, &in); err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+				return
+			}
+		}
+		res, err := mgr.List(ctx, in.Cursor, in.Limit)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "inbox.list", res)
+	case "inbox.stream":
+		ch, cleanup := mgr.Subscribe(ctx)
+		s.writeOK(ctx, c, writeMu, f.ID, "inbox.stream", map[string]any{"subscribed": true})
+		go func() {
+			defer cleanup()
+			for {
+				select {
+				case item, ok := <-ch:
+					if !ok {
+						return
+					}
+					s.writeOK(ctx, c, writeMu, "", "inbox.event", item)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 }

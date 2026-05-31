@@ -61,8 +61,41 @@ type Manager struct {
 }
 
 type alertState struct {
-	active bool
-	hits   int
+	active   bool
+	hits     int
+	firedAt  time.Time
+	ruleKind string
+	target   string
+	body     string
+	severity string
+}
+
+// ActiveAlert is a snapshot of one currently-fired alert, suitable for
+// surfacing in the unified inbox.
+type ActiveAlert struct {
+	Key      string
+	RuleKind string
+	Target   string
+	Body     string
+	Severity string
+	FiredAt  time.Time
+}
+
+// ActiveAlerts returns a snapshot of all alerts currently in the fired state.
+func (m *Manager) ActiveAlerts() []ActiveAlert {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ActiveAlert, 0, len(m.active))
+	for key, st := range m.active {
+		if !st.active {
+			continue
+		}
+		out = append(out, ActiveAlert{
+			Key: key, RuleKind: st.ruleKind, Target: st.target,
+			Body: st.body, Severity: st.severity, FiredAt: st.firedAt,
+		})
+	}
+	return out
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -247,6 +280,11 @@ func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRu
 		return
 	}
 	st.active = true
+	st.firedAt = m.now()
+	st.ruleKind = rule.Kind
+	st.target = target
+	st.body = body
+	st.severity = "warning"
 	m.setState(key, st)
 	m.publish(ctx, rule, target, value, false, body)
 }

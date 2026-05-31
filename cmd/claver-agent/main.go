@@ -15,6 +15,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
+	"github.com/rockclaver/claver/agent/internal/inbox"
 	"github.com/rockclaver/claver/agent/internal/infra"
 	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
@@ -139,6 +140,15 @@ func main() {
 		log.Fatalf("claver-agent: init alerts: %v", err)
 	}
 
+	aiProposalMgr := aiproposal.New()
+
+	inboxMgr := inbox.New()
+	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
+	inboxMgr.AddSource(&inbox.AlertSource{Mgr: alertMgr})
+	inboxMgr.AddSource(&inbox.SessionSource{Store: st})
+	inboxBridgeCleanup := inbox.BridgeAlertNotifications(notificationHub, inboxMgr)
+	defer inboxBridgeCleanup()
+
 	srv := server.New(server.Config{
 		Addr:          *addr,
 		Projects:      mgr,
@@ -154,8 +164,9 @@ func main() {
 		Processes:     processMgr,
 		Firewall:      firewallMgr,
 		Alerts:        alertMgr,
-		AIProposals:   aiproposal.New(),
+		AIProposals:   aiProposalMgr,
 		Notifications: notificationHub,
+		Inbox:         inboxMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
