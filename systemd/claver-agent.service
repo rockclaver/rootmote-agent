@@ -13,21 +13,20 @@ Restart=on-failure
 RestartSec=2s
 
 # Hardening.
-# NoNewPrivileges is intentionally NOT set: firewall management
-# (ufw / firewall-cmd, issue #44) requires root and the agent escalates
-# via a sudoers.d fragment scoped to just those two binaries
-# (/etc/sudoers.d/claver-agent-firewall). NoNewPrivileges blocks setuid
-# which would break that path. All firewall mutations still pass through
-# the agent's biometric + confirmation-token + anti-lockout pipeline
-# before sudo is invoked.
+# NoNewPrivileges MUST stay off: the agent runs as the unprivileged `claver`
+# user and escalates privileged operations (firewall ufw/firewall-cmd from
+# issue #44, and host reboot) through `sudo -n`, scoped by sudoers.d fragments
+# to specific binaries/verbs. NoNewPrivileges blocks sudo's setuid, which
+# breaks every one of those paths. Crucially, several systemd sandboxing
+# directives (PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,
+# ProtectControlGroups=, RestrictAddressFamilies=) *implicitly* force
+# NoNewPrivileges=yes (see systemd.exec(5)), so they are deliberately omitted
+# here — setting them silently re-broke sudo despite the explicit intent.
+# All privileged mutations still pass through the agent's biometric +
+# single-use confirmation-token (+ firewall anti-lockout) pipeline before sudo.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # The agent's *listener* is locked to loopback by an in-process self-check
 # (assertLoopback). It still needs outbound network to clone repos, talk to
 # GitHub CLI auth, previews, etc., so we leave egress open here.
