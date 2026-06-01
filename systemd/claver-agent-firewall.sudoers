@@ -1,12 +1,16 @@
 # Installed by claver-agent installer at /etc/sudoers.d/claver-agent-firewall.
 #
 # The agent runs as the unprivileged `claver` user. Firewall management
-# (ufw / firewall-cmd) and host reboot require root, so we grant passwordless
-# NOPASSWD access to just those binaries (and, for systemctl, only the literal
-# `reboot` verb). All mutations still go through the agent's biometric +
-# confirmation-token + anti-lockout pipeline before this sudo call is ever made.
+# (ufw / firewall-cmd), host webserver config validation, and host reboot require
+# root, so we grant passwordless NOPASSWD access to just those commands. All
+# mutations still go through the agent's biometric + confirmation-token +
+# anti-lockout pipeline before this sudo call is ever made.
 #
 # Visudo syntax: use `Defaults!cmnd setenv` would re-enable env leakage;
 # keep the default env_reset.
 claver ALL=(root) NOPASSWD: /usr/sbin/ufw, /sbin/ufw, /usr/bin/firewall-cmd, /bin/firewall-cmd
 claver ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /bin/systemctl reboot
+claver ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /sbin/nginx -t
+claver ALL=(root) NOPASSWD: /usr/sbin/apache2ctl configtest, /usr/bin/apache2ctl configtest, /usr/sbin/apachectl configtest, /usr/bin/apachectl configtest
+claver ALL=(root) NOPASSWD: /usr/sbin/httpd -t, /usr/bin/httpd -t, /sbin/httpd -t
+claver ALL=(root) NOPASSWD: /usr/bin/caddy validate, /usr/bin/caddy validate --config *, /usr/local/bin/caddy validate, /usr/local/bin/caddy validate --config *

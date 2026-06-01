@@ -48,6 +48,16 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 	return f.output, f.err
 }
 
+type fakePrivilegedRunner struct {
+	fakeRunner
+	privilegedCalls []string
+}
+
+func (f *fakePrivilegedRunner) RunPrivileged(_ context.Context, name string, args ...string) (string, error) {
+	f.privilegedCalls = append(f.privilegedCalls, name+" "+strings.Join(args, " "))
+	return f.output, f.err
+}
+
 func write(t *testing.T, path, body string) string {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -176,7 +186,7 @@ func TestMissingConfigPathProducesWarning(t *testing.T) {
 func TestValidateReturnsFailureOutputWithoutAction(t *testing.T) {
 	dir := t.TempDir()
 	caddy := write(t, filepath.Join(dir, "Caddyfile"), `example.com { respond ok }`)
-	runner := &fakeRunner{output: "bad config", err: errors.New("exit 1")}
+	runner := &fakePrivilegedRunner{fakeRunner: fakeRunner{output: "bad config", err: errors.New("exit 1")}}
 	mgr, err := New(Config{
 		Systemd: &fakeSystemd{units: []systemd.Unit{{Name: "caddy.service"}}},
 		Runner:  runner,
@@ -192,8 +202,8 @@ func TestValidateReturnsFailureOutputWithoutAction(t *testing.T) {
 	if res.OK || res.Output != "bad config" {
 		t.Fatalf("unexpected validate result: %+v", res)
 	}
-	if len(runner.calls) != 1 || !strings.Contains(runner.calls[0], "caddy validate --config") {
-		t.Fatalf("wrong validation command: %+v", runner.calls)
+	if len(runner.privilegedCalls) != 1 || !strings.Contains(runner.privilegedCalls[0], "caddy validate --config") {
+		t.Fatalf("wrong validation command: %+v", runner.privilegedCalls)
 	}
 }
 

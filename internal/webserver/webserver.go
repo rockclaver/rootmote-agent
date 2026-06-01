@@ -66,6 +66,10 @@ type Runner interface {
 	Run(context.Context, string, ...string) (string, error)
 }
 
+type privilegedRunner interface {
+	RunPrivileged(context.Context, string, ...string) (string, error)
+}
+
 type Config struct {
 	Systemd Systemd
 	Runner  Runner
@@ -124,6 +128,45 @@ func (shellRunner) Run(ctx context.Context, name string, args ...string) (string
 		msg = err.Error()
 	}
 	return msg, err
+}
+
+func (r shellRunner) RunPrivileged(ctx context.Context, name string, args ...string) (string, error) {
+	if os.Geteuid() == 0 {
+		return r.Run(ctx, name, args...)
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		path = fallbackBinaryPath(name)
+		if path == "" {
+			// Preserve the same error shape the direct exec path would have exposed.
+			return "", err
+		}
+	}
+	sudoArgs := append([]string{"-n", path}, args...)
+	return r.Run(ctx, "sudo", sudoArgs...)
+}
+
+func fallbackBinaryPath(name string) string {
+	candidates := map[string][]string{
+		"nginx":      {"/usr/sbin/nginx", "/sbin/nginx"},
+		"apache2ctl": {"/usr/sbin/apache2ctl", "/usr/bin/apache2ctl"},
+		"apachectl":  {"/usr/sbin/apachectl", "/usr/bin/apachectl"},
+		"httpd":      {"/usr/sbin/httpd", "/usr/bin/httpd", "/sbin/httpd"},
+		"caddy":      {"/usr/bin/caddy", "/usr/local/bin/caddy"},
+	}
+	for _, p := range candidates[name] {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func runPrivileged(ctx context.Context, runner Runner, name string, args ...string) (string, error) {
+	if pr, ok := runner.(privilegedRunner); ok {
+		return pr.RunPrivileged(ctx, name, args...)
+	}
+	return runner.Run(ctx, name, args...)
 }
 
 type spec struct {
@@ -240,7 +283,7 @@ func (m *Manager) Validate(ctx context.Context, id string) (ValidationResult, er
 	default:
 		return ValidationResult{}, fmt.Errorf("webserver: unsupported kind %q", inst.Kind)
 	}
-	out, runErr := m.runner.Run(ctx, name, args...)
+	out, runErr := runPrivileged(ctx, m.runner, name, args...)
 	return ValidationResult{ID: id, OK: runErr == nil, Output: out}, nil
 }
 
