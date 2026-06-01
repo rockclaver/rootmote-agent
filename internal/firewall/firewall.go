@@ -156,18 +156,22 @@ func New(cfg Config) (*Manager, error) {
 	}, nil
 }
 
-// detect picks the first available backend, or nil for read-only.
+// detect picks the first available backend, or nil for read-only. When no
+// backend is selected, every probed backend's failure is reported (keyed by
+// kind) so the reason isn't masked by whichever backend happened to be last
+// in the list — e.g. a ufw `sudo -n` failure must not be hidden behind a
+// firewalld "firewall-cmd not installed".
 func (m *Manager) detect(ctx context.Context) (Backend, string) {
-	var lastErr error
+	var msgs []string
 	for _, b := range m.backends {
 		if err := b.Available(ctx); err == nil {
 			return b, ""
 		} else {
-			lastErr = err
+			msgs = append(msgs, fmt.Sprintf("%s: %s", b.Kind(), err))
 		}
 	}
-	if lastErr != nil {
-		return nil, lastErr.Error()
+	if len(msgs) > 0 {
+		return nil, strings.Join(msgs, "; ")
 	}
 	return nil, "no ufw or firewalld backend present"
 }
