@@ -151,6 +151,31 @@ func (c *SystemctlClient) Action(ctx context.Context, name string, action Action
 	return nil
 }
 
+// Reboot runs `systemctl reboot`. The agent runs as the unprivileged `claver`
+// user, so when it is not already root the call is wrapped in `sudo -n`
+// (matching the firewall backends); a sudoers grant authorizes the literal
+// `systemctl reboot` verb.
+func (c *SystemctlClient) Reboot(ctx context.Context) error {
+	cctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+	name := c.bin()
+	args := []string{"reboot"}
+	if os.Geteuid() != 0 {
+		args = []string{"-n", name, "reboot"}
+		name = "sudo"
+	}
+	cmd := exec.CommandContext(cctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
 func parseListUnits(s string) []Unit {
 	var units []Unit
 	sc := bufio.NewScanner(strings.NewReader(s))

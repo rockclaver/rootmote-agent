@@ -35,6 +35,7 @@ import (
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/tooling"
 	"github.com/rockclaver/claver-agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/webserver"
 )
 
 func main() {
@@ -159,6 +160,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init systemd: %v", err)
 	}
+	webserverMgr, err := webserver.New(webserver.Config{Systemd: systemdMgr})
+	if err != nil {
+		log.Fatalf("claver-agent: init webservers: %v", err)
+	}
 	processMgr, err := agentprocess.New(agentprocess.Config{})
 	if err != nil {
 		log.Fatalf("claver-agent: init process inspector: %v", err)
@@ -250,6 +255,7 @@ func main() {
 		Docker:        dockerMgr,
 		Infra:         infraMgr,
 		Systemd:       systemdMgr,
+		Webservers:    webserverMgr,
 		Processes:     processMgr,
 		Firewall:      firewallMgr,
 		Alerts:        alertMgr,

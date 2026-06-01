@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/tooling"
 	"github.com/rockclaver/claver-agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/webserver"
 )
 
 // Frame is the JSON envelope used on the wire.
@@ -89,6 +91,8 @@ type Config struct {
 	Processes *agentprocess.Manager
 	// Firewall, when non-nil, enables infra.firewall.* kinds.
 	Firewall *firewall.Manager
+	// Webservers, when non-nil, enables infra.webserver.* host proxy kinds.
+	Webservers *webserver.Manager
 	// Alerts, when non-nil, enables infra.alerts.* kinds.
 	Alerts *alerts.Manager
 	// AIProposals, when non-nil, enables infra.proposal.* kinds (Phase 6:
@@ -454,8 +458,13 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchInfra(ctx, c, writeMu, f)
 	case "infra.service.list",
 		"infra.service.get",
-		"infra.service.action":
+		"infra.service.action",
+		"infra.system.reboot":
 		s.dispatchSystemd(ctx, c, writeMu, f)
+	case "infra.webserver.list",
+		"infra.webserver.validate",
+		"infra.webserver.action":
+		s.dispatchWebserver(ctx, c, writeMu, f)
 	case "infra.process.list",
 		"infra.process.kill":
 		s.dispatchProcess(ctx, c, writeMu, f)
@@ -1907,6 +1916,33 @@ func serviceLifecycleTokenBinding(unit string, action systemd.Action) (string, s
 	return "infra.service.action." + string(action), "infra", []string{unit}
 }
 
+func systemRebootTokenBinding() (string, string, []string) {
+	return "infra.system.reboot", "infra", nil
+}
+
+func (s *Server) auditSystemReboot(ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"ok":      ok,
+		"summary": summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "infra.system.reboot",
+		ProjectID: "infra",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("host reboot %s: %s", status, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
 func (s *Server) auditServiceLifecycle(unit, action string, ok bool, summary string) store.AuditEntry {
 	if s.cfg.Review == nil {
 		return store.AuditEntry{}
@@ -2030,6 +2066,140 @@ func (s *Server) dispatchSystemd(ctx context.Context, c *websocket.Conn, writeMu
 		audit := s.auditServiceLifecycle(in.Name, in.Action, true, "ok")
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.service.action", map[string]any{
 			"name":     in.Name,
+			"action":   in.Action,
+			"audit_id": audit.ID,
+		})
+	case "infra.system.reboot":
+		var in struct {
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "invalid payload")
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := systemRebootTokenBinding()
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditSystemReboot(false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		if err := s.cfg.Systemd.Reboot(ctx); err != nil {
+			s.auditSystemReboot(false, err.Error())
+			s.writeError(ctx, c, writeMu, f.ID, "systemd_error", err.Error())
+			return
+		}
+		audit := s.auditSystemReboot(true, "ok")
+		// The OK frame may never reach the app since the host is going down;
+		// the client treats a transport drop after sending as success.
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.system.reboot", map[string]any{
+			"audit_id": audit.ID,
+		})
+	}
+}
+
+func webserverActionTokenBinding(id, action string) (string, string, []string) {
+	return "infra.webserver.action." + action, "infra", []string{id}
+}
+
+func webserverKindFromID(id string) string {
+	if i := strings.IndexByte(id, ':'); i > 0 {
+		return id[:i]
+	}
+	return ""
+}
+
+func (s *Server) auditWebserverAction(id string, kind webserver.Kind, unit, action string, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"id":      id,
+		"kind":    kind,
+		"unit":    unit,
+		"action":  action,
+		"ok":      ok,
+		"summary": summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "infra.webserver.action",
+		ProjectID: "infra",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("webserver %s %s for %s (%s): %s", action, status, id, unit, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) dispatchWebserver(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Webservers == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "webserver subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.webserver.list":
+		snap := s.cfg.Webservers.List(ctx)
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.webserver.list", map[string]any{
+			"available":  snap.Available,
+			"webservers": snap.Webservers,
+			"warnings":   snap.Warnings,
+		})
+	case "infra.webserver.validate":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		res, err := s.cfg.Webservers.Validate(ctx, in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.webserver.validate", res)
+	case "infra.webserver.action":
+		var in struct {
+			ID                string `json:"id"`
+			Action            string `json:"action"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" || in.Action == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id and action required")
+			return
+		}
+		if in.Action != "reload" && in.Action != "restart" {
+			s.auditWebserverAction(in.ID, webserver.Kind(webserverKindFromID(in.ID)), "", in.Action, false, "unsupported action")
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "unsupported webserver action")
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := webserverActionTokenBinding(in.ID, in.Action)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditWebserverAction(in.ID, webserver.Kind(webserverKindFromID(in.ID)), "", in.Action, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		inst, err := s.cfg.Webservers.Action(ctx, in.ID, in.Action)
+		if err != nil {
+			s.auditWebserverAction(in.ID, webserver.Kind(webserverKindFromID(in.ID)), inst.Unit, in.Action, false, err.Error())
+			s.writeError(ctx, c, writeMu, f.ID, "webserver_error", err.Error())
+			return
+		}
+		audit := s.auditWebserverAction(in.ID, inst.Kind, inst.Unit, in.Action, true, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.webserver.action", map[string]any{
+			"id":       in.ID,
 			"action":   in.Action,
 			"audit_id": audit.ID,
 		})

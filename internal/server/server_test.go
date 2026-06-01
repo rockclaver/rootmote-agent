@@ -27,6 +27,7 @@ import (
 	"github.com/rockclaver/claver-agent/internal/store"
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/webserver"
 )
 
 type fakeSessionRuntime struct{}
@@ -1730,9 +1731,21 @@ type fakeSystemdClient struct {
 	available error
 	actions   []string
 	actionErr error
+	reboots   int
+	rebootErr error
 }
 
 func (f *fakeSystemdClient) Available(_ context.Context) error { return f.available }
+func (f *fakeSystemdClient) Status(_ context.Context) systemd.Status {
+	if f.available != nil {
+		return systemd.Status{
+			Available:          false,
+			UnavailableReason:  "test_unavailable",
+			UnavailableMessage: f.available.Error(),
+		}
+	}
+	return systemd.Status{Available: true}
+}
 func (f *fakeSystemdClient) List(_ context.Context) ([]systemd.Unit, error) {
 	return append([]systemd.Unit(nil), f.units...), nil
 }
@@ -1745,6 +1758,10 @@ func (f *fakeSystemdClient) Get(_ context.Context, name string) (systemd.UnitDet
 func (f *fakeSystemdClient) Action(_ context.Context, name string, action systemd.Action) error {
 	f.actions = append(f.actions, name+":"+string(action))
 	return f.actionErr
+}
+func (f *fakeSystemdClient) Reboot(_ context.Context) error {
+	f.reboots++
+	return f.rebootErr
 }
 
 func systemdRoundTrip(t *testing.T, cfg Config, kind string, payload []byte) Frame {
@@ -1962,6 +1979,72 @@ func TestSystemdServiceAction_TokenSingleUseAndAudit(t *testing.T) {
 	}
 }
 
+// Host reboot requires a valid single-use token; success runs the client once
+// and records an audit row.
+func TestSystemReboot_TokenRequiredAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	fc := &fakeSystemdClient{}
+	mgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Addr: "127.0.0.1:0", Systemd: mgr, Review: rm}
+
+	// Missing token -> rejected, host not rebooted.
+	payload, _ := json.Marshal(map[string]any{})
+	resp := systemdRoundTrip(t, cfg, "infra.system.reboot", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token kind = %q", resp.Kind)
+	}
+	if fc.reboots != 0 {
+		t.Fatalf("rebooted without token: %d", fc.reboots)
+	}
+
+	// Valid token -> reboot runs once; audit recorded.
+	action, projectID, files := systemRebootTokenBinding()
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.system.reboot", payload)
+	if resp.Kind != "infra.system.reboot" {
+		t.Fatalf("ok kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	if fc.reboots != 1 {
+		t.Fatalf("reboot not called once: %d", fc.reboots)
+	}
+
+	// Single-use: replay same token -> token_used, host not rebooted again.
+	resp = systemdRoundTrip(t, cfg, "infra.system.reboot", payload)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("reused token kind = %q", resp.Kind)
+	}
+	if fc.reboots != 1 {
+		t.Fatalf("reused token re-invoked reboot: %d", fc.reboots)
+	}
+
+	entries, err := rm.ListAudit("infra.system.reboot", "infra", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawSuccess bool
+	for _, e := range entries {
+		if strings.Contains(e.Summary, "succeeded") {
+			sawSuccess = true
+		}
+	}
+	if !sawSuccess {
+		t.Fatalf("missing success audit row: %+v", entries)
+	}
+}
+
 // AC issue #42: protected-unit guard rejects stop/disable BEFORE token consumed.
 func TestSystemdServiceAction_ProtectedUnitRejectedBeforeToken(t *testing.T) {
 	dir := t.TempDir()
@@ -2002,6 +2085,135 @@ func TestSystemdServiceAction_ProtectedUnitRejectedBeforeToken(t *testing.T) {
 	// (non-protected) action. Verify by consuming it directly.
 	if err := rm.ConsumeToken(tok.Token, action, projectID, files, ""); err != nil {
 		t.Fatalf("guard consumed token: %v", err)
+	}
+}
+
+type fakeWebserverRunner struct {
+	output string
+	err    error
+	calls  []string
+}
+
+func (f *fakeWebserverRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	return f.output, f.err
+}
+
+func newTestWebserverManager(t *testing.T, sys *fakeSystemdClient, runner *fakeWebserverRunner, paths map[webserver.Kind][]string) *webserver.Manager {
+	t.Helper()
+	if sys == nil {
+		sys = &fakeSystemdClient{units: []systemd.Unit{{Name: "nginx.service", ActiveState: "active", EnabledOnBoot: "enabled"}}}
+	}
+	mgr, err := webserver.New(webserver.Config{Systemd: sys, Runner: runner, Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mgr
+}
+
+func TestWebserverListOverWS(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "nginx.conf")
+	mustWriteFile(t, cfg, "server_name app.example.com;\n")
+	mgr := newTestWebserverManager(t, &fakeSystemdClient{units: []systemd.Unit{
+		{Name: "nginx.service", Description: "Nginx", ActiveState: "active", EnabledOnBoot: "enabled"},
+	}}, nil, map[webserver.Kind][]string{webserver.KindNginx: {cfg}})
+
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Webservers: mgr}, "infra.webserver.list", nil)
+	if resp.Kind != "infra.webserver.list" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Available  bool                 `json:"available"`
+		Webservers []webserver.Instance `json:"webservers"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available || len(out.Webservers) != 1 || out.Webservers[0].ID != "nginx:nginx.service" {
+		t.Fatalf("unexpected webservers: %+v", out)
+	}
+	if len(out.Webservers[0].Domains) != 1 || out.Webservers[0].Domains[0].Host != "app.example.com" {
+		t.Fatalf("domains not returned: %+v", out.Webservers[0].Domains)
+	}
+}
+
+func TestWebserverValidateReturnsFailedOutputWithoutToken(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "nginx.conf")
+	mustWriteFile(t, cfg, "server_name app.example.com;\n")
+	runner := &fakeWebserverRunner{output: "nginx: bad config", err: errors.New("exit 1")}
+	mgr := newTestWebserverManager(t, nil, runner, map[webserver.Kind][]string{webserver.KindNginx: {cfg}})
+	payload, _ := json.Marshal(map[string]any{"id": "nginx:nginx.service"})
+
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Webservers: mgr}, "infra.webserver.validate", payload)
+	if resp.Kind != "infra.webserver.validate" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out webserver.ValidationResult
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.OK || out.Output != "nginx: bad config" {
+		t.Fatalf("unexpected validate result: %+v", out)
+	}
+	if len(runner.calls) != 1 || runner.calls[0] != "nginx -t" {
+		t.Fatalf("wrong runner calls: %+v", runner.calls)
+	}
+}
+
+func TestWebserverActionTokenSingleUseAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	sys := &fakeSystemdClient{units: []systemd.Unit{{Name: "nginx.service", ActiveState: "active"}}}
+	mgr := newTestWebserverManager(t, sys, nil, map[webserver.Kind][]string{webserver.KindNginx: nil})
+	cfg := Config{Addr: "127.0.0.1:0", Webservers: mgr, Review: rm}
+
+	payload, _ := json.Marshal(map[string]any{"id": "nginx:nginx.service", "action": "restart"})
+	resp := systemdRoundTrip(t, cfg, "infra.webserver.action", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token kind = %q payload=%s", resp.Kind, resp.Payload)
+	}
+	if len(sys.actions) != 0 {
+		t.Fatalf("client called without token: %v", sys.actions)
+	}
+
+	action, projectID, files := webserverActionTokenBinding("nginx:nginx.service", "restart")
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"id": "nginx:nginx.service", "action": "restart", "confirmation_token": tok.Token})
+	resp = systemdRoundTrip(t, cfg, "infra.webserver.action", payload)
+	if resp.Kind != "infra.webserver.action" {
+		t.Fatalf("ok kind = %q payload=%s", resp.Kind, resp.Payload)
+	}
+	if len(sys.actions) != 1 || sys.actions[0] != "nginx.service:restart" {
+		t.Fatalf("wrong actions: %+v", sys.actions)
+	}
+
+	resp = systemdRoundTrip(t, cfg, "infra.webserver.action", payload)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("reused token kind = %q payload=%s", resp.Kind, resp.Payload)
+	}
+	if len(sys.actions) != 1 {
+		t.Fatalf("reused token re-invoked client: %+v", sys.actions)
+	}
+	entries, err := rm.ListAudit("infra.webserver.action", "infra", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawSuccess bool
+	for _, e := range entries {
+		if strings.Contains(e.Summary, "succeeded") && strings.Contains(e.Data, `"unit":"nginx.service"`) {
+			sawSuccess = true
+		}
+	}
+	if !sawSuccess {
+		t.Fatalf("missing webserver action audit: %+v", entries)
 	}
 }
 

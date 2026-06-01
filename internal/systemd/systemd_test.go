@@ -16,6 +16,8 @@ type fakeClient struct {
 	listErr   error
 	getErr    error
 	actionErr error
+	rebootErr error
+	reboots   int
 
 	actions []actionCall
 }
@@ -45,6 +47,10 @@ func (f *fakeClient) Get(_ context.Context, name string) (UnitDetail, error) {
 func (f *fakeClient) Action(_ context.Context, name string, action Action) error {
 	f.actions = append(f.actions, actionCall{name: name, action: action})
 	return f.actionErr
+}
+func (f *fakeClient) Reboot(_ context.Context) error {
+	f.reboots++
+	return f.rebootErr
 }
 
 func newManager(t *testing.T, client Client) *Manager {

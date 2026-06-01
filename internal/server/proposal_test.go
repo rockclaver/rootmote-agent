@@ -427,6 +427,7 @@ func (g *gatedSystemdClient) Action(_ context.Context, _ string, _ systemd.Actio
 	g.mu.Unlock()
 	return nil
 }
+func (g *gatedSystemdClient) Reboot(_ context.Context) error { return nil }
 func (g *gatedSystemdClient) calls() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
