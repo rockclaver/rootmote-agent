@@ -18,6 +18,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver-agent/internal/actions"
 	"github.com/rockclaver/claver-agent/internal/aiproposal"
 	"github.com/rockclaver/claver-agent/internal/alerts"
 	"github.com/rockclaver/claver-agent/internal/billing"
@@ -105,6 +106,9 @@ type Config struct {
 	// Runbook, when non-nil, enables infra.runbook.* kinds and surfaces
 	// the AI-proposed remediation queue (Stickiness #4).
 	Runbook *runbook.Manager
+	// Actions, when non-nil, enables action.* kinds (AI Action Plane:
+	// top-level command jobs). Phase 1 is read-only — no mutation.
+	Actions *actions.Manager
 	// PushDevices, when non-nil, enables push.register / push.unregister
 	// for FCM device-token management.
 	PushDevices *store.Store
@@ -501,6 +505,11 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "infra.runbook.list",
 		"infra.runbook.get":
 		s.dispatchRunbook(ctx, c, writeMu, f)
+	case "action.submit",
+		"action.list",
+		"action.get",
+		"action.cancel":
+		s.dispatchAction(ctx, c, writeMu, f)
 	case "push.register", "push.unregister", "push.list":
 		s.dispatchPush(ctx, c, writeMu, f)
 	case "memory.list",
@@ -3280,6 +3289,69 @@ func (s *Server) dispatchRunbook(ctx context.Context, c *websocket.Conn, writeMu
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.runbook.get", map[string]any{
 			"runbook": rb,
 		})
+	}
+}
+
+// dispatchAction surfaces the AI Action Plane orchestrator (Phase 1). It
+// exposes the job ledger: submit a command, list jobs, get one job with its
+// event trail, and cancel a running job. Phase 1 is read-only — submit kicks
+// off a read-only planner and never mutates host state.
+func (s *Server) dispatchAction(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Actions == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "actions subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "action.submit":
+		var in struct {
+			Text   string `json:"text"`
+			Worker string `json:"worker"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || strings.TrimSpace(in.Text) == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "text required")
+			return
+		}
+		job, err := s.cfg.Actions.Submit(ctx, in.Text, actions.Worker(in.Worker))
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "action.submit", map[string]any{"job": job})
+	case "action.list":
+		jobs, err := s.cfg.Actions.List()
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "action.list", map[string]any{"jobs": jobs})
+	case "action.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		job, err := s.cfg.Actions.Get(in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "not_found", "action job "+in.ID)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "action.get", map[string]any{"job": job})
+	case "action.cancel":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		job, err := s.cfg.Actions.Cancel(in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "not_found", "action job "+in.ID)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "action.cancel", map[string]any{"job": job})
 	}
 }
 

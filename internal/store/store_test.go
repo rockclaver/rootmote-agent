@@ -171,3 +171,82 @@ func TestStore_ActiveSessionsSurviveReopen(t *testing.T) {
 		t.Fatalf("active sessions mismatch: %+v", active)
 	}
 }
+
+// AC (Phase 1): "Submitted jobs persist in agent storage with status, request
+// text, worker choice, timestamps, and event log." We exercise the action job
+// ledger CRUD and confirm it survives a close/reopen.
+func TestStore_ActionJobsSurviveReopen(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "claver.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t0 := time.Unix(1_700_000_000, 0)
+	job := ActionJob{
+		ID:          "j1",
+		RequestText: "the api is crashing",
+		Worker:      "auto",
+		Status:      "submitted",
+		CreatedAt:   t0,
+		UpdatedAt:   t0,
+	}
+	if err := s.CreateActionJob(job); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.AppendActionJobEvent(ActionJobEvent{JobID: "j1", Type: "submitted", Message: "queued", CreatedAt: t0}); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	if _, err := s.AppendActionJobEvent(ActionJobEvent{JobID: "j1", Type: "planning", CreatedAt: t0}); err != nil {
+		t.Fatalf("append event 2: %v", err)
+	}
+	if err := s.UpdateActionJob("j1", "observed", "looks healthy", t0.Add(time.Minute)); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	s.Close()
+
+	s2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	got, err := s2.GetActionJob("j1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != "observed" || got.Result != "looks healthy" || got.RequestText != "the api is crashing" {
+		t.Fatalf("job mismatch after reopen: %+v", got)
+	}
+	if !got.UpdatedAt.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("updated_at = %v", got.UpdatedAt)
+	}
+
+	events, err := s2.ActionJobEvents("j1")
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	if len(events) != 2 || events[0].Seq != 1 || events[1].Seq != 2 {
+		t.Fatalf("events mismatch: %+v", events)
+	}
+
+	jobs, err := s2.ListActionJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "j1" {
+		t.Fatalf("list mismatch: %+v", jobs)
+	}
+}
+
+func TestStore_UpdateActionJobMissing(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	if err := s.UpdateActionJob("nope", "observed", "", time.Now()); err == nil {
+		t.Fatal("expected ErrNotFound for missing job")
+	}
+}

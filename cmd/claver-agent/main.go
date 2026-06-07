@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rockclaver/claver-agent/internal/actions"
 	"github.com/rockclaver/claver-agent/internal/aiproposal"
 	"github.com/rockclaver/claver-agent/internal/alerts"
 	"github.com/rockclaver/claver-agent/internal/billing"
@@ -230,6 +231,27 @@ func main() {
 		log.Fatalf("claver-agent: init runbook: %v", err)
 	}
 
+	// AI Action Plane orchestrator (Phase 1, read-only tracer). Until the
+	// Fleet Inventory + Target Resolver land (Phase 2), the planner cannot
+	// resolve a server/project/resource from free text, so it honestly returns
+	// "needs target" rather than guessing. No mutation happens in this phase.
+	actionsMgr, err := actions.New(actions.Config{
+		Store: st,
+		Planner: actions.PlannerFunc(func(ctx context.Context, req actions.Request) (actions.Result, error) {
+			return actions.Result{
+				Status:  actions.StatusNeedsTarget,
+				Summary: "target resolution is not available yet; specify the server/project explicitly",
+				Events: []actions.PlannerEvent{
+					{Type: "observation", Message: "read-only planner: no fleet inventory wired"},
+				},
+			}, nil
+		}),
+		Notifications: notificationHub,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init actions: %v", err)
+	}
+
 	inboxMgr := inbox.New()
 	inboxMgr.SetStateStore(st)
 	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
@@ -266,6 +288,7 @@ func main() {
 		Notifications: notificationHub,
 		Inbox:         inboxMgr,
 		Runbook:       runbookMgr,
+		Actions:       actionsMgr,
 		PushDevices:   st,
 		Memory:        memoryMgr,
 		Cost:          costCalc,

@@ -111,6 +111,35 @@ type AgentSetting struct {
 	Value string
 }
 
+// ActionJob is the persisted ledger row for one AI Action Plane job: the
+// natural-language request, the chosen worker (claude/codex/auto), the current
+// lifecycle status, and an optional final result summary. Jobs are durable so
+// the orchestrator survives an agent restart and the mobile client can list
+// history without an in-memory cache. Phase 1 only ever transitions a job
+// through read-only states (submitted -> planning -> observed/needs_target),
+// never a mutation.
+type ActionJob struct {
+	ID          string
+	RequestText string
+	Worker      string
+	Status      string
+	Result      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// ActionJobEvent is one append-only entry in a job's evidence/lifecycle trail.
+// Seq is per-job and monotonic, mirroring SessionEvent so the client can poll
+// "events after seq N".
+type ActionJobEvent struct {
+	JobID     string
+	Seq       int64
+	Type      string
+	Message   string
+	Data      string
+	CreatedAt time.Time
+}
+
 // InfraAlertRule stores one per-server alert rule override. Missing rows are
 // materialized from defaults by ListInfraAlertRules.
 type InfraAlertRule struct {
@@ -452,6 +481,30 @@ CREATE TABLE IF NOT EXISTS alert_acks (
 	fired_at   INTEGER NOT NULL,
 	created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS action_jobs (
+	id           TEXT PRIMARY KEY,
+	request_text TEXT NOT NULL,
+	worker       TEXT NOT NULL,
+	status       TEXT NOT NULL,
+	result       TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL,
+	updated_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS action_jobs_created_idx ON action_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS action_jobs_status_idx  ON action_jobs(status);
+
+CREATE TABLE IF NOT EXISTS action_job_events (
+	job_id     TEXT NOT NULL,
+	seq        INTEGER NOT NULL,
+	type       TEXT NOT NULL,
+	message    TEXT NOT NULL DEFAULT '',
+	data       TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY(job_id, seq),
+	FOREIGN KEY(job_id) REFERENCES action_jobs(id) ON DELETE CASCADE
+);
 `)
 	if err != nil {
 		return err
@@ -741,6 +794,142 @@ func (s *Store) AlertAcks() (map[string]time.Time, error) {
 			return nil, err
 		}
 		out[key] = time.Unix(firedAt, 0)
+	}
+	return out, rows.Err()
+}
+
+// CreateActionJob inserts a new action job row. The ID must be unique.
+func (s *Store) CreateActionJob(j ActionJob) error {
+	if j.CreatedAt.IsZero() {
+		j.CreatedAt = time.Now()
+	}
+	if j.UpdatedAt.IsZero() {
+		j.UpdatedAt = j.CreatedAt
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO action_jobs (id, request_text, worker, status, result, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		j.ID, j.RequestText, j.Worker, j.Status, j.Result, j.CreatedAt.Unix(), j.UpdatedAt.Unix(),
+	)
+	return err
+}
+
+// GetActionJob loads one action job by ID.
+func (s *Store) GetActionJob(id string) (ActionJob, error) {
+	row := s.db.QueryRow(
+		`SELECT id, request_text, worker, status, result, created_at, updated_at
+		 FROM action_jobs WHERE id = ?`, id,
+	)
+	j, err := scanActionJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ActionJob{}, fmt.Errorf("action_job %s: %w", id, ErrNotFound)
+	}
+	return j, err
+}
+
+func scanActionJob(row rowScanner) (ActionJob, error) {
+	var j ActionJob
+	var created, updated int64
+	if err := row.Scan(&j.ID, &j.RequestText, &j.Worker, &j.Status, &j.Result, &created, &updated); err != nil {
+		return ActionJob{}, err
+	}
+	j.CreatedAt = time.Unix(created, 0)
+	j.UpdatedAt = time.Unix(updated, 0)
+	return j, nil
+}
+
+// ListActionJobs returns action jobs newest-first.
+func (s *Store) ListActionJobs() ([]ActionJob, error) {
+	rows, err := s.db.Query(
+		`SELECT id, request_text, worker, status, result, created_at, updated_at
+		 FROM action_jobs ORDER BY created_at DESC, id DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ActionJob, 0)
+	for rows.Next() {
+		j, err := scanActionJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// UpdateActionJob updates the mutable lifecycle fields (status, result,
+// updated_at) of an existing job. Returns ErrNotFound when the row is absent.
+func (s *Store) UpdateActionJob(id, status, result string, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		`UPDATE action_jobs SET status = ?, result = ?, updated_at = ? WHERE id = ?`,
+		status, result, updatedAt.Unix(), id,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("action_job %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// AppendActionJobEvent appends one event to a job's trail, assigning the next
+// per-job seq, and returns the stored event.
+func (s *Store) AppendActionJobEvent(event ActionJobEvent) (ActionJobEvent, error) {
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ActionJobEvent{}, err
+	}
+	defer tx.Rollback()
+	var next sql.NullInt64
+	if err := tx.QueryRow(`SELECT MAX(seq) + 1 FROM action_job_events WHERE job_id = ?`, event.JobID).Scan(&next); err != nil {
+		return ActionJobEvent{}, err
+	}
+	if next.Valid {
+		event.Seq = next.Int64
+	} else {
+		event.Seq = 1
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO action_job_events (job_id, seq, type, message, data, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		event.JobID, event.Seq, event.Type, event.Message, event.Data, event.CreatedAt.Unix(),
+	); err != nil {
+		return ActionJobEvent{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ActionJobEvent{}, err
+	}
+	return event, nil
+}
+
+// ActionJobEvents returns all events for a job in ascending seq order.
+func (s *Store) ActionJobEvents(jobID string) ([]ActionJobEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT job_id, seq, type, message, data, created_at
+		 FROM action_job_events WHERE job_id = ? ORDER BY seq ASC`, jobID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ActionJobEvent, 0)
+	for rows.Next() {
+		var ev ActionJobEvent
+		var created int64
+		if err := rows.Scan(&ev.JobID, &ev.Seq, &ev.Type, &ev.Message, &ev.Data, &created); err != nil {
+			return nil, err
+		}
+		ev.CreatedAt = time.Unix(created, 0)
+		out = append(out, ev)
 	}
 	return out, rows.Err()
 }
