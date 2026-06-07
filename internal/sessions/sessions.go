@@ -734,13 +734,47 @@ func (m *Manager) captureAndEmitQuestion(sessionID string) {
 	m.questionMu.Unlock()
 
 	payload, _ := json.Marshal(q)
-	// Type is "ask_question", so the detectQuestion guard above (stdout-only)
-	// prevents this Publish from recursing.
-	_, _ = m.Publish(store.SessionEvent{
+	m.publishEphemeral(store.SessionEvent{
 		SessionID: sessionID,
 		Type:      "ask_question",
 		Data:      string(payload),
 	})
+}
+
+// publishEphemeral delivers a transient event to live subscribers only. Unlike
+// Publish, it does not append to the event log, so the event is never replayed
+// to a reconnecting client. Interactive-menu prompts (ask_question) reflect the
+// live on-screen TUI: once answered, the menu is gone, so resurfacing it from a
+// replay would pop a sheet the user already dismissed. The zero Seq marks the
+// event as ephemeral for the client (see session_repo's seq filter).
+func (m *Manager) publishEphemeral(ev store.SessionEvent) {
+	m.fanout(ev)
+}
+
+// currentQuestionEvent returns an ephemeral ask_question for the menu on screen
+// right now, or false if none is present. Used on subscribe so a client that
+// (re)attaches while a question is still pending re-renders it; an answered
+// menu has left the pane, so this yields nothing and no stale sheet appears.
+func (m *Manager) currentQuestionEvent(sessionID string) (store.SessionEvent, bool) {
+	capture, err := m.Runtime.CaptureVisible(context.Background(), sessionID)
+	if err != nil {
+		return store.SessionEvent{}, false
+	}
+	q, ok := parseAskQuestion(capture)
+	if !ok {
+		return store.SessionEvent{}, false
+	}
+	m.questionMu.Lock()
+	if st := m.questionState[sessionID]; st != nil {
+		q.GroupIndex = st.groupIndex
+	}
+	m.questionMu.Unlock()
+	payload, _ := json.Marshal(q)
+	return store.SessionEvent{
+		SessionID: sessionID,
+		Type:      "ask_question",
+		Data:      string(payload),
+	}, true
 }
 
 // clearQuestion resets a session's interactive-menu tracking so the next menu
@@ -806,6 +840,24 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 		defer close(out)
 		defer close(finished)
 		for _, ev := range replay {
+			// Never replay interactive-menu prompts. New ones are ephemeral, but
+			// sessions created before that change still have ask_question rows
+			// persisted in the store; replaying them re-pops sheets the user
+			// already answered. The live menu (if any) is re-emitted below.
+			if ev.Type == "ask_question" {
+				continue
+			}
+			select {
+			case out <- ev:
+			case <-subCtx.Done():
+				return
+			}
+		}
+		// Re-surface a menu that is still pending on screen (replay no longer
+		// carries ask_question events, so a genuinely-open question would
+		// otherwise be lost on reattach). Answered menus are gone from the pane
+		// and yield nothing here.
+		if ev, ok := m.currentQuestionEvent(sessionID); ok {
 			select {
 			case out <- ev:
 			case <-subCtx.Done():
