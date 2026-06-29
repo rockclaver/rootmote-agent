@@ -23,7 +23,7 @@ func TestStreamingLatency_P50UnderBudget(t *testing.T) {
 		t.Skip("skipping NFR benchmark in -short mode")
 	}
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +85,7 @@ func TestSessionStreaming_RSSStaysUnderBudget(t *testing.T) {
 		t.Skip("skipping NFR benchmark in -short mode")
 	}
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 

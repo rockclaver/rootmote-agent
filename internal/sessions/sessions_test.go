@@ -25,6 +25,8 @@ type fakeRuntime struct {
 	stops       int
 	captureText string
 	dead        bool
+	approvals   []string
+	modes       []string
 }
 
 func (f *fakeRuntime) Start(_ context.Context, spec RuntimeSpec) error {
@@ -66,6 +68,14 @@ func (f *fakeRuntime) CaptureVisible(context.Context, string) (string, error) {
 func (f *fakeRuntime) Alive(context.Context, string) bool {
 	return !f.dead
 }
+func (f *fakeRuntime) SendApproval(_ context.Context, sessionID, requestID, decision, note string) error {
+	f.approvals = append(f.approvals, sessionID+":"+requestID+":"+decision+":"+note)
+	return nil
+}
+func (f *fakeRuntime) SetMode(_ context.Context, sessionID, mode string) error {
+	f.modes = append(f.modes, sessionID+":"+mode)
+	return nil
+}
 
 func newTestManager(t *testing.T) (*Manager, *fakeRuntime) {
 	t.Helper()
@@ -94,7 +104,7 @@ func newTestManager(t *testing.T) (*Manager, *fakeRuntime) {
 // pipe-pane streams output into Stream Hub."
 func TestStartSession_CreatesRuntimePaneAndStreamsOutput(t *testing.T) {
 	m, rt := newTestManager(t)
-	sess, err := m.Start(context.Background(), "p1", "codex", "manual")
+	sess, err := m.Start(context.Background(), "p1", "codex", "manual", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +127,7 @@ func TestStartSession_CreatesRuntimePaneAndStreamsOutput(t *testing.T) {
 // backpressure; no event loss observed under simulated slow client."
 func TestStreamHub_NoEventLossWithSlowClient(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,7 +167,7 @@ func TestStartSession_InjectsProjectMemory(t *testing.T) {
 		}
 		return "# Project memory\nUse tabs.\n"
 	}
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(rt.prompts) != 1 || !strings.Contains(rt.prompts[0], "Use tabs") {
@@ -179,7 +189,7 @@ func TestStartSession_InjectsProjectMemory(t *testing.T) {
 func TestStartSession_NoMemoryNoPrompt(t *testing.T) {
 	m, rt := newTestManager(t)
 	m.MemorySource = func(string) string { return "  " }
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(rt.prompts) != 0 {
@@ -196,7 +206,7 @@ func TestStop_FiresOnEndHook(t *testing.T) {
 		called++
 		got = sess
 	}
-	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Stop(context.Background(), "s1"); err != nil {
@@ -211,7 +221,7 @@ func TestStop_FiresOnEndHook(t *testing.T) {
 // must not block Subscribe before the caller can start reading.
 func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 80; i++ {
@@ -257,7 +267,7 @@ func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {
 
 func TestSubscribe_CleanupDoesNotRequireParentContextCancel(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 80; i++ {
@@ -286,7 +296,7 @@ func TestSubscribe_CleanupDoesNotRequireParentContextCancel(t *testing.T) {
 // streamed output within the NFR latency budget."
 func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.SendPrompt(context.Background(), "s1", "explain"); err != nil {
@@ -299,7 +309,7 @@ func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
 
 func TestSendInput_ForwardsRawBytesAndSkipsEmpty(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	// An empty payload is a no-op and must not reach the runtime.
@@ -381,7 +391,7 @@ func TestClaudeFirstRunAdvancer_AdvancesLoginMethodAfterTheme(t *testing.T) {
 // pane; the session can receive another prompt afterward."
 func TestInterrupt_LeavesSessionPromptable(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Interrupt(context.Background(), "s1"); err != nil {
@@ -399,7 +409,7 @@ func TestInterrupt_LeavesSessionPromptable(t *testing.T) {
 // session; the user sees no data loss beyond what tmux itself drops."
 func TestRehydrate_CapturesActiveTmuxPane(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	rt.captureText = "still running\n"
@@ -419,7 +429,7 @@ func TestRehydrate_CapturesActiveTmuxPane(t *testing.T) {
 // existing tmux panes, not only capture a one-time snapshot.
 func TestRehydrate_AttachesStreamingToActiveTmuxPane(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	rt.captureText = "still running\n"
@@ -466,7 +476,7 @@ func TestRehydrate_AcrossAgentRestart_LosesNoCommittedEvent(t *testing.T) {
 	m1 := New(st, pm, rt1)
 	m1.IDGen = func() string { return "s1" }
 	m1.Now = func() time.Time { return time.Unix(100, 0) }
-	if _, err := m1.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := m1.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Publish committed events that should survive the crash.
@@ -543,7 +553,7 @@ func contains(xs []string, s string) bool {
 // (parsed from the agent's own usage output)."
 func TestUsageOutput_UpdatesSessionList(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "input tokens: 12 output tokens: 34"}); err != nil {
@@ -590,7 +600,7 @@ func TestCountToolCalls(t *testing.T) {
 // session row keyed by project.
 func TestAccountUsage_PersistsViaPublish(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout",
@@ -616,7 +626,7 @@ func TestAccountUsage_PersistsViaPublish(t *testing.T) {
 // AC: "No code path exposes an arbitrary shell command to the mobile UI."
 func TestStartSession_RejectsArbitraryAgentCommand(t *testing.T) {
 	m, _ := newTestManager(t)
-	_, err := m.Start(context.Background(), "p1", "sh -c rm -rf /", "manual")
+	_, err := m.Start(context.Background(), "p1", "sh -c rm -rf /", "manual", "")
 	if err == nil {
 		t.Fatal("expected bad agent error")
 	}
@@ -624,7 +634,7 @@ func TestStartSession_RejectsArbitraryAgentCommand(t *testing.T) {
 
 func TestStartSession_RejectsUnknownRunMode(t *testing.T) {
 	m, _ := newTestManager(t)
-	_, err := m.Start(context.Background(), "p1", "codex", "custom")
+	_, err := m.Start(context.Background(), "p1", "codex", "custom", "")
 	if !errors.Is(err, ErrBadMode) {
 		t.Fatalf("err = %v want ErrBadMode", err)
 	}
@@ -633,7 +643,7 @@ func TestStartSession_RejectsUnknownRunMode(t *testing.T) {
 func TestStartSession_RejectsUnauthenticatedAgent(t *testing.T) {
 	m, rt := newTestManager(t)
 	m.AuthOK = func(context.Context, string) bool { return false }
-	_, err := m.Start(context.Background(), "p1", "claude", "manual")
+	_, err := m.Start(context.Background(), "p1", "claude", "manual", "")
 	if !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("err = %v want ErrAuthRequired", err)
 	}

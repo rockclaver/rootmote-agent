@@ -1,0 +1,12 @@
+{
+  "message_delta": {"role": "assistant", "text": "Hel"},
+  "message": {"role": "assistant", "text": "Hello, world", "blocks": [{"kind": "text", "text": "Hello, world"}]},
+  "reasoning": {"text": "Let me think about this."},
+  "tool_call": {"call_id": "call_1", "name": "Bash", "args": {"command": "ls -la"}, "status": "completed", "result": "total 0", "error": ""},
+  "diff": {"call_id": "call_2", "path": "main.go", "patch": "@@ -1 +1 @@\n-old\n+new"},
+  "plan": {"items": [{"title": "Read code", "status": "completed"}, {"title": "Write fix", "status": "pending"}], "gating": true},
+  "approval_request": {"request_id": "req_1", "kind": "command", "summary": "Run ls -la", "detail": "ls -la in /workspace", "options": ["allow", "allow_always", "deny"]},
+  "usage": {"input": 1200, "output": 340, "cache": 100, "cost_usd": 0.0123},
+  "turn": {"state": "complete", "stop_reason": "end_turn"},
+  "error": {"message": "process exited", "fatal": true}
+}

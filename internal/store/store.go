@@ -31,6 +31,7 @@ type Session struct {
 	ID           string
 	ProjectID    string
 	Agent        string
+	Transport    string
 	StartedAt    time.Time
 	EndedAt      *time.Time
 	InputTokens  int
@@ -300,6 +301,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 	id            TEXT PRIMARY KEY,
 	project_id    TEXT NOT NULL,
 	agent         TEXT NOT NULL,
+	transport     TEXT NOT NULL DEFAULT 'terminal',
 	started_at    INTEGER NOT NULL,
 	ended_at      INTEGER,
 	input_tokens  INTEGER NOT NULL DEFAULT 0,
@@ -515,6 +517,7 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 	return s.addColumns("sessions",
 		columnDef{"cache_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		columnDef{"tool_calls", "INTEGER NOT NULL DEFAULT 0"},
+		columnDef{"transport", "TEXT NOT NULL DEFAULT 'terminal'"},
 	)
 }
 
@@ -996,10 +999,13 @@ func (s *Store) CreateSession(sess Session) error {
 	if sess.StartedAt.IsZero() {
 		sess.StartedAt = time.Now()
 	}
+	if sess.Transport == "" {
+		sess.Transport = "terminal"
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sess.ID, sess.ProjectID, sess.Agent, sess.StartedAt.Unix(), nullableUnix(sess.EndedAt),
+		`INSERT INTO sessions (id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.ID, sess.ProjectID, sess.Agent, sess.Transport, sess.StartedAt.Unix(), nullableUnix(sess.EndedAt),
 		sess.InputTokens, sess.OutputTokens, sess.CacheTokens, sess.ToolCalls,
 	)
 	return err
@@ -1008,7 +1014,7 @@ func (s *Store) CreateSession(sess Session) error {
 // GetSession loads a session by ID.
 func (s *Store) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions WHERE id = ?`, id,
 	)
 	sess, err := scanSession(row)
@@ -1022,7 +1028,7 @@ func scanSession(row rowScanner) (Session, error) {
 	var sess Session
 	var started int64
 	var ended sql.NullInt64
-	if err := row.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &started, &ended,
+	if err := row.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &sess.Transport, &started, &ended,
 		&sess.InputTokens, &sess.OutputTokens, &sess.CacheTokens, &sess.ToolCalls); err != nil {
 		return Session{}, err
 	}
@@ -1037,7 +1043,7 @@ func scanSession(row rowScanner) (Session, error) {
 // ListSessions returns sessions ordered newest first.
 func (s *Store) ListSessions(projectID string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions
 		 WHERE (? = '' OR project_id = ?)
 		 ORDER BY started_at DESC, id DESC`, projectID, projectID,
@@ -1060,7 +1066,7 @@ func (s *Store) ListSessions(projectID string) ([]Session, error) {
 // ActiveSessions returns sessions that have not been stopped.
 func (s *Store) ActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions WHERE ended_at IS NULL ORDER BY started_at ASC, id ASC`,
 	)
 	if err != nil {

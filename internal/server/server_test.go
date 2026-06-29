@@ -155,15 +155,19 @@ func TestIssue41InfraMetricsSubscribeUnsubscribeOverWS(t *testing.T) {
 		break
 	}
 }
-func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
-func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }
-func (fakeSessionRuntime) SendInput(context.Context, string, string) error    { return nil }
-func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
-func (fakeSessionRuntime) Resize(context.Context, string, int, int) error     { return nil }
-func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
+func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error     { return nil }
+func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error       { return nil }
+func (fakeSessionRuntime) SendInput(context.Context, string, string) error        { return nil }
+func (fakeSessionRuntime) Interrupt(context.Context, string) error                { return nil }
+func (fakeSessionRuntime) Resize(context.Context, string, int, int) error         { return nil }
+func (fakeSessionRuntime) Stop(context.Context, string) error                     { return nil }
 func (fakeSessionRuntime) Capture(context.Context, string) (string, error)        { return "", nil }
 func (fakeSessionRuntime) CaptureVisible(context.Context, string) (string, error) { return "", nil }
 func (fakeSessionRuntime) Alive(context.Context, string) bool                     { return true }
+func (fakeSessionRuntime) SendApproval(context.Context, string, string, string, string) error {
+	return nil
+}
+func (fakeSessionRuntime) SetMode(context.Context, string, string) error { return nil }
 
 // startTestServer brings up a server on a real loopback port and returns the
 // ws URL plus a cancel function.
@@ -598,7 +602,7 @@ func TestSession_SubscribeReplaysFromSequenceOverWS(t *testing.T) {
 	}
 	sm := sessions.New(st, pm, fakeSessionRuntime{})
 	sm.IDGen = func() string { return "s1" }
-	if _, err := sm.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := sm.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sm.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "after\n"}); err != nil {
@@ -704,7 +708,7 @@ func TestReview_ApproveFlow_OverWS(t *testing.T) {
 	rm := review.New(pm, st, review.HeuristicSummarizer{})
 	sm := sessions.New(st, pm, fakeSessionRuntime{})
 	sm.IDGen = func() string { return "s1" }
-	if _, err := sm.Start(context.Background(), "p1", "codex", "manual"); err != nil {
+	if _, err := sm.Start(context.Background(), "p1", "codex", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2621,5 +2625,71 @@ func TestFirewall_AntiLockoutOnSSHPort_RefusedBeforeBackend(t *testing.T) {
 	}
 	if len(b.removed) != 0 {
 		t.Fatal("backend Remove called despite anti-lockout")
+	}
+}
+
+// AC (Phase 0): session.approval and session.set_mode dispatch and return OK
+// against a fake runtime.
+func TestSession_ApprovalAndSetModeOverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	sm := sessions.New(st, pm, fakeSessionRuntime{})
+	sm.IDGen = func() string { return "s1" }
+	if _, err := sm.Start(context.Background(), "p1", "codex", "manual", "structured"); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Sessions: sm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	send := func(id, kind string, payload map[string]any) Frame {
+		b, _ := json.Marshal(payload)
+		req, _ := json.Marshal(Frame{ID: id, Kind: kind, Payload: b})
+		if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+			t.Fatalf("write %s: %v", kind, err)
+		}
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatalf("read %s: %v", kind, err)
+		}
+		var resp Frame
+		if err := json.Unmarshal(data, &resp); err != nil {
+			t.Fatalf("unmarshal %s: %v", kind, err)
+		}
+		return resp
+	}
+
+	resp := send("a", "session.approval", map[string]any{
+		"session_id": "s1", "request_id": "req_1", "decision": "allow",
+	})
+	if resp.Kind != "session.approval" {
+		t.Fatalf("approval kind = %q want session.approval", resp.Kind)
+	}
+
+	resp = send("m", "session.set_mode", map[string]any{
+		"session_id": "s1", "mode": "plan",
+	})
+	if resp.Kind != "session.set_mode" {
+		t.Fatalf("set_mode kind = %q want session.set_mode", resp.Kind)
 	}
 }

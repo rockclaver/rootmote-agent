@@ -26,10 +26,11 @@ import (
 )
 
 var (
-	ErrBadAgent     = errors.New("agent must be claude or codex")
-	ErrBadMode      = errors.New("run mode must be manual or yolo")
-	ErrAuthRequired = errors.New("agent cli is not authenticated")
-	ErrNotFound     = store.ErrNotFound
+	ErrBadAgent      = errors.New("agent must be claude or codex")
+	ErrBadMode       = errors.New("run mode must be manual or yolo")
+	ErrAuthRequired  = errors.New("agent cli is not authenticated")
+	ErrNotFound      = store.ErrNotFound
+	ErrNotStructured = errors.New("operation requires the structured transport")
 )
 
 type Runtime interface {
@@ -46,12 +47,18 @@ type Runtime interface {
 	// earlier menus from history.
 	CaptureVisible(ctx context.Context, sessionID string) (string, error)
 	Alive(ctx context.Context, sessionID string) bool
+	// SendApproval and SetMode are only meaningful on the structured transport;
+	// the terminal (tmux) runtime returns ErrNotStructured.
+	SendApproval(ctx context.Context, sessionID, requestID, decision, note string) error
+	SetMode(ctx context.Context, sessionID, mode string) error
 }
 
 type RuntimeSpec struct {
 	SessionID string
 	Agent     string
 	RunMode   string
+	// Transport is "terminal" (tmux TUI) or "structured" (machine protocol).
+	Transport string
 	WorkDir   string
 	Output    io.Writer
 	// ClaudeSessionID, when set, is passed to the claude CLI via --session-id so
@@ -125,7 +132,7 @@ func randomID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (store.Session, error) {
+func (m *Manager) Start(ctx context.Context, projectID, agent, runMode, transport string) (store.Session, error) {
 	if agent != "claude" && agent != "codex" {
 		return store.Session{}, ErrBadAgent
 	}
@@ -133,6 +140,9 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (
 	if runMode != "manual" && runMode != "yolo" {
 		return store.Session{}, ErrBadMode
 	}
+	// Transport is persisted on the session row; structured runtime selection by
+	// transport lands in Phase 1, so until then all sessions run on m.Runtime.
+	transport = normalizeTransport(transport)
 	if m.AuthOK != nil && !m.AuthOK(ctx, agent) {
 		return store.Session{}, ErrAuthRequired
 	}
@@ -140,7 +150,7 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (
 		return store.Session{}, err
 	}
 	id := m.IDGen()
-	sess := store.Session{ID: id, ProjectID: projectID, Agent: agent, StartedAt: m.Now()}
+	sess := store.Session{ID: id, ProjectID: projectID, Agent: agent, Transport: transport, StartedAt: m.Now()}
 	if err := m.Store.CreateSession(sess); err != nil {
 		return store.Session{}, err
 	}
@@ -155,6 +165,7 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (
 		SessionID:       id,
 		Agent:           agent,
 		RunMode:         runMode,
+		Transport:       transport,
 		WorkDir:         m.Projects.WorkspaceDir(projectID),
 		Output:          w,
 		ClaudeSessionID: claudeSessionID,
@@ -205,6 +216,27 @@ func (m *Manager) SendPrompt(ctx context.Context, sessionID, prompt string) erro
 	m.clearQuestion(sessionID)
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "prompt", Data: prompt})
 	return m.Runtime.SendPrompt(ctx, sessionID, prompt)
+}
+
+// SendApproval forwards the user's decision on a pending approval_request to the
+// structured runtime. decision is one of DecisionAllow/DecisionAllowAlways/
+// DecisionDeny; note is optional free text. The terminal runtime rejects this
+// with ErrNotStructured.
+func (m *Manager) SendApproval(ctx context.Context, sessionID, requestID, decision, note string) error {
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	return m.Runtime.SendApproval(ctx, sessionID, requestID, decision, note)
+}
+
+// SetMode switches the session's permission/run mode (ModePlan/ModeDefault/
+// ModeAcceptEdits/ModeYolo) on the structured runtime. The terminal runtime
+// rejects this with ErrNotStructured.
+func (m *Manager) SetMode(ctx context.Context, sessionID, mode string) error {
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	return m.Runtime.SetMode(ctx, sessionID, mode)
 }
 
 // SendInput forwards raw bytes (e.g. the arrow-key or mouse-wheel escape
@@ -1412,6 +1444,18 @@ func (TmuxRuntime) Stop(ctx context.Context, sessionID string) error {
 func (TmuxRuntime) Alive(ctx context.Context, sessionID string) bool {
 	err := exec.CommandContext(ctx, "tmux", "has-session", "-t", tmuxName(sessionID)).Run()
 	return err == nil
+}
+
+// SendApproval is unsupported on the terminal transport: approvals are driven
+// in-pane via SendInput. Returns ErrNotStructured.
+func (TmuxRuntime) SendApproval(context.Context, string, string, string, string) error {
+	return ErrNotStructured
+}
+
+// SetMode is unsupported on the terminal transport: the mode is fixed at launch
+// via the CLI args. Returns ErrNotStructured.
+func (TmuxRuntime) SetMode(context.Context, string, string) error {
+	return ErrNotStructured
 }
 
 func tmuxPanePIDs(ctx context.Context, name string) []int {

@@ -411,6 +411,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"session.delete",
 		"session.list",
 		"session.subscribe",
+		"session.approval",
+		"session.set_mode",
 		"session.download":
 		s.dispatchSession(ctx, c, writeMu, f)
 	case "skills.list":
@@ -556,6 +558,7 @@ type SessionDTO struct {
 	ID           string `json:"id"`
 	ProjectID    string `json:"project_id"`
 	Agent        string `json:"agent"`
+	Transport    string `json:"transport"`
 	StartedAt    int64  `json:"started_at"`
 	EndedAt      *int64 `json:"ended_at,omitempty"`
 	InputTokens  int    `json:"input_tokens"`
@@ -577,7 +580,7 @@ func toSessionDTO(sess store.Session) SessionDTO {
 		ended = &v
 	}
 	return SessionDTO{
-		ID: sess.ID, ProjectID: sess.ProjectID, Agent: sess.Agent,
+		ID: sess.ID, ProjectID: sess.ProjectID, Agent: sess.Agent, Transport: sess.Transport,
 		StartedAt: sess.StartedAt.Unix(), EndedAt: ended,
 		InputTokens: sess.InputTokens, OutputTokens: sess.OutputTokens,
 	}
@@ -715,12 +718,13 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			ProjectID string `json:"project_id"`
 			Agent     string `json:"agent"`
 			RunMode   string `json:"run_mode"`
+			Transport string `json:"transport"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || in.Agent == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id and agent required")
 			return
 		}
-		sess, err := mgr.Start(ctx, in.ProjectID, in.Agent, in.RunMode)
+		sess, err := mgr.Start(ctx, in.ProjectID, in.Agent, in.RunMode, in.Transport)
 		if err != nil {
 			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
 			return
@@ -771,6 +775,36 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.question_decision", map[string]any{"session_id": in.SessionID})
+	case "session.approval":
+		var in struct {
+			SessionID string `json:"session_id"`
+			RequestID string `json:"request_id"`
+			Decision  string `json:"decision"`
+			Note      string `json:"note"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		if err := mgr.SendApproval(ctx, in.SessionID, in.RequestID, in.Decision, in.Note); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.approval", map[string]any{"session_id": in.SessionID})
+	case "session.set_mode":
+		var in struct {
+			SessionID string `json:"session_id"`
+			Mode      string `json:"mode"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		if err := mgr.SetMode(ctx, in.SessionID, in.Mode); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.set_mode", map[string]any{"session_id": in.SessionID})
 	case "session.interrupt":
 		var in struct {
 			SessionID string `json:"session_id"`
