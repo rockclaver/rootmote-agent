@@ -423,3 +423,56 @@ func mustGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
 	}
 }
+
+// AC (Phase 5 #3): the @-file autocomplete source lists workspace files
+// (tracked + untracked-not-ignored), filters by query, and excludes ignored
+// files.
+func TestFiles_ListsTrackedAndUntrackedFiltered(t *testing.T) {
+	m := newManager(t)
+	p, err := m.CreateEmpty("filesdemo")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	dir := m.WorkspaceDir(p.ID)
+	mustWrite := func(rel, body string) {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("main.go", "package main")
+	mustWrite("lib/util.go", "package lib")
+	mustWrite("README.md", "# demo")
+	mustWrite(".gitignore", "secret.txt\n")
+	mustWrite("secret.txt", "nope")
+
+	has := func(list []string, want string) bool {
+		for _, f := range list {
+			if f == want {
+				return true
+			}
+		}
+		return false
+	}
+	all, err := m.Files(p.ID, "", 50)
+	if err != nil {
+		t.Fatalf("files: %v", err)
+	}
+	if !has(all, "main.go") || !has(all, "lib/util.go") || !has(all, "README.md") {
+		t.Fatalf("expected workspace files, got %v", all)
+	}
+	if has(all, "secret.txt") {
+		t.Fatalf("ignored file leaked into list: %v", all)
+	}
+
+	hits, err := m.Files(p.ID, "util", 50)
+	if err != nil {
+		t.Fatalf("files query: %v", err)
+	}
+	if len(hits) != 1 || hits[0] != "lib/util.go" {
+		t.Fatalf("query 'util' = %v, want [lib/util.go]", hits)
+	}
+}

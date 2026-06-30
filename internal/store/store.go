@@ -38,6 +38,11 @@ type Session struct {
 	OutputTokens int
 	CacheTokens  int
 	ToolCalls    int
+	// AgentSessionID is the agent CLI's own conversation handle (claude
+	// --session-id UUID or codex thread id), persisted so a session can be
+	// resumed or forked after its child process has exited. Empty for terminal
+	// sessions and for structured sessions started before this was recorded.
+	AgentSessionID string
 }
 
 // SessionEvent is an append-only terminal or lifecycle event for a session.
@@ -308,6 +313,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 	output_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_tokens  INTEGER NOT NULL DEFAULT 0,
 	tool_calls    INTEGER NOT NULL DEFAULT 0,
+	agent_session_id TEXT NOT NULL DEFAULT '',
 	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -518,6 +524,7 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 		columnDef{"cache_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		columnDef{"tool_calls", "INTEGER NOT NULL DEFAULT 0"},
 		columnDef{"transport", "TEXT NOT NULL DEFAULT 'terminal'"},
+		columnDef{"agent_session_id", "TEXT NOT NULL DEFAULT ''"},
 	)
 }
 
@@ -1003,10 +1010,10 @@ func (s *Store) CreateSession(sess Session) error {
 		sess.Transport = "terminal"
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions (id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls, agent_session_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.ProjectID, sess.Agent, sess.Transport, sess.StartedAt.Unix(), nullableUnix(sess.EndedAt),
-		sess.InputTokens, sess.OutputTokens, sess.CacheTokens, sess.ToolCalls,
+		sess.InputTokens, sess.OutputTokens, sess.CacheTokens, sess.ToolCalls, sess.AgentSessionID,
 	)
 	return err
 }
@@ -1014,7 +1021,7 @@ func (s *Store) CreateSession(sess Session) error {
 // GetSession loads a session by ID.
 func (s *Store) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls, agent_session_id
 		 FROM sessions WHERE id = ?`, id,
 	)
 	sess, err := scanSession(row)
@@ -1029,7 +1036,7 @@ func scanSession(row rowScanner) (Session, error) {
 	var started int64
 	var ended sql.NullInt64
 	if err := row.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &sess.Transport, &started, &ended,
-		&sess.InputTokens, &sess.OutputTokens, &sess.CacheTokens, &sess.ToolCalls); err != nil {
+		&sess.InputTokens, &sess.OutputTokens, &sess.CacheTokens, &sess.ToolCalls, &sess.AgentSessionID); err != nil {
 		return Session{}, err
 	}
 	sess.StartedAt = time.Unix(started, 0)
@@ -1043,7 +1050,7 @@ func scanSession(row rowScanner) (Session, error) {
 // ListSessions returns sessions ordered newest first.
 func (s *Store) ListSessions(projectID string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls, agent_session_id
 		 FROM sessions
 		 WHERE (? = '' OR project_id = ?)
 		 ORDER BY started_at DESC, id DESC`, projectID, projectID,
@@ -1066,7 +1073,7 @@ func (s *Store) ListSessions(projectID string) ([]Session, error) {
 // ActiveSessions returns sessions that have not been stopped.
 func (s *Store) ActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
+		`SELECT id, project_id, agent, transport, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls, agent_session_id
 		 FROM sessions WHERE ended_at IS NULL ORDER BY started_at ASC, id ASC`,
 	)
 	if err != nil {
@@ -1087,6 +1094,22 @@ func (s *Store) ActiveSessions() ([]Session, error) {
 // EndSession marks a session stopped without deleting its log.
 func (s *Store) EndSession(id string, endedAt time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, endedAt.Unix(), id)
+	return err
+}
+
+// ReopenSession clears a session's ended_at, marking it active again. Used when
+// a structured session is resumed in place: the row and its event log are
+// reused while a fresh agent child process is spawned.
+func (s *Store) ReopenSession(id string) error {
+	_, err := s.db.Exec(`UPDATE sessions SET ended_at = NULL WHERE id = ?`, id)
+	return err
+}
+
+// SetSessionAgentSessionID records the agent CLI's own conversation handle
+// (claude --session-id or codex thread id) so the session can later be resumed
+// or forked. The structured runtime reports it once the child is live.
+func (s *Store) SetSessionAgentSessionID(id, agentSessionID string) error {
+	_, err := s.db.Exec(`UPDATE sessions SET agent_session_id = ? WHERE id = ?`, agentSessionID, id)
 	return err
 }
 
@@ -1116,6 +1139,23 @@ func (s *Store) IncrSessionToolCalls(id string, delta int) error {
 	_, err := s.db.Exec(
 		`UPDATE sessions SET tool_calls = tool_calls + ? WHERE id = ?`,
 		delta, id,
+	)
+	return err
+}
+
+// AddSessionUsage folds one turn's token deltas into a session's running
+// totals. Structured runtimes report usage per turn (not cumulative), so the
+// deltas accumulate; this is robust across agent restarts because the running
+// total is persisted, not held in memory. The terminal transport keeps using
+// UpdateSessionUsage (which overwrites with a cumulative figure scraped from
+// the transcript).
+func (s *Store) AddSessionUsage(id string, inputTokens, outputTokens, cacheTokens int) error {
+	if inputTokens == 0 && outputTokens == 0 && cacheTokens == 0 {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`UPDATE sessions SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, cache_tokens = cache_tokens + ? WHERE id = ?`,
+		inputTokens, outputTokens, cacheTokens, id,
 	)
 	return err
 }

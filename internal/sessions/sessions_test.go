@@ -32,6 +32,15 @@ type fakeRuntime struct {
 func (f *fakeRuntime) Start(_ context.Context, spec RuntimeSpec) error {
 	f.started = append(f.started, spec)
 	_, _ = io.WriteString(spec.Output, "ready\n")
+	if spec.OnAgentSession != nil {
+		// Mirror the real runtimes: resume continues the same agent id; a fresh
+		// start or a fork mints a new one keyed off the session id.
+		id := "agent-" + spec.SessionID
+		if spec.ResumeAgentSessionID != "" && !spec.Fork {
+			id = spec.ResumeAgentSessionID
+		}
+		spec.OnAgentSession(id)
+	}
 	return nil
 }
 func (f *fakeRuntime) Attach(_ context.Context, spec RuntimeSpec) error {

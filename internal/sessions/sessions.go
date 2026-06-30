@@ -31,6 +31,8 @@ var (
 	ErrAuthRequired  = errors.New("agent cli is not authenticated")
 	ErrNotFound      = store.ErrNotFound
 	ErrNotStructured = errors.New("operation requires the structured transport")
+	ErrNotResumable  = errors.New("session has no resumable agent conversation")
+	ErrForkUnsupported = errors.New("fork is not supported by this runtime")
 )
 
 type Runtime interface {
@@ -70,6 +72,17 @@ type RuntimeSpec struct {
 	// its transcript file is named deterministically and we can read real token
 	// usage from it. Empty for non-claude agents.
 	ClaudeSessionID string
+	// ResumeAgentSessionID, when set, is the prior agent-native conversation
+	// handle (claude --session-id UUID or codex thread id) this session should
+	// continue from. Fork branches a new conversation off it (the original is
+	// left untouched); without Fork the same conversation is reattached.
+	ResumeAgentSessionID string
+	Fork                 bool
+	// OnAgentSession, when set, is invoked by the structured runtime once the
+	// child is live and its agent-native conversation handle is known, so the
+	// Manager can persist it for later resume/fork. Ignored by the terminal
+	// runtime.
+	OnAgentSession func(agentSessionID string)
 }
 
 type Manager struct {
@@ -145,8 +158,9 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode, transpor
 	if runMode != "manual" && runMode != "yolo" {
 		return store.Session{}, ErrBadMode
 	}
-	// Transport is persisted on the session row; structured runtime selection by
-	// transport lands in Phase 1, so until then all sessions run on m.Runtime.
+	// Transport is persisted on the session row and selects the runtime
+	// (structured machine protocol vs. terminal tmux TUI) via the routing
+	// runtime's per-session lookup.
 	transport = normalizeTransport(transport)
 	if m.AuthOK != nil && !m.AuthOK(ctx, agent) {
 		return store.Session{}, ErrAuthRequired
@@ -176,6 +190,7 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode, transpor
 		ClaudeSessionID: claudeSessionID,
 		Emit:            func(ev store.SessionEvent) { _, _ = m.Publish(ev) },
 		EmitEphemeral:   m.publishEphemeral,
+		OnAgentSession:  m.recordAgentSession(id),
 	}); err != nil {
 		_ = m.Store.EndSession(id, m.Now())
 		return store.Session{}, err
@@ -203,6 +218,107 @@ func (m *Manager) injectMemory(ctx context.Context, sessionID, projectID string)
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "memory", Data: block})
 	_ = m.Runtime.SendPrompt(ctx, sessionID, block)
+}
+
+// recordAgentSession returns the callback the structured runtime invokes once
+// the child's agent-native conversation handle is known, persisting it so the
+// session can be resumed or forked after the child exits.
+func (m *Manager) recordAgentSession(sessionID string) func(string) {
+	return func(agentSessionID string) {
+		if agentSessionID == "" {
+			return
+		}
+		_ = m.Store.SetSessionAgentSessionID(sessionID, agentSessionID)
+	}
+}
+
+// Resume reattaches to a prior structured session, continuing the same row and
+// event log with a freshly spawned agent child that reloads the prior
+// conversation. It is a no-op (returns the live session) if the child is still
+// running. Resume is only meaningful on the structured transport; terminal
+// sessions cannot be reattached.
+func (m *Manager) Resume(ctx context.Context, sessionID string) (store.Session, error) {
+	sess, err := m.Store.GetSession(sessionID)
+	if err != nil {
+		return store.Session{}, err
+	}
+	if sess.Transport != TransportStructured {
+		return store.Session{}, ErrNotStructured
+	}
+	if sess.AgentSessionID == "" {
+		return store.Session{}, ErrNotResumable
+	}
+	if m.AuthOK != nil && !m.AuthOK(ctx, sess.Agent) {
+		return store.Session{}, ErrAuthRequired
+	}
+	if m.Runtime.Alive(ctx, sessionID) {
+		return sess, nil
+	}
+	if err := m.Store.ReopenSession(sessionID); err != nil {
+		return store.Session{}, err
+	}
+	w := &eventWriter{manager: m, sessionID: sessionID, eventType: "stdout"}
+	if err := m.Runtime.Start(ctx, RuntimeSpec{
+		SessionID:            sessionID,
+		Agent:                sess.Agent,
+		RunMode:              "manual",
+		Transport:            sess.Transport,
+		WorkDir:              m.Projects.WorkspaceDir(sess.ProjectID),
+		Output:               w,
+		Emit:                 func(ev store.SessionEvent) { _, _ = m.Publish(ev) },
+		EmitEphemeral:        m.publishEphemeral,
+		OnAgentSession:       m.recordAgentSession(sessionID),
+		ResumeAgentSessionID: sess.AgentSessionID,
+	}); err != nil {
+		_ = m.Store.EndSession(sessionID, m.Now())
+		return store.Session{}, err
+	}
+	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "lifecycle", Data: "started"})
+	return m.Store.GetSession(sessionID)
+}
+
+// Fork branches a new structured session off a prior one: the new session
+// starts from the parent's conversation context but is a distinct row and
+// agent-native conversation, so the original is left untouched. Structured
+// transport only.
+func (m *Manager) Fork(ctx context.Context, sessionID string) (store.Session, error) {
+	parent, err := m.Store.GetSession(sessionID)
+	if err != nil {
+		return store.Session{}, err
+	}
+	if parent.Transport != TransportStructured {
+		return store.Session{}, ErrNotStructured
+	}
+	if parent.AgentSessionID == "" {
+		return store.Session{}, ErrNotResumable
+	}
+	if m.AuthOK != nil && !m.AuthOK(ctx, parent.Agent) {
+		return store.Session{}, ErrAuthRequired
+	}
+	id := m.IDGen()
+	sess := store.Session{ID: id, ProjectID: parent.ProjectID, Agent: parent.Agent, Transport: parent.Transport, StartedAt: m.Now()}
+	if err := m.Store.CreateSession(sess); err != nil {
+		return store.Session{}, err
+	}
+	w := &eventWriter{manager: m, sessionID: id, eventType: "stdout"}
+	if err := m.Runtime.Start(ctx, RuntimeSpec{
+		SessionID:            id,
+		Agent:                parent.Agent,
+		RunMode:              "manual",
+		Transport:            parent.Transport,
+		WorkDir:              m.Projects.WorkspaceDir(parent.ProjectID),
+		Output:               w,
+		Emit:                 func(ev store.SessionEvent) { _, _ = m.Publish(ev) },
+		EmitEphemeral:        m.publishEphemeral,
+		OnAgentSession:       m.recordAgentSession(id),
+		ResumeAgentSessionID: parent.AgentSessionID,
+		Fork:                 true,
+	}); err != nil {
+		_ = m.Store.EndSession(id, m.Now())
+		return store.Session{}, err
+	}
+	_, _ = m.Publish(store.SessionEvent{SessionID: id, Type: "lifecycle", Data: "started"})
+	return sess, nil
 }
 
 func normalizeRunMode(mode string) string {
@@ -705,19 +821,38 @@ func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
 	return ev, nil
 }
 
-// accountUsage extracts token usage and tool-call counts from a freshly
-// persisted event and folds them into the session's per-project usage row.
-// Both are best-effort: usage lines and tool-call markers only appear in
-// stdout from the agent CLI, and a malformed line simply yields no update.
+// accountUsage folds a freshly persisted event into the session's per-project
+// usage row. Two disjoint paths by event type keep the structured and terminal
+// transports separate:
+//   - Structured EvUsage/EvToolCall carry the agent's own typed accounting;
+//     usage deltas accumulate (per-turn, never cumulative) and each tool call is
+//     counted once at its "started" transition. No regex, no transcript scrape.
+//   - Terminal stdout/stderr is scraped with the legacy regexes (parseUsage /
+//     countToolCalls); structured runtimes never emit these types so the regex
+//     path is reached only by the terminal transport.
+//
+// All folding is best-effort: a malformed payload simply yields no update.
 func (m *Manager) accountUsage(ev store.SessionEvent) {
-	if ev.Type != "stdout" && ev.Type != "stderr" {
+	switch ev.Type {
+	case EvUsage:
+		var u Usage
+		if json.Unmarshal([]byte(ev.Data), &u) == nil {
+			_ = m.Store.AddSessionUsage(ev.SessionID, u.Input, u.Output, u.Cache)
+		}
 		return
-	}
-	if in, out, cache, ok := parseUsage(ev.Data); ok {
-		_ = m.Store.UpdateSessionUsage(ev.SessionID, in, out, cache)
-	}
-	if n := countToolCalls(ev.Data); n > 0 {
-		_ = m.Store.IncrSessionToolCalls(ev.SessionID, n)
+	case EvToolCall:
+		var tc ToolCall
+		if json.Unmarshal([]byte(ev.Data), &tc) == nil && tc.Status == ToolStarted {
+			_ = m.Store.IncrSessionToolCalls(ev.SessionID, 1)
+		}
+		return
+	case "stdout", "stderr":
+		if in, out, cache, ok := parseUsage(ev.Data); ok {
+			_ = m.Store.UpdateSessionUsage(ev.SessionID, in, out, cache)
+		}
+		if n := countToolCalls(ev.Data); n > 0 {
+			_ = m.Store.IncrSessionToolCalls(ev.SessionID, n)
+		}
 	}
 }
 

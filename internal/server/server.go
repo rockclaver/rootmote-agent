@@ -397,6 +397,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"project.list",
 		"project.status",
 		"project.history",
+		"project.files",
 		"project.branch_create",
 		"project.branch_switch",
 		"project.delete":
@@ -413,6 +414,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"session.subscribe",
 		"session.approval",
 		"session.set_mode",
+		"session.resume",
+		"session.fork",
 		"session.download":
 		s.dispatchSession(ctx, c, writeMu, f)
 	case "skills.list":
@@ -667,6 +670,22 @@ func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "project.history", map[string]any{"commits": commits})
+	case "project.files":
+		var in struct {
+			ID    string `json:"id"`
+			Query string `json:"query"`
+			Limit int    `json:"limit"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		files, err := mgr.Files(in.ID, in.Query, in.Limit)
+		if err != nil {
+			s.writeProjectErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "project.files", map[string]any{"files": files})
 	case "project.branch_create", "project.branch_switch":
 		var in struct {
 			ID     string `json:"id"`
@@ -822,6 +841,34 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.set_mode", map[string]any{"session_id": in.SessionID})
+	case "session.resume":
+		var in struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		sess, err := mgr.Resume(ctx, in.SessionID)
+		if err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.resume", toSessionDTO(sess))
+	case "session.fork":
+		var in struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		sess, err := mgr.Fork(ctx, in.SessionID)
+		if err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.fork", toSessionDTO(sess))
 	case "session.interrupt":
 		var in struct {
 			SessionID string `json:"session_id"`
@@ -1358,6 +1405,8 @@ func (s *Server) writeSessionErr(ctx context.Context, c *websocket.Conn, writeMu
 		s.writeError(ctx, c, writeMu, id, "auth_required", err.Error())
 	case errors.Is(err, sessions.ErrNotFound), errors.Is(err, projects.ErrNotFound):
 		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
+	case errors.Is(err, sessions.ErrNotStructured), errors.Is(err, sessions.ErrNotResumable), errors.Is(err, sessions.ErrForkUnsupported):
+		s.writeError(ctx, c, writeMu, id, "unsupported", err.Error())
 	default:
 		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
 	}

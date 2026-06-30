@@ -238,11 +238,12 @@ type codexExecSession struct {
 	sink    structuredSink
 	workDir string
 
-	mu       sync.Mutex
-	runMode  string
-	threadID string
-	cancel   context.CancelFunc
-	running  bool
+	mu             sync.Mutex
+	runMode        string
+	threadID       string
+	cancel         context.CancelFunc
+	running        bool
+	onAgentSession func(string)
 }
 
 func NewCodexExecRuntime(extraPath, homeDir string, secrets func(string) map[string]string) *CodexExecRuntime {
@@ -267,6 +268,11 @@ func (r *CodexExecRuntime) Start(_ context.Context, spec RuntimeSpec) error {
 	if spec.Emit == nil {
 		return errors.New("structured runtime requires RuntimeSpec.Emit")
 	}
+	if spec.Fork {
+		// `codex exec` has no fork primitive; resuming it would mutate the
+		// original thread, so forking is refused on the exec fallback.
+		return ErrForkUnsupported
+	}
 	if err := os.MkdirAll(spec.WorkDir, 0o700); err != nil {
 		return err
 	}
@@ -275,11 +281,16 @@ func (r *CodexExecRuntime) Start(_ context.Context, spec RuntimeSpec) error {
 	}
 	r.mu.Lock()
 	r.sessions[spec.SessionID] = &codexExecSession{
-		sink:    structuredSink{sessionID: spec.SessionID, emit: spec.Emit, ephemeral: spec.EmitEphemeral},
-		workDir: spec.WorkDir,
-		runMode: spec.RunMode,
+		sink:           structuredSink{sessionID: spec.SessionID, emit: spec.Emit, ephemeral: spec.EmitEphemeral},
+		workDir:        spec.WorkDir,
+		runMode:        spec.RunMode,
+		threadID:       spec.ResumeAgentSessionID,
+		onAgentSession: spec.OnAgentSession,
 	}
 	r.mu.Unlock()
+	if spec.ResumeAgentSessionID != "" && spec.OnAgentSession != nil {
+		spec.OnAgentSession(spec.ResumeAgentSessionID)
+	}
 	return nil
 }
 
@@ -369,7 +380,11 @@ func (s *codexExecSession) captureThread(line []byte) {
 	if json.Unmarshal(line, &p) == nil && p.Type == "thread.started" && p.ThreadID != "" {
 		s.mu.Lock()
 		s.threadID = p.ThreadID
+		cb := s.onAgentSession
 		s.mu.Unlock()
+		if cb != nil {
+			cb(p.ThreadID)
+		}
 	}
 }
 

@@ -227,9 +227,12 @@ func (c *codexConn) respondError(id json.RawMessage, code int, msg string) {
 	})
 }
 
-// handshake performs the initialize -> initialized -> thread/start sequence and
+// handshake performs the initialize -> initialized -> thread setup sequence and
 // records the thread id so prompts can open turns. Runs synchronously in Start
-// so a follow-on SendPrompt always sees a live thread.
+// so a follow-on SendPrompt always sees a live thread. The thread is started
+// fresh, resumed from a prior conversation, or forked off one depending on
+// spec.ResumeAgentSessionID / spec.Fork. The resulting thread id is reported
+// via spec.OnAgentSession so the Manager can persist it for later resume/fork.
 func (c *codexConn) handshake(ctx context.Context, spec RuntimeSpec) error {
 	if _, err := c.call(ctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{"name": "claver-agent", "title": "Claver", "version": "1"},
@@ -243,13 +246,34 @@ func (c *codexConn) handshake(ctx context.Context, spec RuntimeSpec) error {
 	c.mu.Lock()
 	c.approvalPolicy = policy
 	c.mu.Unlock()
-	res, err := c.call(ctx, "thread/start", map[string]any{
+
+	method := "thread/start"
+	params := map[string]any{
 		"cwd":            spec.WorkDir,
 		"approvalPolicy": policy,
 		"sandbox":        codexSandbox(spec.RunMode),
-	})
+	}
+	switch {
+	case spec.ResumeAgentSessionID != "" && spec.Fork:
+		// Fork branches a new thread off the prior one; the original is untouched.
+		method = "thread/fork"
+		params = map[string]any{
+			"threadId":       spec.ResumeAgentSessionID,
+			"approvalPolicy": policy,
+			"sandbox":        codexSandbox(spec.RunMode),
+		}
+	case spec.ResumeAgentSessionID != "":
+		// Resume reloads the prior thread and continues it in place.
+		method = "thread/resume"
+		params = map[string]any{
+			"threadId":       spec.ResumeAgentSessionID,
+			"approvalPolicy": policy,
+			"sandbox":        codexSandbox(spec.RunMode),
+		}
+	}
+	res, err := c.call(ctx, method, params)
 	if err != nil {
-		return fmt.Errorf("thread/start: %w", err)
+		return fmt.Errorf("%s: %w", method, err)
 	}
 	var r struct {
 		Thread struct {
@@ -257,11 +281,14 @@ func (c *codexConn) handshake(ctx context.Context, spec RuntimeSpec) error {
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(res, &r); err != nil || r.Thread.ID == "" {
-		return errors.New("thread/start returned no thread id")
+		return fmt.Errorf("%s returned no thread id", method)
 	}
 	c.mu.Lock()
 	c.threadID = r.Thread.ID
 	c.mu.Unlock()
+	if spec.OnAgentSession != nil {
+		spec.OnAgentSession(r.Thread.ID)
+	}
 	return nil
 }
 

@@ -345,19 +345,33 @@ func (r *ClaudeStructuredRuntime) Start(ctx context.Context, spec RuntimeSpec) e
 		return err
 	}
 	claudeSessionID := spec.ClaudeSessionID
-	if claudeSessionID == "" {
-		claudeSessionID = uuid.NewString()
-	}
 	args := []string{
 		"--print",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
-		"--session-id", claudeSessionID,
+	}
+	switch {
+	case spec.ResumeAgentSessionID != "" && spec.Fork:
+		// Fork: branch a brand-new conversation (its own --session-id) off the
+		// prior one. The original session id is left untouched.
+		claudeSessionID = uuid.NewString()
+		args = append(args, "--resume", spec.ResumeAgentSessionID, "--fork-session", "--session-id", claudeSessionID)
+	case spec.ResumeAgentSessionID != "":
+		// Resume: continue the same conversation id in place.
+		claudeSessionID = spec.ResumeAgentSessionID
+		args = append(args, "--resume", spec.ResumeAgentSessionID)
+	default:
+		if claudeSessionID == "" {
+			claudeSessionID = uuid.NewString()
+		}
+		args = append(args, "--session-id", claudeSessionID)
+	}
+	args = append(args,
 		"--permission-mode", claudePermissionForRunMode(spec.RunMode),
 		"--permission-prompt-tool", "stdio",
-	}
+	)
 	if dir := claudeSkillsDir(r.HomeDir); dir != "" {
 		args = append(args, "--add-dir", dir)
 	}
@@ -399,6 +413,9 @@ func (r *ClaudeStructuredRuntime) Start(ctx context.Context, spec RuntimeSpec) e
 	r.mu.Lock()
 	r.procs[spec.SessionID] = proc
 	r.mu.Unlock()
+	if spec.OnAgentSession != nil {
+		spec.OnAgentSession(claudeSessionID)
+	}
 
 	go io.Copy(io.Discard, stderr) //nolint:errcheck // drain so the pipe never blocks the child
 	go conn.run(stdout)

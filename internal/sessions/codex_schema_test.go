@@ -36,7 +36,7 @@ func TestCodexSchema_DeclaresTranslatedSurface(t *testing.T) {
 		// server -> client approval requests we answer
 		codexMethodCmdApproval, codexMethodFileApproval, codexMethodExecApproval, codexMethodPatchApproval,
 		// client -> server requests we send
-		"thread/start", "turn/start", "turn/interrupt", "initialize",
+		"thread/start", "thread/resume", "thread/fork", "turn/start", "turn/interrupt", "initialize",
 		// decision values we send back
 		"acceptForSession", "approved_for_session",
 		// item types we switch on

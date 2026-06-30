@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -224,6 +225,69 @@ func (m *Manager) History(id string, limit int, offset int) ([]Commit, error) {
 		})
 	}
 	return commits, nil
+}
+
+// Files returns workspace-relative file paths for @-mention autocomplete. It
+// lists git-tracked plus untracked-not-ignored files (so freshly created files
+// surface), filters by query (case-insensitive substring) when one is given,
+// and ranks basename-prefix matches first. The result is capped at limit
+// (default 50, max 200). A non-git or empty workspace yields an empty list
+// rather than an error.
+func (m *Manager) Files(id, query string, limit int) ([]string, error) {
+	if _, err := m.Store.GetProject(id); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	dir := m.WorkspaceDir(id)
+	out, err := run(dir, "git", "ls-files", "--cached", "--others", "--exclude-standard")
+	if err != nil {
+		// Not a git repo (or git unavailable): no autocomplete source, not fatal.
+		return []string{}, nil
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	seen := make(map[string]struct{})
+	matched := make([]string, 0, 64)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, dup := seen[line]; dup {
+			continue
+		}
+		seen[line] = struct{}{}
+		if q == "" || strings.Contains(strings.ToLower(line), q) {
+			matched = append(matched, line)
+		}
+	}
+	sort.SliceStable(matched, func(i, j int) bool {
+		if q != "" {
+			ri, rj := fileMatchRank(matched[i], q), fileMatchRank(matched[j], q)
+			if ri != rj {
+				return ri < rj
+			}
+		}
+		return matched[i] < matched[j]
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
+}
+
+// fileMatchRank ranks a path against a lowercased query: 0 = basename prefix,
+// 1 = full-path prefix, 2 = substring elsewhere. Lower sorts first.
+func fileMatchRank(path, q string) int {
+	switch {
+	case strings.HasPrefix(strings.ToLower(filepath.Base(path)), q):
+		return 0
+	case strings.HasPrefix(strings.ToLower(path), q):
+		return 1
+	default:
+		return 2
+	}
 }
 
 // BranchCreate creates a new branch and switches to it. If force is false and
