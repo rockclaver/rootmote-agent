@@ -4,10 +4,22 @@ The VPS-side companion for [Claver](https://github.com/rockclaver/claver). A sin
 `systemd`, that binds only to `127.0.0.1` and speaks a JSON-over-WebSocket
 protocol to the mobile app over an SSH-forwarded port.
 
-## Status
+## Sessions
 
-Phase 1 (issue #2): control plane skeleton with `server.health`. Sessions,
-projects, git, and preview are stubs that will land in later phases.
+Structured agent sessions are the default transport. Claude Code and Codex are
+driven over their native machine protocols — `claude` stream-json over stdio and
+`codex app-server` JSON-RPC — translated into one normalized event/command schema
+(messages, tool calls, diffs, plans, approvals, usage, turn boundaries) that the
+mobile app renders as a typed transcript. Each session is a per-session child
+process; start/interrupt/stop/resume/fork and replay are owned by the session
+Manager, and approvals/plan-mode are answered by a single protocol message rather
+than by scraping a TUI.
+
+A **raw-terminal transport** remains as an explicit fallback for flows the
+structured protocols do not cover (CLI auth / device-code prompts, experimental
+modes): the CLI runs in a tmux pane and its bytes stream to the app's terminal
+view. Each session selects its transport at start
+(`session.start { transport: "structured" | "terminal" }`, default `structured`).
 
 ## Build
 

@@ -71,9 +71,6 @@ func (f *fakeRuntime) Stop(context.Context, string) error {
 func (f *fakeRuntime) Capture(context.Context, string) (string, error) {
 	return f.captureText, nil
 }
-func (f *fakeRuntime) CaptureVisible(context.Context, string) (string, error) {
-	return f.captureText, nil
-}
 func (f *fakeRuntime) Alive(context.Context, string) bool {
 	return !f.dead
 }

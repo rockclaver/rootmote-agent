@@ -155,15 +155,14 @@ func TestIssue41InfraMetricsSubscribeUnsubscribeOverWS(t *testing.T) {
 		break
 	}
 }
-func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error     { return nil }
-func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error       { return nil }
-func (fakeSessionRuntime) SendInput(context.Context, string, string) error        { return nil }
-func (fakeSessionRuntime) Interrupt(context.Context, string) error                { return nil }
-func (fakeSessionRuntime) Resize(context.Context, string, int, int) error         { return nil }
-func (fakeSessionRuntime) Stop(context.Context, string) error                     { return nil }
-func (fakeSessionRuntime) Capture(context.Context, string) (string, error)        { return "", nil }
-func (fakeSessionRuntime) CaptureVisible(context.Context, string) (string, error) { return "", nil }
-func (fakeSessionRuntime) Alive(context.Context, string) bool                     { return true }
+func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
+func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }
+func (fakeSessionRuntime) SendInput(context.Context, string, string) error    { return nil }
+func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
+func (fakeSessionRuntime) Resize(context.Context, string, int, int) error     { return nil }
+func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
+func (fakeSessionRuntime) Capture(context.Context, string) (string, error)    { return "", nil }
+func (fakeSessionRuntime) Alive(context.Context, string) bool                 { return true }
 func (fakeSessionRuntime) SendApproval(context.Context, string, string, string, string) error {
 	return nil
 }

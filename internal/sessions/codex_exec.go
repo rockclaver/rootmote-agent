@@ -432,9 +432,6 @@ func (r *CodexExecRuntime) Attach(context.Context, RuntimeSpec) error {
 func (r *CodexExecRuntime) Capture(context.Context, string) (string, error) {
 	return "", nil
 }
-func (r *CodexExecRuntime) CaptureVisible(context.Context, string) (string, error) {
-	return "", nil
-}
 
 func (r *CodexExecRuntime) Alive(_ context.Context, sessionID string) bool {
 	return r.get(sessionID) != nil

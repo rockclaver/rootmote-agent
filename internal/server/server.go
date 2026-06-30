@@ -405,7 +405,6 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "session.start",
 		"session.prompt",
 		"session.input",
-		"session.question_decision",
 		"session.interrupt",
 		"session.resize",
 		"session.stop",
@@ -777,23 +776,6 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.input", map[string]any{"session_id": in.SessionID})
-	case "session.question_decision":
-		var in struct {
-			SessionID       string `json:"session_id"`
-			GroupIndex      int    `json:"group_index"`
-			SelectedIndices []int  `json:"selected_indices"`
-			FreeText        string `json:"free_text"`
-			Action          string `json:"action"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "invalid_payload", "session_id required")
-			return
-		}
-		if err := mgr.SendQuestionDecision(ctx, in.SessionID, in.GroupIndex, in.SelectedIndices, in.FreeText, in.Action); err != nil {
-			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "session.question_decision", map[string]any{"session_id": in.SessionID})
 	case "session.approval":
 		var in struct {
 			SessionID         string `json:"session_id"`

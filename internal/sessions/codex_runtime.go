@@ -562,11 +562,8 @@ func (r *CodexStructuredRuntime) Attach(context.Context, RuntimeSpec) error {
 	return errors.New("structured sessions cannot be reattached")
 }
 
-// Capture / CaptureVisible have no meaning without a pane.
+// Capture has no meaning without a pane.
 func (r *CodexStructuredRuntime) Capture(context.Context, string) (string, error) {
-	return "", nil
-}
-func (r *CodexStructuredRuntime) CaptureVisible(context.Context, string) (string, error) {
 	return "", nil
 }
 

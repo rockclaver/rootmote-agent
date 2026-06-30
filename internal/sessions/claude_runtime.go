@@ -485,11 +485,8 @@ func (r *ClaudeStructuredRuntime) Attach(context.Context, RuntimeSpec) error {
 	return errors.New("structured sessions cannot be reattached")
 }
 
-// Capture / CaptureVisible have no meaning without a pane.
+// Capture has no meaning without a pane.
 func (r *ClaudeStructuredRuntime) Capture(context.Context, string) (string, error) {
-	return "", nil
-}
-func (r *ClaudeStructuredRuntime) CaptureVisible(context.Context, string) (string, error) {
 	return "", nil
 }
 
@@ -620,9 +617,6 @@ func (r *routingRuntime) Stop(ctx context.Context, sessionID string) error {
 }
 func (r *routingRuntime) Capture(ctx context.Context, sessionID string) (string, error) {
 	return r.pick(sessionID).Capture(ctx, sessionID)
-}
-func (r *routingRuntime) CaptureVisible(ctx context.Context, sessionID string) (string, error) {
-	return r.pick(sessionID).CaptureVisible(ctx, sessionID)
 }
 func (r *routingRuntime) Alive(ctx context.Context, sessionID string) bool {
 	return r.pick(sessionID).Alive(ctx, sessionID)
