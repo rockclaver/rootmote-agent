@@ -528,7 +528,7 @@ func (m *Manager) listDarwin(ctx context.Context, sortBy string, limit int) ([]P
 	if limit <= 0 {
 		limit = 25
 	}
-	out, err := m.darwinProcesses(ctx)
+	out, err := m.darwinProcesses(ctx, sortBy)
 	if err != nil {
 		return nil, err
 	}
@@ -576,7 +576,7 @@ func (m *Manager) protectedDarwin(ctx context.Context, procs []Process) map[int]
 }
 
 func (m *Manager) readDarwinProcess(pid int) (Process, error) {
-	for _, p := range m.mustDarwinProcesses(context.Background()) {
+	for _, p := range m.mustDarwinProcesses(context.Background(), SortCPU) {
 		if p.PID == pid {
 			return p, nil
 		}
@@ -586,7 +586,7 @@ func (m *Manager) readDarwinProcess(pid int) (Process, error) {
 
 func (m *Manager) darwinPIDsByCommand(needle string) []int {
 	var pids []int
-	for _, p := range m.mustDarwinProcesses(context.Background()) {
+	for _, p := range m.mustDarwinProcesses(context.Background(), SortCPU) {
 		if processCommandContains(p, needle) {
 			pids = append(pids, p.PID)
 		}
@@ -603,16 +603,20 @@ func processCommandContains(p Process, needle string) bool {
 	return strings.Contains(base, needle) || strings.Contains(p.Command, needle)
 }
 
-func (m *Manager) mustDarwinProcesses(ctx context.Context) []Process {
-	procs, err := m.darwinProcesses(ctx)
+func (m *Manager) mustDarwinProcesses(ctx context.Context, sortBy string) []Process {
+	procs, err := m.darwinProcesses(ctx, sortBy)
 	if err != nil {
 		return nil
 	}
 	return procs
 }
 
-func (m *Manager) darwinProcesses(ctx context.Context) ([]Process, error) {
-	out, err := m.run(ctx, "ps", "-axo", "pid=,user=,%cpu=,rss=,lstart=,comm=")
+func (m *Manager) darwinProcesses(ctx context.Context, sortBy string) ([]Process, error) {
+	format := "-arcxo"
+	if sortBy == SortMemory {
+		format = "-amcxo"
+	}
+	out, err := m.run(ctx, "ps", format, "pid=,user=,%cpu=,rss=,comm=")
 	if err != nil {
 		return nil, fmt.Errorf("process: ps: %w", err)
 	}
@@ -628,7 +632,7 @@ func parseDarwinPS(raw string) []Process {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 10 {
+		if len(fields) < 5 {
 			continue
 		}
 		pid, err := strconv.Atoi(fields[0])
@@ -637,11 +641,15 @@ func parseDarwinPS(raw string) []Process {
 		}
 		cpu, _ := strconv.ParseFloat(fields[2], 64)
 		rssKB, _ := strconv.ParseUint(fields[3], 10, 64)
-		start := uint64(0)
-		if ts, err := time.Parse("Mon Jan 2 15:04:05 2006", strings.Join(fields[4:9], " ")); err == nil {
-			start = uint64(ts.Unix())
+		start := uint64(pid)
+		commandStart := 4
+		if len(fields) >= 10 {
+			if ts, err := time.Parse("Mon Jan 2 15:04:05 2006", strings.Join(fields[4:9], " ")); err == nil {
+				start = uint64(ts.Unix())
+				commandStart = 9
+			}
 		}
-		cmd := strings.Join(fields[9:], " ")
+		cmd := strings.Join(fields[commandStart:], " ")
 		out = append(out, Process{
 			PID:            pid,
 			User:           fields[1],
