@@ -2,11 +2,7 @@ package push
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"io"
 	"net/http"
@@ -14,39 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/rockclaver/claver-agent/internal/notifications"
 	"github.com/rockclaver/claver-agent/internal/store"
 )
-
-// testServiceAccount builds an in-memory, validly-signed service account so
-// tests exercise the real RSA sign + JWT encode path without needing a real
-// GCP key on disk.
-func testServiceAccount(t *testing.T) *ServiceAccount {
-	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
-	saJSON, _ := json.Marshal(map[string]string{
-		"type":         "service_account",
-		"project_id":   "claver-test",
-		"private_key":  string(pemBytes),
-		"client_email": "fcm@claver-test.iam.gserviceaccount.com",
-		"token_uri":    "https://example.invalid/token",
-	})
-	sa, err := ParseServiceAccount(saJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return sa
-}
 
 // fakeHTTP records requests and replies with a script of canned responses.
 type fakeHTTP struct {
@@ -85,19 +52,46 @@ func (f *fakeHTTP) push(status int, body string) {
 	f.scriptErr = append(f.scriptErr, nil)
 }
 
-func TestLoadServiceAccount_RejectsMissingFields(t *testing.T) {
-	if _, err := ParseServiceAccount([]byte(`{"project_id":"x"}`)); err == nil {
+func TestRegister_ReturnsToken(t *testing.T) {
+	hc := &fakeHTTP{}
+	hc.push(200, `{"token":"tok-123"}`)
+	tok, err := Register(context.Background(), "https://notify.example.com/", "test-host", hc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok-123" {
+		t.Fatalf("token = %q, want tok-123", tok)
+	}
+	if hc.requests[0].URL.String() != "https://notify.example.com/v1/register" {
+		t.Fatalf("register URL = %s", hc.requests[0].URL)
+	}
+	var body map[string]string
+	_ = json.Unmarshal([]byte(hc.reqBody[0]), &body)
+	if body["label"] != "test-host" {
+		t.Fatalf("label missing from register body: %s", hc.reqBody[0])
+	}
+}
+
+func TestRegister_RejectsErrorStatus(t *testing.T) {
+	hc := &fakeHTTP{}
+	hc.push(500, `boom`)
+	if _, err := Register(context.Background(), "https://notify.example.com", "", hc); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-func TestClient_SendMintsTokenThenPosts(t *testing.T) {
-	sa := testServiceAccount(t)
+func TestRegister_RejectsEmptyToken(t *testing.T) {
 	hc := &fakeHTTP{}
-	hc.push(200, `{"access_token":"tok","expires_in":3600,"token_type":"Bearer"}`)
-	hc.push(200, `{"name":"projects/claver-test/messages/123"}`)
-	c := NewClient(sa, hc)
-	c.now = func() time.Time { return time.Unix(1700000000, 0) }
+	hc.push(200, `{}`)
+	if _, err := Register(context.Background(), "https://notify.example.com", "", hc); err == nil {
+		t.Fatal("expected error for empty token")
+	}
+}
+
+func TestRelayClient_SendPostsAuthenticatedRequest(t *testing.T) {
+	hc := &fakeHTTP{}
+	hc.push(200, `{"results":[{"token":"device-1","ok":true}]}`)
+	c := NewRelayClient("https://notify.example.com", "tok-123", hc)
 
 	err := c.Send(context.Background(), Message{
 		Token: "device-1", Title: "AI runbook", Body: "restart x",
@@ -106,58 +100,60 @@ func TestClient_SendMintsTokenThenPosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hc.requests) != 2 {
-		t.Fatalf("requests=%d, want 2 (token then send)", len(hc.requests))
+	if len(hc.requests) != 1 {
+		t.Fatalf("requests=%d, want 1", len(hc.requests))
 	}
-	// First request: token exchange.
-	if !strings.Contains(hc.requests[0].URL.String(), "token") {
-		t.Fatalf("first request URL=%s", hc.requests[0].URL)
+	req := hc.requests[0]
+	if req.URL.String() != "https://notify.example.com/v1/notify" {
+		t.Fatalf("URL = %s", req.URL)
 	}
-	if !strings.Contains(hc.reqBody[0], "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer") {
-		t.Fatalf("missing jwt-bearer grant: %s", hc.reqBody[0])
+	if req.Header.Get("Authorization") != "Bearer tok-123" {
+		t.Fatalf("missing bearer token: %s", req.Header.Get("Authorization"))
 	}
-	// Second request: send.
-	if !strings.Contains(hc.requests[1].URL.String(), "projects/claver-test/messages:send") {
-		t.Fatalf("second request URL=%s", hc.requests[1].URL)
-	}
-	if hc.requests[1].Header.Get("Authorization") != "Bearer tok" {
-		t.Fatal("missing bearer token")
-	}
-	if !strings.Contains(hc.reqBody[1], `"runbook_id":"rb1"`) {
-		t.Fatalf("data payload missing: %s", hc.reqBody[1])
+	if !strings.Contains(hc.reqBody[0], `"runbook_id":"rb1"`) {
+		t.Fatalf("data payload missing: %s", hc.reqBody[0])
 	}
 }
 
-func TestClient_TokenCachedAcrossSends(t *testing.T) {
-	sa := testServiceAccount(t)
+func TestRelayClient_Send_RejectsEmptyToken(t *testing.T) {
+	c := NewRelayClient("https://notify.example.com", "tok-123", &fakeHTTP{})
+	if err := c.Send(context.Background(), Message{}); err == nil {
+		t.Fatal("expected error for empty device token")
+	}
+}
+
+func TestRelayClient_Send_MapsUnregisteredResult(t *testing.T) {
 	hc := &fakeHTTP{}
-	hc.push(200, `{"access_token":"tok","expires_in":3600,"token_type":"Bearer"}`)
-	hc.push(200, `{}`)
-	hc.push(200, `{}`)
-	c := NewClient(sa, hc)
-	c.now = func() time.Time { return time.Unix(1700000000, 0) }
-	for range 2 {
-		if err := c.Send(context.Background(), Message{Token: "d"}); err != nil {
-			t.Fatal(err)
-		}
+	hc.push(200, `{"results":[{"token":"dead","ok":false,"unregistered":true,"error":"gone"}]}`)
+	c := NewRelayClient("https://notify.example.com", "tok-123", hc)
+	err := c.Send(context.Background(), Message{Token: "dead"})
+	if err == nil {
+		t.Fatal("expected error")
 	}
-	if len(hc.requests) != 3 {
-		t.Fatalf("requests=%d, want 1 token + 2 sends", len(hc.requests))
+	if !IsUnregistered(err) {
+		t.Fatalf("expected unregistered error, got %v", err)
 	}
 }
 
-func TestIsUnregistered_DetectsFCMUnregistered(t *testing.T) {
-	if !IsUnregistered(&SendError{HTTPStatus: 404, Body: `{"error":{"status":"NOT_FOUND"}}`}) {
-		t.Fatal("404 should be unregistered")
+func TestRelayClient_Send_HTTPErrorStatus(t *testing.T) {
+	hc := &fakeHTTP{}
+	hc.push(401, `unauthorized`)
+	c := NewRelayClient("https://notify.example.com", "bad-token", hc)
+	err := c.Send(context.Background(), Message{Token: "d"})
+	if err == nil {
+		t.Fatal("expected error")
 	}
-	if !IsUnregistered(&SendError{HTTPStatus: 400, Body: `errorCode: UNREGISTERED`}) {
-		t.Fatal("UNREGISTERED body should be unregistered")
+	if IsUnregistered(err) {
+		t.Fatal("401 must not be treated as unregistered")
 	}
-	if IsUnregistered(&SendError{HTTPStatus: 500, Body: "internal"}) {
-		t.Fatal("500 is not unregistered")
+}
+
+func TestIsUnregistered_RequiresRelayError(t *testing.T) {
+	if IsUnregistered(errors.New("plain error")) {
+		t.Fatal("non-RelayError must not be unregistered")
 	}
-	if IsUnregistered(errors.New("non-send err")) {
-		t.Fatal("non-SendError must not be unregistered")
+	if IsUnregistered(&RelayError{Unregistered: false}) {
+		t.Fatal("Unregistered=false must report false")
 	}
 }
 
@@ -192,7 +188,7 @@ func TestHub_ForwardSelectedTypesAndPrunesUnregistered(t *testing.T) {
 	}
 
 	sender := &stubSender{errFor: map[string]error{
-		"dead-3": &SendError{HTTPStatus: 404, Body: `UNREGISTERED`},
+		"dead-3": &RelayError{Unregistered: true, Message: "gone"},
 	}}
 	hub := &Hub{
 		Sender: sender,

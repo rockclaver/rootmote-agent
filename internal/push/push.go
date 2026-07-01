@@ -1,16 +1,16 @@
-// Package push delivers agent-side notifications to registered mobile devices
-// via Firebase Cloud Messaging's HTTP v1 API.
+// Package push delivers agent-side notifications to registered mobile
+// devices via a central claver-notify relay.
 //
-// We deliberately do NOT take a dependency on firebase.google.com/go/v4: the
-// admin SDK pulls in dozens of indirect Google-Cloud packages we do not
-// otherwise use. FCM HTTP v1 only needs (a) a JWT signed with the service
-// account's RSA private key, (b) an OAuth2 token exchange, (c) an HTTPS POST.
-// All three are stdlib (or close to it), and the resulting blast radius for
-// future supply-chain audits is tiny.
+// Earlier versions of this package spoke to Firebase Cloud Messaging's HTTP
+// v1 API directly, which meant every self-hosted agent had to provision its
+// own Firebase project and service-account key. That per-install setup cost
+// is gone: the relay (github.com/rockclaver/claver-notify) holds the one
+// shared FCM service-account credential, and every agent authenticates to
+// it with a lightweight bearer token obtained via Register.
 //
 // The package surfaces three things:
-//   - LoadServiceAccount: parse the on-disk JSON the user provisioned.
-//   - Client.Send: deliver one Message to one device token.
+//   - Register: self-service enrollment against a relay deployment.
+//   - RelayClient.Send: deliver one Message through the relay.
 //   - Hub: subscribes to notifications.Hub, fans selected notification kinds
 //     out to every device registered in the store.
 package push
@@ -18,108 +18,22 @@ package push
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rockclaver/claver-agent/internal/notifications"
 	"github.com/rockclaver/claver-agent/internal/store"
 )
 
-// fcmAPIURL is the FCM HTTP v1 send endpoint template. The {project} segment
-// is filled from the service account's project_id.
-const fcmAPIURL = "https://fcm.googleapis.com/v1/projects/%s/messages:send"
-
-// fcmScope is the OAuth2 scope FCM requires for messages:send.
-const fcmScope = "https://www.googleapis.com/auth/firebase.messaging"
-
-// tokenURL is the Google OAuth2 token endpoint. Pulled from the service
-// account JSON in production, but defaulted here so older keys (which
-// sometimes omit the field) still work.
-const defaultTokenURL = "https://oauth2.googleapis.com/token"
-
-// ServiceAccount is the parsed shape of a Google service-account JSON key.
-// Only the fields we actually use are declared so a key with future fields
-// still parses cleanly.
-type ServiceAccount struct {
-	Type        string `json:"type"`
-	ProjectID   string `json:"project_id"`
-	PrivateKey  string `json:"private_key"`
-	ClientEmail string `json:"client_email"`
-	TokenURI    string `json:"token_uri,omitempty"`
-
-	parsedKey *rsa.PrivateKey
-}
-
-// LoadServiceAccount reads and parses a service-account JSON file.
-func LoadServiceAccount(path string) (*ServiceAccount, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read service account: %w", err)
-	}
-	return ParseServiceAccount(b)
-}
-
-// ParseServiceAccount parses raw service-account JSON bytes.
-func ParseServiceAccount(b []byte) (*ServiceAccount, error) {
-	var sa ServiceAccount
-	if err := json.Unmarshal(b, &sa); err != nil {
-		return nil, fmt.Errorf("parse service account JSON: %w", err)
-	}
-	if sa.ProjectID == "" || sa.ClientEmail == "" || sa.PrivateKey == "" {
-		return nil, errors.New("service account missing project_id/client_email/private_key")
-	}
-	key, err := parseRSAPrivateKey(sa.PrivateKey)
-	if err != nil {
-		return nil, err
-	}
-	sa.parsedKey = key
-	if sa.TokenURI == "" {
-		sa.TokenURI = defaultTokenURL
-	}
-	return &sa, nil
-}
-
-func parseRSAPrivateKey(pem string) (*rsa.PrivateKey, error) {
-	block, _ := decodePEM([]byte(pem))
-	if block == nil {
-		return nil, errors.New("private_key is not PEM")
-	}
-	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		return key, nil
-	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
-	}
-	rsaKey, ok := parsed.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("private key is %T, want RSA", parsed)
-	}
-	return rsaKey, nil
-}
-
-// decodePEM wraps encoding/pem.Decode so we can keep the import list tight.
-func decodePEM(in []byte) (*pem.Block, []byte) { return pem.Decode(in) }
-
-// Message is the minimal FCM message shape we send. We include both the
-// `notification` block (so the OS draws the system banner / wakes the screen)
-// AND a `data` payload (so the foreground client can deep-link without
-// re-fetching the body). Apple and Android both deliver `data` to the app.
+// Message is the minimal message shape we hand to the relay. We include
+// both title/body (so the OS draws the system banner / wakes the screen)
+// AND a data payload (so the foreground client can deep-link without
+// re-fetching the body). Apple and Android both deliver data to the app.
 type Message struct {
 	Token string            // FCM device token (required)
 	Title string            // notification.title
@@ -132,169 +46,152 @@ type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// Client sends FCM messages. Construct with NewClient. Safe for concurrent use.
-type Client struct {
-	sa     *ServiceAccount
-	http   HTTPDoer
-	now    func() time.Time
-	tokMu  sync.Mutex
-	token  string
-	tokExp time.Time
+func defaultHTTPClient(c HTTPDoer) HTTPDoer {
+	if c != nil {
+		return c
+	}
+	return &http.Client{Timeout: 15 * time.Second}
 }
 
-// NewClient constructs a Client. http and now default sensibly.
-func NewClient(sa *ServiceAccount, httpClient HTTPDoer) *Client {
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
-	}
-	return &Client{sa: sa, http: httpClient, now: time.Now}
-}
-
-// Send delivers one message. Returns an error containing the FCM error code
-// so the caller can prune UNREGISTERED tokens from the device registry.
-func (c *Client) Send(ctx context.Context, m Message) error {
-	if m.Token == "" {
-		return errors.New("push: empty device token")
-	}
-	tok, err := c.accessToken(ctx)
+// Register calls a claver-notify deployment's self-service enrollment
+// endpoint and returns a fresh bearer token for this installation. label is
+// an optional human-readable hint (e.g. hostname) the relay stores alongside
+// the token so an operator can identify it later; it need not be unique.
+func Register(ctx context.Context, baseURL, label string, httpClient HTTPDoer) (string, error) {
+	httpClient = defaultHTTPClient(httpClient)
+	body, err := json.Marshal(map[string]string{"label": label})
 	if err != nil {
-		return err
-	}
-	body, err := buildSendPayload(m)
-	if err != nil {
-		return err
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf(fcmAPIURL, c.sa.ProjectID), bytes.NewReader(body))
+		strings.TrimRight(baseURL, "/")+"/v1/register", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("fcm send: %w", err)
+		return "", fmt.Errorf("notify relay register: %w", err)
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return &SendError{HTTPStatus: resp.StatusCode, Body: string(rb)}
+		return "", fmt.Errorf("notify relay register: status=%d body=%s",
+			resp.StatusCode, truncate(string(rb), 256))
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rb, &out); err != nil {
+		return "", fmt.Errorf("notify relay register: parse response: %w", err)
+	}
+	if out.Token == "" {
+		return "", errors.New("notify relay register: empty token")
+	}
+	return out.Token, nil
+}
+
+// RelayClient sends messages through a central claver-notify relay instead
+// of talking to FCM directly. Construct with NewRelayClient. Safe for
+// concurrent use (it is stateless beyond its HTTP client).
+type RelayClient struct {
+	// BaseURL is the claver-notify deployment, e.g. "https://notify.example.com".
+	BaseURL string
+	// Token authenticates this agent installation to the relay. Obtain one
+	// via Register and persist it (see cmd/claver-agent).
+	Token string
+	HTTP  HTTPDoer
+}
+
+// NewRelayClient constructs a RelayClient. httpClient defaults sensibly.
+func NewRelayClient(baseURL, token string, httpClient HTTPDoer) *RelayClient {
+	return &RelayClient{BaseURL: baseURL, Token: token, HTTP: defaultHTTPClient(httpClient)}
+}
+
+type relayNotifyRequest struct {
+	Messages []relayMessage `json:"messages"`
+}
+
+type relayMessage struct {
+	Token string            `json:"token"`
+	Title string            `json:"title"`
+	Body  string            `json:"body"`
+	Data  map[string]string `json:"data,omitempty"`
+}
+
+type relayNotifyResponse struct {
+	Results []struct {
+		Token        string `json:"token"`
+		OK           bool   `json:"ok"`
+		Unregistered bool   `json:"unregistered"`
+		Error        string `json:"error"`
+	} `json:"results"`
+}
+
+// Send delivers one message via the relay's /v1/notify endpoint. Returns a
+// *RelayError the caller can inspect with IsUnregistered to prune dead
+// tokens from the device registry.
+func (c *RelayClient) Send(ctx context.Context, m Message) error {
+	if m.Token == "" {
+		return errors.New("push: empty device token")
+	}
+	reqBody, err := json.Marshal(relayNotifyRequest{Messages: []relayMessage{{
+		Token: m.Token, Title: m.Title, Body: m.Body, Data: m.Data,
+	}}})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(c.BaseURL, "/")+"/v1/notify", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := defaultHTTPClient(c.HTTP).Do(req)
+	if err != nil {
+		return fmt.Errorf("notify relay: %w", err)
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return &RelayError{HTTPStatus: resp.StatusCode,
+			Message: fmt.Sprintf("notify relay: status=%d body=%s", resp.StatusCode, truncate(string(rb), 256))}
+	}
+	var out relayNotifyResponse
+	if err := json.Unmarshal(rb, &out); err != nil {
+		return fmt.Errorf("notify relay: parse response: %w", err)
+	}
+	if len(out.Results) != 1 {
+		return fmt.Errorf("notify relay: expected 1 result, got %d", len(out.Results))
+	}
+	if r := out.Results[0]; !r.OK {
+		return &RelayError{Unregistered: r.Unregistered, Message: r.Error}
 	}
 	return nil
 }
 
-// SendError wraps a non-2xx FCM response so the caller can detect 404 /
-// UNREGISTERED and prune the dead token from the registry.
-type SendError struct {
-	HTTPStatus int
-	Body       string
+// RelayError wraps a per-message failure reported by the notify relay,
+// whether that's a transport-level HTTP error or a per-token FCM rejection
+// the relay normalized for us.
+type RelayError struct {
+	HTTPStatus   int
+	Unregistered bool
+	Message      string
 }
 
-func (e *SendError) Error() string {
-	return fmt.Sprintf("fcm send: status=%d body=%s", e.HTTPStatus, truncate(e.Body, 256))
+func (e *RelayError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("notify relay: status=%d", e.HTTPStatus)
 }
 
 // IsUnregistered reports whether err indicates the device token is no longer
 // valid (uninstalled / token rotated). The caller should drop the token.
 func IsUnregistered(err error) bool {
-	var se *SendError
-	if !errors.As(err, &se) {
-		return false
-	}
-	if se.HTTPStatus == http.StatusNotFound {
-		return true
-	}
-	// FCM v1 returns 404 with error.status="NOT_FOUND" and
-	// errorCode="UNREGISTERED" for stale tokens; the string match is a
-	// belt-and-braces fallback for the rare 400 phrasings.
-	low := strings.ToLower(se.Body)
-	return strings.Contains(low, "unregistered") || strings.Contains(low, "not_found")
-}
-
-func buildSendPayload(m Message) ([]byte, error) {
-	msg := map[string]any{
-		"token": m.Token,
-		"notification": map[string]any{
-			"title": m.Title,
-			"body":  m.Body,
-		},
-	}
-	if len(m.Data) > 0 {
-		msg["data"] = m.Data
-	}
-	return json.Marshal(map[string]any{"message": msg})
-}
-
-// accessToken returns a cached OAuth2 access token, minting a new one when
-// the cached one has fewer than 60 seconds remaining.
-func (c *Client) accessToken(ctx context.Context) (string, error) {
-	c.tokMu.Lock()
-	defer c.tokMu.Unlock()
-	if c.token != "" && c.now().Add(60*time.Second).Before(c.tokExp) {
-		return c.token, nil
-	}
-	now := c.now()
-	jwt, err := buildJWT(c.sa, now)
-	if err != nil {
-		return "", err
-	}
-	form := url.Values{}
-	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
-	form.Set("assertion", jwt)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sa.TokenURI,
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("oauth2 token exchange: %w", err)
-	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("oauth2 token exchange: status=%d body=%s",
-			resp.StatusCode, truncate(string(rb), 256))
-	}
-	var tr struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-		TokenType   string `json:"token_type"`
-	}
-	if err := json.Unmarshal(rb, &tr); err != nil {
-		return "", fmt.Errorf("oauth2 token parse: %w", err)
-	}
-	if tr.AccessToken == "" {
-		return "", errors.New("oauth2 token exchange: empty access_token")
-	}
-	c.token = tr.AccessToken
-	c.tokExp = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
-	return c.token, nil
-}
-
-// buildJWT signs a service-account assertion suitable for the OAuth2
-// jwt-bearer grant. Hand-rolled because importing a JWT library for one
-// 30-line function would be overkill.
-func buildJWT(sa *ServiceAccount, now time.Time) (string, error) {
-	header := map[string]string{"alg": "RS256", "typ": "JWT"}
-	claims := map[string]any{
-		"iss":   sa.ClientEmail,
-		"scope": fcmScope,
-		"aud":   sa.TokenURI,
-		"iat":   now.Unix(),
-		"exp":   now.Add(time.Hour).Unix(),
-	}
-	hb, _ := json.Marshal(header)
-	cb, _ := json.Marshal(claims)
-	enc := base64.RawURLEncoding
-	signingInput := enc.EncodeToString(hb) + "." + enc.EncodeToString(cb)
-	hash := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, sa.parsedKey, crypto.SHA256, hash[:])
-	if err != nil {
-		return "", fmt.Errorf("sign jwt: %w", err)
-	}
-	return signingInput + "." + enc.EncodeToString(sig), nil
+	var re *RelayError
+	return errors.As(err, &re) && re.Unregistered
 }
 
 // Sender is the narrow surface Hub needs. Decoupled so tests can stub.
@@ -302,10 +199,10 @@ type Sender interface {
 	Send(ctx context.Context, m Message) error
 }
 
-// Hub wires the agent's notifications.Hub to an FCM Sender + the device
-// registry in store. On every selected notification it queries the registry
-// once and fans the message out to every device, pruning tokens that FCM
-// rejects as unregistered.
+// Hub wires the agent's notifications.Hub to a Sender + the device registry
+// in store. On every selected notification it queries the registry once and
+// fans the message out to every device, pruning tokens the relay reports as
+// unregistered.
 //
 // Selection is opt-in by notification Type: we only push high-signal events
 // (alerts, runbooks) and not chatty things like session lifecycle ticks.

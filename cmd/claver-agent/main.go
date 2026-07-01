@@ -48,7 +48,8 @@ func main() {
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
 	caddyFragmentsDir := flag.String("caddy-fragments-dir", envOr("CLAVER_CADDY_FRAGMENTS_DIR", "/etc/caddy/claver"), "directory for per-preview Caddy site blocks")
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
-	fcmServiceAccount := flag.String("fcm-service-account", envOr("CLAVER_FCM_SERVICE_ACCOUNT", ""), "path to Firebase service-account JSON; enables server-side push when set")
+	notifyRelayURL := flag.String("notify-relay-url", envOr("CLAVER_NOTIFY_RELAY_URL", ""), "base URL of the central claver-notify relay; enables server-side push when set")
+	notifyToken := flag.String("notify-token", envOr("CLAVER_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
 	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
 	codexRuntimeKind := flag.String("codex-runtime", envOr("CLAVER_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
 	serverID := flag.String("server-id", envOr("CLAVER_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
@@ -383,18 +384,37 @@ func main() {
 	runbookCleanup := runbookMgr.Start(ctx)
 	defer runbookCleanup()
 
-	// FCM push: optional. The agent stays fully functional without it (the
-	// notification hub + inbox keep delivering to connected sockets). With
-	// a service-account JSON, we additionally fan high-signal events out
-	// as system-level push so a backgrounded device still wakes the user.
-	if *fcmServiceAccount != "" {
-		sa, err := push.LoadServiceAccount(*fcmServiceAccount)
-		if err != nil {
-			log.Printf("claver-agent: FCM disabled: %v", err)
-		} else {
-			pushClient := push.NewClient(sa, nil)
+	// Push delivery: optional. The agent stays fully functional without it
+	// (the notification hub + inbox keep delivering to connected sockets).
+	// With a relay URL configured, we additionally fan high-signal events
+	// out as system-level push so a backgrounded device still wakes the
+	// user. The relay (github.com/rockclaver/claver-notify) holds the one
+	// shared FCM service-account credential, so no per-install Firebase
+	// project is required: the agent self-registers for a bearer token on
+	// first run and persists it in agent_settings.
+	if *notifyRelayURL != "" {
+		token := *notifyToken
+		if token == "" {
+			if saved, getErr := st.GetAgentSetting("notify_relay_token"); getErr == nil {
+				token = saved
+			}
+		}
+		if token == "" {
+			registerCtx, registerCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			registeredToken, regErr := push.Register(registerCtx, *notifyRelayURL, hostname, nil)
+			registerCancel()
+			if regErr != nil {
+				log.Printf("claver-agent: notify relay register failed, push disabled: %v", regErr)
+			} else {
+				token = registeredToken
+				if putErr := st.PutAgentSetting("notify_relay_token", token); putErr != nil {
+					log.Printf("claver-agent: persist notify token: %v", putErr)
+				}
+			}
+		}
+		if token != "" {
 			pushHub := &push.Hub{
-				Sender: pushClient,
+				Sender: push.NewRelayClient(*notifyRelayURL, token, nil),
 				Store:  st,
 				Types:  map[string]bool{"infra.alert": true, "infra.runbook": true},
 				Logf:   log.Printf,
@@ -402,7 +422,7 @@ func main() {
 			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
 			defer pushCleanup()
 			pushDeliveryConfigured = true
-			log.Printf("claver-agent: FCM push enabled (project %s)", sa.ProjectID)
+			log.Printf("claver-agent: notify relay push enabled (%s)", *notifyRelayURL)
 		}
 	}
 

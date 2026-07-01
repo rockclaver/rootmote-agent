@@ -4,9 +4,10 @@ dist/
 e2e-smoke
 claver-agent
 
-# Runtime secrets.
-server/*.json
-server/**/*firebase-adminsdk*.json
+# Local-only credentials from the pre-relay direct-FCM setup. The agent no
+# longer reads this path (see internal/push), but keep it ignored so a
+# stray key never gets committed by an over-broad `git add`.
+server/
 
 # Skills are materialized from skills-lock.json by the installer.
 .agents/skills/
