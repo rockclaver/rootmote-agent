@@ -612,7 +612,7 @@ func (m *Manager) mustDarwinProcesses(ctx context.Context) []Process {
 }
 
 func (m *Manager) darwinProcesses(ctx context.Context) ([]Process, error) {
-	out, err := m.run(ctx, "ps", "-axo", "pid=,user=,%cpu=,rss=,lstart=,command=")
+	out, err := m.run(ctx, "ps", "-axo", "pid=,user=,%cpu=,rss=,lstart=,comm=")
 	if err != nil {
 		return nil, fmt.Errorf("process: ps: %w", err)
 	}
