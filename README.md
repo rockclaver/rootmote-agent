@@ -202,10 +202,25 @@ DevDeck connects to.
 macOS support is for running coding sessions, project operations, and the
 read-only Infrastructure views on the MacBook. The Overview tab uses native
 macOS metrics, Services lists `launchd` jobs, Processes uses `ps`, Firewall
-falls back to read-only listening sockets through `lsof`, and Webservers checks
+falls back to read-only listening sockets through `netstat`, and Webservers checks
 common Homebrew Caddy/Nginx/Apache config paths. Linux-only controls such as
 ufw/firewalld rule edits and Linux storage cleanup are reported as unavailable
 or limited on macOS.
+
+### Local macOS development deploy
+
+To test unreleased agent changes on the same MacBook without cutting a GitHub
+release, run:
+
+```sh
+./scripts/deploy-macos-local.sh
+```
+
+The script builds the current working tree for macOS, installs it into the same
+per-user LaunchAgent location as `install-macos.sh`, restarts launchd, and
+probes the WebSocket health and Infrastructure endpoints. Local builds are
+versioned as `dev-<git-sha>` with a `-dirty` suffix when the tree has
+uncommitted changes.
 
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,
