@@ -104,14 +104,28 @@ func defaultPaths() map[Kind][]string {
 			"/etc/caddy/*.caddy",
 			"/etc/caddy/conf.d/*.caddy",
 			"/etc/caddy/claver/*.caddy",
+			"/opt/homebrew/etc/Caddyfile",
+			"/opt/homebrew/etc/caddy/Caddyfile",
+			"/opt/homebrew/etc/caddy/*.caddy",
+			"/opt/homebrew/etc/caddy/conf.d/*.caddy",
+			"/usr/local/etc/Caddyfile",
+			"/usr/local/etc/caddy/Caddyfile",
+			"/usr/local/etc/caddy/*.caddy",
+			"/usr/local/etc/caddy/conf.d/*.caddy",
 		},
 		KindNginx: {
 			"/etc/nginx/sites-enabled/*",
 			"/etc/nginx/conf.d/*.conf",
+			"/opt/homebrew/etc/nginx/servers/*.conf",
+			"/opt/homebrew/etc/nginx/conf.d/*.conf",
+			"/usr/local/etc/nginx/servers/*.conf",
+			"/usr/local/etc/nginx/conf.d/*.conf",
 		},
 		KindApache: {
 			"/etc/apache2/sites-enabled/*",
 			"/etc/httpd/conf.d/*.conf",
+			"/opt/homebrew/etc/httpd/extra/httpd-vhosts.conf",
+			"/usr/local/etc/httpd/extra/httpd-vhosts.conf",
 		},
 	}
 }
@@ -176,9 +190,9 @@ type spec struct {
 }
 
 var specs = []spec{
-	{kind: KindCaddy, units: []string{"caddy.service"}, description: "Caddy"},
-	{kind: KindNginx, units: []string{"nginx.service"}, description: "Nginx"},
-	{kind: KindApache, units: []string{"apache2.service", "httpd.service"}, description: "Apache"},
+	{kind: KindCaddy, units: []string{"caddy.service", "homebrew.mxcl.caddy"}, description: "Caddy"},
+	{kind: KindNginx, units: []string{"nginx.service", "homebrew.mxcl.nginx"}, description: "Nginx"},
+	{kind: KindApache, units: []string{"apache2.service", "httpd.service", "homebrew.mxcl.httpd"}, description: "Apache"},
 }
 
 func (m *Manager) List(ctx context.Context) Snapshot {

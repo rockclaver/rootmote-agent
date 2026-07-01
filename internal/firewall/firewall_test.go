@@ -404,3 +404,20 @@ udp   UNCONN 0      0           0.0.0.0:53          0.0.0.0:*    users:(("dnsmas
 		t.Fatalf("udp socket: %+v", got[2])
 	}
 }
+
+func TestParseLsofDarwinSockets(t *testing.T) {
+	raw := `COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+sshd        421   root    3u  IPv4 0x123456789abcdef0      0t0  TCP *:22 (LISTEN)
+claver-ag   999 claver    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:7676 (LISTEN)
+`
+	got := parseLsof(raw, ProtoTCP)
+	if len(got) != 2 {
+		t.Fatalf("len=%d got=%+v", len(got), got)
+	}
+	if got[0].Process != "sshd" || got[0].PID != 421 || got[0].Port != 22 || got[0].Address != "*" {
+		t.Fatalf("first socket: %+v", got[0])
+	}
+	if got[1].Process != "claver-ag" || got[1].Port != 7676 || got[1].Address != "127.0.0.1" {
+		t.Fatalf("second socket: %+v", got[1])
+	}
+}

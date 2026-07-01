@@ -199,10 +199,13 @@ under `~/Library/Application Support/ClaverAgent/bin`, stores agent data under
 the same user-level Claude, Codex, GitHub CLI, and SSH state as the account
 DevDeck connects to.
 
-macOS support is for running coding sessions and project operations on the
-MacBook. Linux host-management features such as systemd, ufw/firewalld, Caddy
-service control, and Linux storage cleanup are reported as unavailable or are
-limited on macOS.
+macOS support is for running coding sessions, project operations, and the
+read-only Infrastructure views on the MacBook. The Overview tab uses native
+macOS metrics, Services lists `launchd` jobs, Processes uses `ps`, Firewall
+falls back to read-only listening sockets through `lsof`, and Webservers checks
+common Homebrew Caddy/Nginx/Apache config paths. Linux-only controls such as
+ufw/firewalld rule edits and Linux storage cleanup are reported as unavailable
+or limited on macOS.
 
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,

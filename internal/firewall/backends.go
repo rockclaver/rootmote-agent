@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -356,6 +357,110 @@ func parseSSProcess(tok string) (string, int) {
 		pid, _ = strconv.Atoi(rest[k+4 : end])
 	}
 	return name, pid
+}
+
+// LsofSocketReader is the macOS/BSD SocketReader backed by lsof. Darwin does
+// not ship Linux `ss`, but lsof is present on stock macOS and reports owning
+// PIDs for listening sockets.
+type LsofSocketReader struct {
+	Run runner
+}
+
+func NewLsofSocketReader() *LsofSocketReader {
+	return &LsofSocketReader{Run: defaultRunner}
+}
+
+func (l *LsofSocketReader) Listening(ctx context.Context) ([]Socket, error) {
+	run := l.Run
+	if run == nil {
+		run = defaultRunner
+	}
+	tcpOut, tcpErr := run(ctx, "lsof", "-nP", "-iTCP", "-sTCP:LISTEN")
+	udpOut, udpErr := run(ctx, "lsof", "-nP", "-iUDP")
+	if tcpErr != nil && udpErr != nil {
+		return nil, fmt.Errorf("lsof: tcp: %v; udp: %v", tcpErr, udpErr)
+	}
+	var out []Socket
+	if tcpErr == nil {
+		out = append(out, parseLsof(string(tcpOut), ProtoTCP)...)
+	}
+	if udpErr == nil {
+		out = append(out, parseLsof(string(udpOut), ProtoUDP)...)
+	}
+	return dedupeSockets(out), nil
+}
+
+var lsofPortRE = regexp.MustCompile(`:(\d+)(?:\s|\(|$)`)
+
+func parseLsof(raw string, defaultProto Protocol) []Socket {
+	var out []Socket
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "COMMAND ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 9 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil {
+			continue
+		}
+		nameIdx := -1
+		proto := defaultProto
+		for i, f := range fields {
+			switch f {
+			case "TCP":
+				nameIdx = i + 1
+				proto = ProtoTCP
+			case "UDP":
+				nameIdx = i + 1
+				proto = ProtoUDP
+			}
+			if nameIdx >= 0 {
+				break
+			}
+		}
+		if nameIdx < 0 || nameIdx >= len(fields) {
+			continue
+		}
+		name := strings.Join(fields[nameIdx:], " ")
+		m := lsofPortRE.FindStringSubmatch(name)
+		if len(m) < 2 {
+			continue
+		}
+		port, err := strconv.Atoi(m[1])
+		if err != nil || port <= 0 {
+			continue
+		}
+		address := "*"
+		if i := strings.LastIndex(name, ":"+m[1]); i > 0 {
+			address = strings.TrimSpace(name[:i])
+			address = strings.TrimPrefix(address, "TCP ")
+			address = strings.TrimPrefix(address, "UDP ")
+			if address == "" {
+				address = "*"
+			}
+		}
+		out = append(out, Socket{Protocol: proto, Address: address, Port: port, Process: fields[0], PID: pid})
+	}
+	return out
+}
+
+func dedupeSockets(in []Socket) []Socket {
+	seen := map[string]bool{}
+	var out []Socket
+	for _, s := range in {
+		key := fmt.Sprintf("%s/%s/%d/%s/%d", s.Protocol, s.Address, s.Port, s.Process, s.PID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // SSHFromSockets resolves SSH ports by inspecting listening sockets whose

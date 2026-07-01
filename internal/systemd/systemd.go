@@ -124,11 +124,14 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("systemd: Client is required")
 	}
 	protected := map[string]string{
-		"sshd.service":         "SSH daemon is the transport into the agent",
-		"ssh.service":          "SSH daemon is the transport into the agent",
-		"claver-agent.service": "Claver agent supervises itself; refuse self-shutdown",
-		"caddy.service":        "Caddy terminates TLS for preview tunnels",
-		"init.scope":           "pid-1/init must never be stopped",
+		"sshd.service":                "SSH daemon is the transport into the agent",
+		"ssh.service":                 "SSH daemon is the transport into the agent",
+		"com.openssh.sshd":            "SSH daemon is the transport into the agent",
+		"claver-agent.service":        "Claver agent supervises itself; refuse self-shutdown",
+		"com.rockclaver.claver-agent": "Claver agent supervises itself; refuse self-shutdown",
+		"caddy.service":               "Caddy terminates TLS for preview tunnels",
+		"homebrew.mxcl.caddy":         "Caddy terminates TLS for preview tunnels",
+		"init.scope":                  "pid-1/init must never be stopped",
 	}
 	for _, name := range cfg.ExtraProtected {
 		name = strings.TrimSpace(name)

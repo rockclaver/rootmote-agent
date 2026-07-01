@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -192,7 +193,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init storage: %v", err)
 	}
-	systemdMgr, err := systemd.New(systemd.Config{Client: systemd.NewSystemctlClient()})
+	var serviceClient systemd.Client = systemd.NewSystemctlClient()
+	if runtime.GOOS == "darwin" {
+		serviceClient = systemd.NewLaunchctlClient()
+	}
+	systemdMgr, err := systemd.New(systemd.Config{Client: serviceClient})
 	if err != nil {
 		log.Fatalf("claver-agent: init systemd: %v", err)
 	}
@@ -200,11 +205,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init webservers: %v", err)
 	}
-	processMgr, err := agentprocess.New(agentprocess.Config{})
+	processMgr, err := agentprocess.New(agentprocess.Config{Platform: runtime.GOOS})
 	if err != nil {
 		log.Fatalf("claver-agent: init process inspector: %v", err)
 	}
-	socketReader := firewall.NewSSCommandReader()
+	var socketReader firewall.SocketReader = firewall.NewSSCommandReader()
+	if runtime.GOOS == "darwin" {
+		socketReader = firewall.NewLsofSocketReader()
+	}
 	firewallMgr, err := firewall.New(firewall.Config{
 		Backends: []firewall.Backend{firewall.NewUFWBackend(), firewall.NewFirewalldBackend()},
 		Sockets:  socketReader,

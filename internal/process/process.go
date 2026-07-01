@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,6 +81,8 @@ func (osReader) Readlink(name string) (string, error)       { return os.Readlink
 type Config struct {
 	ProcRoot         string
 	Reader           FileReader
+	Platform         string
+	Run              CommandRunner
 	PageSize         uint64
 	ClockTicks       float64
 	NumCPU           int
@@ -92,9 +95,13 @@ type Config struct {
 	KillPollInterval time.Duration
 }
 
+type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
+
 type Manager struct {
 	procRoot         string
 	reader           FileReader
+	platform         string
+	run              CommandRunner
 	pageSize         uint64
 	clockTicks       float64
 	numCPU           int
@@ -108,11 +115,24 @@ type Manager struct {
 }
 
 func New(cfg Config) (*Manager, error) {
+	procRootConfigured := cfg.ProcRoot != ""
 	if cfg.ProcRoot == "" {
 		cfg.ProcRoot = "/proc"
 	}
 	if cfg.Reader == nil {
 		cfg.Reader = osReader{}
+	}
+	if cfg.Platform == "" {
+		if procRootConfigured && cfg.ProcRoot != "/proc" {
+			cfg.Platform = "linux"
+		} else {
+			cfg.Platform = runtime.GOOS
+		}
+	}
+	if cfg.Run == nil {
+		cfg.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return exec.CommandContext(ctx, name, args...).Output()
+		}
 	}
 	if cfg.PageSize == 0 {
 		cfg.PageSize = uint64(os.Getpagesize())
@@ -147,6 +167,8 @@ func New(cfg Config) (*Manager, error) {
 	return &Manager{
 		procRoot:         cfg.ProcRoot,
 		reader:           cfg.Reader,
+		platform:         cfg.Platform,
+		run:              cfg.Run,
 		pageSize:         cfg.PageSize,
 		clockTicks:       cfg.ClockTicks,
 		numCPU:           cfg.NumCPU,
@@ -166,6 +188,9 @@ func (m *Manager) List(ctx context.Context, sortBy string, limit int) ([]Process
 	}
 	if sortBy != SortCPU && sortBy != SortMemory {
 		return nil, fmt.Errorf("process: unsupported sort %q", sortBy)
+	}
+	if m.platform == "darwin" {
+		return m.listDarwin(ctx, sortBy, limit)
 	}
 	if limit <= 0 {
 		limit = 25
@@ -306,6 +331,9 @@ func (m *Manager) protected(ctx context.Context) map[int]string {
 }
 
 func (m *Manager) sshdPIDs() []int {
+	if m.platform == "darwin" {
+		return m.darwinPIDsByCommand("sshd")
+	}
 	entries, err := m.reader.ReadDir(m.procRoot)
 	if err != nil {
 		return nil
@@ -333,6 +361,9 @@ func (m *Manager) sshdPIDs() []int {
 }
 
 func (m *Manager) readProcess(pid int, uptime float64) (Process, error) {
+	if m.platform == "darwin" {
+		return m.readDarwinProcess(pid)
+	}
 	dir := filepath.Join(m.procRoot, strconv.Itoa(pid))
 	stat, err := parseStat(mustString(m.reader.ReadFile(filepath.Join(dir, "stat"))))
 	if err != nil {
@@ -491,6 +522,114 @@ func cpuPercent(st procStat, uptime, clockTicks float64, numCPU int) float64 {
 		return 0
 	}
 	return percent
+}
+
+func (m *Manager) listDarwin(ctx context.Context, sortBy string, limit int) ([]Process, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	out, err := m.darwinProcesses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	protected := m.protected(ctx)
+	for i := range out {
+		if reason, ok := protected[out[i].PID]; ok {
+			out[i].Protected = true
+			out[i].ProtectReason = reason
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if sortBy == SortMemory {
+			if out[i].RSSBytes == out[j].RSSBytes {
+				return out[i].PID < out[j].PID
+			}
+			return out[i].RSSBytes > out[j].RSSBytes
+		}
+		if out[i].CPUPercent == out[j].CPUPercent {
+			return out[i].PID < out[j].PID
+		}
+		return out[i].CPUPercent > out[j].CPUPercent
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *Manager) readDarwinProcess(pid int) (Process, error) {
+	for _, p := range m.mustDarwinProcesses(context.Background()) {
+		if p.PID == pid {
+			return p, nil
+		}
+	}
+	return Process{}, os.ErrNotExist
+}
+
+func (m *Manager) darwinPIDsByCommand(needle string) []int {
+	var pids []int
+	for _, p := range m.mustDarwinProcesses(context.Background()) {
+		fields := strings.Fields(p.Command)
+		base := ""
+		if len(fields) > 0 {
+			base = filepath.Base(fields[0])
+		}
+		if strings.Contains(base, needle) || strings.Contains(p.Command, needle) {
+			pids = append(pids, p.PID)
+		}
+	}
+	return pids
+}
+
+func (m *Manager) mustDarwinProcesses(ctx context.Context) []Process {
+	procs, err := m.darwinProcesses(ctx)
+	if err != nil {
+		return nil
+	}
+	return procs
+}
+
+func (m *Manager) darwinProcesses(ctx context.Context) ([]Process, error) {
+	out, err := m.run(ctx, "ps", "-axo", "pid=,user=,%cpu=,rss=,lstart=,command=")
+	if err != nil {
+		return nil, fmt.Errorf("process: ps: %w", err)
+	}
+	return parseDarwinPS(string(out)), nil
+}
+
+func parseDarwinPS(raw string) []Process {
+	var out []Process
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cpu, _ := strconv.ParseFloat(fields[2], 64)
+		rssKB, _ := strconv.ParseUint(fields[3], 10, 64)
+		start := uint64(0)
+		if ts, err := time.Parse("Mon Jan 2 15:04:05 2006", strings.Join(fields[4:9], " ")); err == nil {
+			start = uint64(ts.Unix())
+		}
+		cmd := strings.Join(fields[9:], " ")
+		out = append(out, Process{
+			PID:            pid,
+			User:           fields[1],
+			Command:        cmd,
+			CPUPercent:     cpu,
+			RSSBytes:       rssKB * 1024,
+			StartTimeTicks: start,
+		})
+	}
+	return out
 }
 
 func parseSignal(name string) (syscall.Signal, error) {

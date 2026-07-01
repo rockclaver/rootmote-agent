@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -224,5 +225,46 @@ func TestProtectedUnits_LookupWithoutSuffix(t *testing.T) {
 func TestNew_RejectsNilClient(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Fatalf("expected error for nil client")
+	}
+}
+
+func TestLaunchctlListMapsDarwinJobs(t *testing.T) {
+	raw := `PID	Status	Label
+123	0	com.apple.WindowServer
+-	0	homebrew.mxcl.nginx
+-	78	com.example.failed
+`
+	got := parseLaunchctlList(raw)
+	if len(got) != 3 {
+		t.Fatalf("len=%d got=%+v", len(got), got)
+	}
+	if got[0].Name != "com.apple.WindowServer" || got[0].ActiveState != "active" || got[0].SubState != "running" {
+		t.Fatalf("running job mapped incorrectly: %+v", got[0])
+	}
+	if got[1].Name != "homebrew.mxcl.nginx" || got[1].ActiveState != "inactive" {
+		t.Fatalf("inactive job mapped incorrectly: %+v", got[1])
+	}
+	if got[2].Name != "com.example.failed" || got[2].ActiveState != "failed" {
+		t.Fatalf("failed job mapped incorrectly: %+v", got[2])
+	}
+}
+
+func TestLaunchctlClientActionsUseGuiDomain(t *testing.T) {
+	var calls []string
+	c := &LaunchctlClient{
+		UID: "501",
+		Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, name+" "+strings.Join(args, " "))
+			return nil, nil
+		},
+	}
+	if err := c.Action(context.Background(), "homebrew.mxcl.nginx", ActionRestart); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := calls[0], "launchctl kickstart -k gui/501/homebrew.mxcl.nginx"; got != want {
+		t.Fatalf("call=%q want=%q", got, want)
+	}
+	if err := c.Action(context.Background(), "homebrew.mxcl.nginx", ActionDisable); err == nil {
+		t.Fatal("disable should be unsupported on macOS")
 	}
 }

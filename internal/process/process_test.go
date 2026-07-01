@@ -325,6 +325,42 @@ func TestSignalFlag_MapsTermAndKillToKillCLIFlags(t *testing.T) {
 	}
 }
 
+func TestDarwinProcessList_UsesPSWhenProcfsIsUnavailable(t *testing.T) {
+	ps := `  10 root      0.0    512 Wed Jul  1 22:49:42 2026 /sbin/launchd
+ 100 claver   12.5  2048 Wed Jul  1 22:50:10 2026 /Applications/Foo.app/Contents/MacOS/Foo --flag
+ 200 claver    1.0  8192 Wed Jul  1 22:51:10 2026 /usr/sbin/sshd -i
+`
+	mgr, err := New(Config{
+		Platform: "darwin",
+		AgentPID: 999,
+		TmuxPanePIDs: func(context.Context) []int {
+			return []int{10}
+		},
+		Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name != "ps" {
+				t.Fatalf("unexpected command %s %v", name, args)
+			}
+			return []byte(ps), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr.List(context.Background(), SortMemory, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len=%d got=%+v", len(got), got)
+	}
+	if got[0].PID != 200 || got[0].RSSBytes != 8192*1024 || !got[0].Protected {
+		t.Fatalf("memory/protection mapping failed: %+v", got[0])
+	}
+	if got[1].Command != "/Applications/Foo.app/Contents/MacOS/Foo --flag" || got[1].CPUPercent != 12.5 || got[1].StartTimeTicks == 0 {
+		t.Fatalf("process fields failed: %+v", got[1])
+	}
+}
+
 func TestSudoKillArgs_FormatsNoPromptSignalAndPID(t *testing.T) {
 	if got, want := sudoKillArgs(1234, syscall.SIGTERM), []string{"-n", "kill", "-TERM", "1234"}; !equalStrings(got, want) {
 		t.Fatalf("sudoKillArgs(SIGTERM) = %v, want %v", got, want)

@@ -183,6 +183,27 @@ func TestMissingConfigPathProducesWarning(t *testing.T) {
 	}
 }
 
+func TestListMatchesHomebrewLaunchdWebserverUnits(t *testing.T) {
+	dir := t.TempDir()
+	caddy := write(t, filepath.Join(dir, "Caddyfile"), `mac.example.com { respond ok }`)
+	mgr, err := New(Config{
+		Systemd: &fakeSystemd{units: []systemd.Unit{
+			{Name: "homebrew.mxcl.caddy", Description: "Caddy", ActiveState: "active", EnabledOnBoot: "loaded"},
+		}},
+		Paths: map[Kind][]string{KindCaddy: {caddy}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mgr.List(context.Background())
+	if len(got.Webservers) != 1 {
+		t.Fatalf("webservers=%+v", got.Webservers)
+	}
+	if got.Webservers[0].ID != "caddy:homebrew.mxcl.caddy" || got.Webservers[0].Domains[0].Host != "mac.example.com" {
+		t.Fatalf("homebrew launchd instance not mapped: %+v", got.Webservers[0])
+	}
+}
+
 func TestValidateReturnsFailureOutputWithoutAction(t *testing.T) {
 	dir := t.TempDir()
 	caddy := write(t, filepath.Join(dir, "Caddyfile"), `example.com { respond ok }`)
