@@ -2,12 +2,12 @@
 
 dist/
 e2e-smoke
-claver-agent
+/claver-agent
 
 # Local-only credentials from the pre-relay direct-FCM setup. The agent no
 # longer reads this path (see internal/push), but keep it ignored so a
 # stray key never gets committed by an over-broad `git add`.
-server/
+/server/
 
 # Skills are materialized from skills-lock.json by the installer.
 .agents/skills/
