@@ -4050,15 +4050,16 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 	switch f.Kind {
 	case "push.register":
 		var in struct {
-			Token    string `json:"token"`
-			Platform string `json:"platform"`
+			Token     string `json:"token"`
+			APNsToken string `json:"apns_token"`
+			Platform  string `json:"platform"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
 			return
 		}
 		err := s.cfg.PushDevices.PutPushDevice(store.PushDevice{
-			Token: in.Token, Platform: in.Platform, LastSeenAt: s.cfg.Now(),
+			Token: in.Token, APNsToken: in.APNsToken, Platform: in.Platform, LastSeenAt: s.cfg.Now(),
 		})
 		if err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())

@@ -187,7 +187,7 @@ func TestPush_RegisterUnregisterListOverWS(t *testing.T) {
 		}
 	}
 
-	if r := send("1", "push.register", `{"token":"fcm-1","platform":"ios"}`); r.Kind == "error" {
+	if r := send("1", "push.register", `{"token":"fcm-1","apns_token":"apns-1","platform":"ios"}`); r.Kind == "error" {
 		t.Fatalf("register failed: %s", r.Payload)
 	}
 	if r := send("2", "push.register", `{"token":"fcm-2","platform":"android"}`); r.Kind == "error" {
@@ -201,6 +201,11 @@ func TestPush_RegisterUnregisterListOverWS(t *testing.T) {
 	_ = json.Unmarshal(r.Payload, &listResp)
 	if len(listResp.Devices) != 2 {
 		t.Fatalf("list returned %d devices: %+v", len(listResp.Devices), listResp.Devices)
+	}
+	for _, d := range listResp.Devices {
+		if d.Token == "fcm-1" && d.APNsToken != "apns-1" {
+			t.Fatalf("apns_token not relayed through push.register: %+v", d)
+		}
 	}
 
 	if r := send("4", "push.unregister", `{"token":"fcm-1"}`); r.Kind == "error" {

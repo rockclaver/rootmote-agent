@@ -181,10 +181,13 @@ type GitHubToken struct {
 // PushDevice is one registered mobile device that can receive FCM-delivered
 // push notifications from this agent. We keep the registry on-host (rather
 // than in a separate cloud service) so the agent has no external dependency
-// for the device list — the FCM service-account JSON is the only off-host
-// credential it needs.
+// for the device list beyond the notify relay it forwards sends through.
+// APNsToken is diagnostic/forward-looking only: FCM v1 sends address the
+// device by FCMToken regardless of platform, so nothing currently sends to
+// APNsToken directly.
 type PushDevice struct {
 	Token        string
+	APNsToken    string
 	Platform     string // "ios" | "android"
 	RegisteredAt time.Time
 	LastSeenAt   time.Time
@@ -520,11 +523,18 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 	// Column additions for stores created before the cost/usage dashboard
 	// (issue #60). CREATE TABLE IF NOT EXISTS leaves an existing sessions
 	// table untouched, so add the new usage columns idempotently.
-	return s.addColumns("sessions",
+	if err := s.addColumns("sessions",
 		columnDef{"cache_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		columnDef{"tool_calls", "INTEGER NOT NULL DEFAULT 0"},
 		columnDef{"transport", "TEXT NOT NULL DEFAULT 'terminal'"},
 		columnDef{"agent_session_id", "TEXT NOT NULL DEFAULT ''"},
+	); err != nil {
+		return err
+	}
+	// Stores created before the direct-APNs-token capture (device registers
+	// now send both FCM and APNs tokens) need the column added idempotently.
+	return s.addColumns("push_devices",
+		columnDef{"apns_token", "TEXT NOT NULL DEFAULT ''"},
 	)
 }
 
@@ -1632,12 +1642,13 @@ func (s *Store) PutPushDevice(d PushDevice) error {
 		reg = now
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO push_devices (token, platform, registered_at, last_seen_at)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO push_devices (token, apns_token, platform, registered_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(token) DO UPDATE SET
+		   apns_token = excluded.apns_token,
 		   platform = excluded.platform,
 		   last_seen_at = excluded.last_seen_at`,
-		d.Token, d.Platform, reg.Unix(), now.Unix(),
+		d.Token, d.APNsToken, d.Platform, reg.Unix(), now.Unix(),
 	)
 	return err
 }
@@ -1652,7 +1663,7 @@ func (s *Store) DeletePushDevice(token string) error {
 
 // ListPushDevices returns every registered device.
 func (s *Store) ListPushDevices() ([]PushDevice, error) {
-	rows, err := s.db.Query(`SELECT token, platform, registered_at, last_seen_at FROM push_devices ORDER BY registered_at`)
+	rows, err := s.db.Query(`SELECT token, apns_token, platform, registered_at, last_seen_at FROM push_devices ORDER BY registered_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1661,7 +1672,7 @@ func (s *Store) ListPushDevices() ([]PushDevice, error) {
 	for rows.Next() {
 		var d PushDevice
 		var reg, seen int64
-		if err := rows.Scan(&d.Token, &d.Platform, &reg, &seen); err != nil {
+		if err := rows.Scan(&d.Token, &d.APNsToken, &d.Platform, &reg, &seen); err != nil {
 			return nil, err
 		}
 		d.RegisteredAt = time.Unix(reg, 0)

@@ -250,3 +250,42 @@ func TestStore_UpdateActionJobMissing(t *testing.T) {
 		t.Fatal("expected ErrNotFound for missing job")
 	}
 }
+
+// AC: registering a device from the app persists both the FCM send token
+// and the diagnostic APNs token, and re-registering the same FCM token
+// updates the APNs token in place rather than creating a duplicate row.
+func TestStore_PushDeviceRoundTripsAPNsToken(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.PutPushDevice(PushDevice{
+		Token: "fcm-1", APNsToken: "apns-1", Platform: "ios",
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	devices, err := s.ListPushDevices()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(devices) != 1 || devices[0].APNsToken != "apns-1" {
+		t.Fatalf("apns_token not persisted: %+v", devices)
+	}
+
+	// Re-registering the same FCM token with a rotated APNs token updates
+	// in place -- no duplicate row, and the stale APNs token is gone.
+	if err := s.PutPushDevice(PushDevice{
+		Token: "fcm-1", APNsToken: "apns-2", Platform: "ios",
+	}); err != nil {
+		t.Fatalf("re-put: %v", err)
+	}
+	devices, err = s.ListPushDevices()
+	if err != nil {
+		t.Fatalf("list after re-put: %v", err)
+	}
+	if len(devices) != 1 || devices[0].APNsToken != "apns-2" {
+		t.Fatalf("apns_token not updated: %+v", devices)
+	}
+}
