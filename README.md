@@ -246,6 +246,8 @@ mv /var/lib/claver/probe /var/lib/rootmote/probe 2>/dev/null || true
 cp -a /var/lib/claver/. /var/lib/rootmote/ # home dotfiles: CLI sign-ins
 rm -rf /var/lib/claver && mkdir /var/lib/claver
 ln -s /var/lib/rootmote/rootmote /var/lib/claver/claver  # state.db keeps absolute paths
+[ -e /var/lib/rootmote/go ] && ln -s /var/lib/rootmote/go /var/lib/claver/go
+[ -e /var/lib/rootmote/probe ] && ln -s /var/lib/rootmote/probe /var/lib/claver/probe
 chown -R rootmote:rootmote /var/lib/rootmote /var/lib/claver
 id -nG claver 2>/dev/null | grep -qw docker && usermod -aG docker rootmote
 systemctl start rootmote-agent
