@@ -184,6 +184,12 @@ if [[ -f "$TMPFILES_DST" ]] && command -v systemd-tmpfiles >/dev/null 2>&1; then
   systemd-tmpfiles --create "$TMPFILES_DST"
 fi
 
+# ProtectSystem=strict + ReadWritePaths in the unit require every listed path
+# to exist when the service starts, or systemd fails with 226/NAMESPACE. The
+# Caddy phase below also creates this dir, but it runs after the first start;
+# create it now (Phase 7 tightens ownership to rootmote:caddy + setgid).
+install -d -o rootmote -g rootmote -m 0750 "$CADDY_FRAGMENTS_DIR"
+
 # --- Legacy cutover ---------------------------------------------------------
 # Old installs ran `claver-agent` on the same loopback port; any process still
 # holding it leaves the new unit crash-looping on bind (the exact "Agent not
