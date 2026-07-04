@@ -154,6 +154,33 @@ if ! launchctl print "$domain" >/dev/null 2>&1; then
   domain="user/$uid"
 fi
 
+# --- Legacy cutover ---------------------------------------------------------
+# Old installs used the claver-agent label; a survivor holding the loopback
+# port would leave the new agent unable to bind. Retire it, then clear any
+# remaining listener on the agent port.
+LEGACY_LABEL="com.rockclaver.claver-agent"
+LEGACY_PLIST="$PLIST_DIR/$LEGACY_LABEL.plist"
+if [[ -f "$LEGACY_PLIST" ]]; then
+  echo "retiring legacy $LEGACY_LABEL LaunchAgent" >&2
+  launchctl bootout "$domain" "$LEGACY_PLIST" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_PLIST"
+fi
+if [[ -d "$HOME/Library/Application Support/ClaverAgent" ]]; then
+  echo "note: legacy agent state in ~/Library/Application Support/ClaverAgent was" >&2
+  echo "      left untouched; see 'Migrating from claver-agent' in the README." >&2
+fi
+agent_port="${ADDR##*:}"
+listeners="$(lsof -nP -tiTCP:"$agent_port" -sTCP:LISTEN 2>/dev/null || true)"
+if [[ -n "$listeners" ]]; then
+  echo "killing processes holding 127.0.0.1:$agent_port: $listeners" >&2
+  kill $listeners 2>/dev/null || true
+  sleep 2
+  still="$(lsof -nP -tiTCP:"$agent_port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -n "$still" ]]; then
+    kill -9 $still 2>/dev/null || true
+  fi
+fi
+
 launchctl bootout "$domain" "$PLIST_DST" >/dev/null 2>&1 || true
 launchctl bootstrap "$domain" "$PLIST_DST"
 launchctl enable "$domain/$LABEL" >/dev/null 2>&1 || true

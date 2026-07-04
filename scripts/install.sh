@@ -10,8 +10,10 @@
 #   1. Ensure a `rootmote` system user exists.
 #   2. Download the agent binary for the host arch.
 #   3. Install the systemd unit.
-#   4. Enable + start the service.
-#   5. Print the installed version to stdout (Phase 1 acceptance criterion).
+#   4. Retire any legacy claver-agent unit and kill whatever still holds the
+#      agent port (7676), so the new service can bind.
+#   5. Enable + start the service.
+#   6. Print the installed version to stdout (Phase 1 acceptance criterion).
 
 set -euo pipefail
 
@@ -180,6 +182,53 @@ else
 fi
 if [[ -f "$TMPFILES_DST" ]] && command -v systemd-tmpfiles >/dev/null 2>&1; then
   systemd-tmpfiles --create "$TMPFILES_DST"
+fi
+
+# --- Legacy cutover ---------------------------------------------------------
+# Old installs ran `claver-agent` on the same loopback port; any process still
+# holding it leaves the new unit crash-looping on bind (the exact "Agent not
+# installed" loop the app shows). Retire the legacy unit for good, then clear
+# any remaining listener on the agent port before starting ours.
+AGENT_PORT="${AGENT_PORT:-7676}"
+if [[ -f /etc/systemd/system/claver-agent.service ]] || \
+   systemctl cat claver-agent.service >/dev/null 2>&1; then
+  echo "retiring legacy claver-agent.service" >&2
+  systemctl disable --now claver-agent.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/claver-agent.service
+fi
+if [[ -d /var/lib/claver && ! -L /var/lib/claver ]]; then
+  echo "note: legacy agent state found at /var/lib/claver (pairing key, projects," >&2
+  echo "      CLI sign-ins). It was left untouched; to carry it over see" >&2
+  echo "      'Migrating from claver-agent' in the rootmote-agent README." >&2
+fi
+
+# Stop our own unit first so only foreign processes can be holding the port.
+systemctl stop rootmote-agent.service >/dev/null 2>&1 || true
+
+list_port_pids() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnpH "sport = :$1" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "$1/tcp" 2>/dev/null | tr -s ' ' '\n'
+  fi
+}
+
+pids="$(list_port_pids "$AGENT_PORT" || true)"
+if [[ -n "$pids" ]]; then
+  for pid in $pids; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null || echo '?')"
+    echo "killing process $pid ($comm) holding 127.0.0.1:$AGENT_PORT" >&2
+    kill "$pid" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    pids="$(list_port_pids "$AGENT_PORT" || true)"
+    [[ -z "$pids" ]] && break
+  done
+  if [[ -n "$pids" ]]; then
+    echo "escalating to SIGKILL for: $pids" >&2
+    for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+  fi
 fi
 
 systemctl daemon-reload

@@ -228,3 +228,25 @@ as `v0.1.0` to publish the `rootmote-agent-linux-amd64`,
 `rootmote-agent-darwin-arm64`, `rootmote-agent.service`,
 `rootmote-agent-firewall.sudoers`, `rootmote-agent-sudo.tmpfiles.conf`, and
 `install-macos.sh` assets consumed by the installers.
+
+## Migrating from claver-agent
+
+The installer retires a legacy `claver-agent` service and frees port 7676
+automatically, but it never touches legacy state. If a server has history
+worth keeping (pairing key, projects, session/audit history, Claude/Codex/gh
+sign-ins), migrate it manually — only if you have NOT already paired the new
+agent on that server (this replaces fresh rootmote state):
+
+```sh
+systemctl stop rootmote-agent
+rm -rf /var/lib/rootmote/rootmote          # fresh, unpaired state only!
+mv /var/lib/claver/claver /var/lib/rootmote/rootmote
+mv /var/lib/claver/go /var/lib/rootmote/go 2>/dev/null || true
+mv /var/lib/claver/probe /var/lib/rootmote/probe 2>/dev/null || true
+cp -a /var/lib/claver/. /var/lib/rootmote/ # home dotfiles: CLI sign-ins
+rm -rf /var/lib/claver && mkdir /var/lib/claver
+ln -s /var/lib/rootmote/rootmote /var/lib/claver/claver  # state.db keeps absolute paths
+chown -R rootmote:rootmote /var/lib/rootmote /var/lib/claver
+id -nG claver 2>/dev/null | grep -qw docker && usermod -aG docker rootmote
+systemctl start rootmote-agent
+```
