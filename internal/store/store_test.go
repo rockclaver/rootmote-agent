@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-// AC: "Project list survives `systemctl restart claver-agent` with no data loss."
+// AC: "Project list survives `systemctl restart rootmote-agent` with no data loss."
 // We simulate a restart by closing and reopening the database file.
 func TestStore_ProjectsSurviveReopen(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "claver.db")
+	dbPath := filepath.Join(dir, "rootmote.db")
 
 	s, err := Open(dbPath)
 	if err != nil {
@@ -177,7 +177,7 @@ func TestStore_ActiveSessionsSurviveReopen(t *testing.T) {
 // ledger CRUD and confirm it survives a close/reopen.
 func TestStore_ActionJobsSurviveReopen(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "claver.db")
+	dbPath := filepath.Join(dir, "rootmote.db")
 
 	s, err := Open(dbPath)
 	if err != nil {

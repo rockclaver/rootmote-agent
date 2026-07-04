@@ -350,7 +350,7 @@ func TestParseUFWRules(t *testing.T) {
 }
 
 // Review comment #3329218455: in the packaged install the agent runs as
-// `claver`, so ufw / firewall-cmd must be invoked through a privileged
+// `rootmote`, so ufw / firewall-cmd must be invoked through a privileged
 // path. When Sudo=true the backends must prepend `sudo -n`.
 func TestBackends_SudoWraps_RealCommand(t *testing.T) {
 	var calls []string
@@ -390,7 +390,7 @@ func TestBackends_SudoWraps_RealCommand(t *testing.T) {
 
 func TestParseSS(t *testing.T) {
 	raw := `tcp   LISTEN 0      128         0.0.0.0:22          0.0.0.0:*    users:(("sshd",pid=421,fd=3))
-tcp   LISTEN 0      128         127.0.0.1:7676      0.0.0.0:*    users:(("claver-agent",pid=999,fd=7))
+tcp   LISTEN 0      128         127.0.0.1:7676      0.0.0.0:*    users:(("rootmote-agent",pid=999,fd=7))
 udp   UNCONN 0      0           0.0.0.0:53          0.0.0.0:*    users:(("dnsmasq",pid=300,fd=4))
 `
 	got := parseSS(raw)
@@ -408,7 +408,7 @@ udp   UNCONN 0      0           0.0.0.0:53          0.0.0.0:*    users:(("dnsmas
 func TestParseLsofDarwinSockets(t *testing.T) {
 	raw := `COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 sshd        421   root    3u  IPv4 0x123456789abcdef0      0t0  TCP *:22 (LISTEN)
-claver-ag   999 claver    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:7676 (LISTEN)
+rootmote-ag   999 rootmote    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:7676 (LISTEN)
 `
 	got := parseLsof(raw, ProtoTCP)
 	if len(got) != 2 {
@@ -417,7 +417,7 @@ claver-ag   999 claver    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:76
 	if got[0].Process != "sshd" || got[0].PID != 421 || got[0].Port != 22 || got[0].Address != "*" {
 		t.Fatalf("first socket: %+v", got[0])
 	}
-	if got[1].Process != "claver-ag" || got[1].Port != 7676 || got[1].Address != "127.0.0.1" {
+	if got[1].Process != "rootmote-ag" || got[1].Port != 7676 || got[1].Address != "127.0.0.1" {
 		t.Fatalf("second socket: %+v", got[1])
 	}
 }
@@ -425,7 +425,7 @@ claver-ag   999 claver    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:76
 func TestParseNetstatDarwinSockets(t *testing.T) {
 	raw := `Active Internet connections (including servers)
 Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options
-tcp4       0      0  127.0.0.1.7676         *.*                    LISTEN                 0            0  131072  131072     claver-agent:99680  00100 00000006
+tcp4       0      0  127.0.0.1.7676         *.*                    LISTEN                 0            0  131072  131072     rootmote-agent:99680  00100 00000006
 tcp4       0      0  *.22                   *.*                    LISTEN                 0            0  131072  131072          launchd:1      00180 00000006
 tcp4       0      0  127.0.0.1.64795        1.1.1.1.443            ESTABLISHED            0          171  132104  132104          Safari:100     00102 00000008
 `
@@ -433,7 +433,7 @@ tcp4       0      0  127.0.0.1.64795        1.1.1.1.443            ESTABLISHED  
 	if len(got) != 2 {
 		t.Fatalf("len=%d got=%+v", len(got), got)
 	}
-	if got[0].Process != "claver-agent" || got[0].PID != 99680 || got[0].Address != "127.0.0.1" || got[0].Port != 7676 {
+	if got[0].Process != "rootmote-agent" || got[0].PID != 99680 || got[0].Address != "127.0.0.1" || got[0].Port != 7676 {
 		t.Fatalf("first socket: %+v", got[0])
 	}
 	if got[1].Process != "launchd" || got[1].PID != 1 || got[1].Address != "*" || got[1].Port != 22 {

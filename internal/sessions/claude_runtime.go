@@ -17,7 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // claude_runtime.go drives the `claude` CLI over its stream-json stdio protocol
@@ -523,7 +523,7 @@ func (r *ClaudeStructuredRuntime) processEnv() []string {
 }
 
 // resolveAgentBinary finds the agent CLI, preferring extraPath (the agent's
-// managed bin dir, e.g. /var/lib/claver/bin) over the ambient PATH. This is
+// managed bin dir, e.g. /var/lib/rootmote/bin) over the ambient PATH. This is
 // required because exec resolves a bare command name against the parent PATH,
 // ignoring cmd.Env, so without it the system-wide CLI would shadow the
 // provisioned one.

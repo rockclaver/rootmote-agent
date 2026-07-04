@@ -12,7 +12,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // translated is one normalized event a runtime will publish. Ephemeral events

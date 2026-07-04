@@ -118,7 +118,7 @@ type Config struct {
 	// Client probes the Docker daemon. Required.
 	Client Client
 	// ProjectRoot is the agent workspace root. When set, container mounts under
-	// this directory are mapped back to a Claver project id on a best-effort
+	// this directory are mapped back to a Rootmote project id on a best-effort
 	// basis.
 	ProjectRoot string
 }
@@ -592,7 +592,7 @@ func composeService(labels map[string]string) string {
 }
 
 func projectID(labels map[string]string, root string, mounts []MountSummary) string {
-	for _, key := range []string{"claver.project_id", "com.claver.project_id"} {
+	for _, key := range []string{"rootmote.project_id", "com.rootmote.project_id"} {
 		if labels != nil && labels[key] != "" {
 			return labels[key]
 		}
@@ -1426,8 +1426,8 @@ func composeLabels(labels map[string]string) map[string]string {
 		"com.docker.compose.project",
 		"com.docker.compose.service",
 		"com.docker.compose.oneoff",
-		"claver.project_id",
-		"com.claver.project_id",
+		"rootmote.project_id",
+		"com.rootmote.project_id",
 	} {
 		if labels != nil && labels[k] != "" {
 			keep[k] = labels[k]

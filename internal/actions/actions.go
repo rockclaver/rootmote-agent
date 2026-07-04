@@ -30,8 +30,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Worker identifies which AI CLI should plan/execute a job. "auto" defers the

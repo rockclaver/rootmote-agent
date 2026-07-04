@@ -5,14 +5,14 @@
 #
 # Usage:
 #   scripts/deploy-macos-local.sh
-#   scripts/deploy-macos-local.sh --addr 127.0.0.1:7677 --data-dir /tmp/claver-agent-dev
+#   scripts/deploy-macos-local.sh --addr 127.0.0.1:7677 --data-dir /tmp/rootmote-agent-dev
 #   scripts/deploy-macos-local.sh --skip-probe
 
 set -euo pipefail
 
-LABEL="${LABEL:-com.rockclaver.claver-agent}"
+LABEL="${LABEL:-com.rockclaver.rootmote-agent}"
 ADDR="${ADDR:-127.0.0.1:7676}"
-DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/ClaverAgent}"
+DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/RootmoteAgent}"
 SKIP_PROBE=0
 
 while [[ $# -gt 0 ]]; do
@@ -42,9 +42,9 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$DATA_DIR/bin"
-BIN_DST="$BIN_DIR/claver-agent"
+BIN_DST="$BIN_DIR/rootmote-agent"
 FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
-LOG_DIR="$HOME/Library/Logs/ClaverAgent"
+LOG_DIR="$HOME/Library/Logs/RootmoteAgent"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_DST="$PLIST_DIR/$LABEL.plist"
 
@@ -66,12 +66,12 @@ if [[ -n "$(cd "$ROOT" && git status --porcelain 2>/dev/null)" ]]; then
 fi
 version="dev-${short_sha}${dirty}"
 (cd "$ROOT" && GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build \
-  -ldflags "-X github.com/rockclaver/claver-agent/internal/version.Version=${version}" \
-  -o "$tmp/claver-agent" ./cmd/claver-agent)
+  -ldflags "-X github.com/rockclaver/rootmote-agent/internal/version.Version=${version}" \
+  -o "$tmp/rootmote-agent" ./cmd/rootmote-agent)
 
 echo "[deploy] installing binary to $BIN_DST"
 install -d -m 0700 "$DATA_DIR" "$BIN_DIR" "$FRAGMENTS_DIR" "$LOG_DIR" "$PLIST_DIR"
-install -m 0755 "$tmp/claver-agent" "$BIN_DST"
+install -m 0755 "$tmp/rootmote-agent" "$BIN_DST"
 
 xml_escape() {
   local value="$1"

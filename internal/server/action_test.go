@@ -8,8 +8,8 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver-agent/internal/actions"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/actions"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // readFrame reads frames until it sees one matching id.

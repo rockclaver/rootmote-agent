@@ -12,7 +12,7 @@ import (
 	"os/exec"
 	"sync"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // codex_exec.go is the fallback structured runtime for environments where

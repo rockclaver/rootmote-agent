@@ -1,4 +1,4 @@
-// Package server implements the claver-agent control-plane WebSocket server.
+// Package server implements the rootmote-agent control-plane WebSocket server.
 //
 // The server binds only to a loopback address. A startup self-check refuses
 // non-loopback bind addresses outright — the only legitimate transport into
@@ -19,30 +19,30 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver-agent/internal/actions"
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
-	"github.com/rockclaver/claver-agent/internal/alerts"
-	"github.com/rockclaver/claver-agent/internal/cliauth"
-	"github.com/rockclaver/claver-agent/internal/docker"
-	"github.com/rockclaver/claver-agent/internal/firewall"
-	gh "github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/infra"
-	"github.com/rockclaver/claver-agent/internal/inventory"
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	agentprocess "github.com/rockclaver/claver-agent/internal/process"
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/push"
-	"github.com/rockclaver/claver-agent/internal/review"
-	"github.com/rockclaver/claver-agent/internal/runbook"
-	"github.com/rockclaver/claver-agent/internal/security"
-	"github.com/rockclaver/claver-agent/internal/sessions"
-	"github.com/rockclaver/claver-agent/internal/skills"
-	"github.com/rockclaver/claver-agent/internal/storage"
-	"github.com/rockclaver/claver-agent/internal/store"
-	"github.com/rockclaver/claver-agent/internal/systemd"
-	"github.com/rockclaver/claver-agent/internal/tooling"
-	"github.com/rockclaver/claver-agent/internal/version"
-	"github.com/rockclaver/claver-agent/internal/webserver"
+	"github.com/rockclaver/rootmote-agent/internal/actions"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/alerts"
+	"github.com/rockclaver/rootmote-agent/internal/cliauth"
+	"github.com/rockclaver/rootmote-agent/internal/docker"
+	"github.com/rockclaver/rootmote-agent/internal/firewall"
+	gh "github.com/rockclaver/rootmote-agent/internal/github"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
+	"github.com/rockclaver/rootmote-agent/internal/inventory"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/push"
+	"github.com/rockclaver/rootmote-agent/internal/review"
+	"github.com/rockclaver/rootmote-agent/internal/runbook"
+	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/sessions"
+	"github.com/rockclaver/rootmote-agent/internal/skills"
+	"github.com/rockclaver/rootmote-agent/internal/storage"
+	"github.com/rockclaver/rootmote-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/tooling"
+	"github.com/rockclaver/rootmote-agent/internal/version"
+	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
 
 // Frame is the JSON envelope used on the wire.
@@ -3836,7 +3836,7 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 			Token     string `json:"token"`
 			APNsToken string `json:"apns_token"`
 			Platform  string `json:"platform"`
-			// ServerID is DevDeck's own client-side identifier for the
+			// ServerID is Rootmote's own client-side identifier for the
 			// server this device is registering against (minted when the
 			// user added the server; the agent has no other way to learn
 			// it). Persisted per-device so push.Hub can stamp the right

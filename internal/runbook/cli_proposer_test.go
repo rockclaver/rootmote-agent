@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 )
 
 func TestCLIProposer_ParsesClaudeEnvelope(t *testing.T) {

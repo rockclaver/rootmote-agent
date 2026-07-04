@@ -12,8 +12,8 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver-agent/internal/security"
-	"github.com/rockclaver/claver-agent/internal/tooling"
+	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/tooling"
 )
 
 func TestSecurityAIFix_ReturnsToolMissingWhenCLIIsNotInstalled(t *testing.T) {

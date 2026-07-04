@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/firewall"
-	agentprocess "github.com/rockclaver/claver-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/firewall"
+	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 )
 
 type Severity string
@@ -239,7 +239,7 @@ func (m *Manager) Fix(ctx context.Context, req FixRequest) (FixResult, error) {
 		if err != nil {
 			return FixResult{}, err
 		}
-		rule := firewall.Rule{Action: firewall.ActionDeny, Protocol: proto, Port: req.Port, Comment: "Claver security audit"}
+		rule := firewall.Rule{Action: firewall.ActionDeny, Protocol: proto, Port: req.Port, Comment: "Rootmote security audit"}
 		if st.Backend == firewall.BackendFirewalld {
 			rule.Action = firewall.ActionAllow
 			err = m.cfg.Firewall.RuleRemove(ctx, rule)

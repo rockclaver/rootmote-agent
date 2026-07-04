@@ -2,7 +2,7 @@
 
 dist/
 e2e-smoke
-/claver-agent
+/rootmote-agent
 
 # Local-only credentials from the pre-relay direct-FCM setup. The agent no
 # longer reads this path (see internal/push), but keep it ignored so a

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
-	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
 )
 
 // stubProposer returns a canned Proposal and counts invocations so throttle

@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Errors returned by the review module. Callers translate them to wire-level

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // newTestManager wires a Manager over a real in-memory store with an inline

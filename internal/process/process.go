@@ -317,7 +317,7 @@ func (m *Manager) IsProtected(ctx context.Context, pid int) (string, bool) {
 func (m *Manager) protected(ctx context.Context) map[int]string {
 	out := map[int]string{
 		1:          "pid 1/init must never be signalled",
-		m.agentPID: "Claver agent supervises this request",
+		m.agentPID: "Rootmote agent supervises this request",
 	}
 	for _, pid := range m.sshdPIDs() {
 		out[pid] = "SSH daemon is the transport into the agent"
@@ -560,7 +560,7 @@ func (m *Manager) listDarwin(ctx context.Context, sortBy string, limit int) ([]P
 func (m *Manager) protectedDarwin(ctx context.Context, procs []Process) map[int]string {
 	out := map[int]string{
 		1:          "pid 1/init must never be signalled",
-		m.agentPID: "Claver agent supervises this request",
+		m.agentPID: "Rootmote agent supervises this request",
 	}
 	for _, p := range procs {
 		if processCommandContains(p, "sshd") {
@@ -674,12 +674,12 @@ func parseSignal(name string) (syscall.Signal, error) {
 }
 
 // defaultSignal is the production Config.Signal. The agent runs as the
-// unprivileged `claver` system user (see claver-agent.service), so a bare
+// unprivileged `rootmote` system user (see rootmote-agent.service), so a bare
 // syscall.Kill only reaches processes owned by that same user — every
 // process owned by root or another service account fails with EPERM
 // ("operation not permitted"), which is exactly the case that matters for a
 // security-audit "terminate process" fix, since the flagged process is
-// almost always owned by root or a service account, not `claver`. Try the
+// almost always owned by root or a service account, not `rootmote`. Try the
 // direct signal first (works for same-user processes and when the agent
 // runs as root, with no sudo dependency at all) and escalate through the
 // same `sudo -n` + sudoers.d pattern the firewall backends use only on

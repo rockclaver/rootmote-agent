@@ -8,7 +8,7 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver-agent/internal/inventory"
+	"github.com/rockclaver/rootmote-agent/internal/inventory"
 )
 
 func TestInventoryCapabilitiesOverWS(t *testing.T) {

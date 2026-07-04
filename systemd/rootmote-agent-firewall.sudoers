@@ -1,0 +1,55 @@
+# Installed by rootmote-agent installer at /etc/sudoers.d/rootmote-agent-firewall.
+#
+# The agent runs as the unprivileged `rootmote` user. Firewall management
+# (ufw / firewall-cmd), host webserver config validation, host reboot,
+# terminating a suspicious process found by the security audit (which is
+# usually owned by root or another service account, not `rootmote`), enabling
+# auditd as a narrow security-hardening remediation,
+# storage cleanup's file/journal deletion (issue: "reclaim storage" finds a
+# large file anywhere on disk but rootmote-agent.service's ProtectSystem=strict
+# mounts everything outside ReadWritePaths=/var/lib/rootmote /etc/caddy/rootmote
+# read-only), and running an AI-proposed remediation script for a security
+# finding with no narrow typed fix (e.g. correcting ownership/permissions on
+# /etc/shadow) require root, so we grant passwordless NOPASSWD access to just
+# those commands. All mutations still go through the agent's biometric +
+# confirmation-token + anti-lockout pipeline before any sudo call is made.
+#
+# The `sh -c *` grant below is the broadest one in this file — it lets
+# `rootmote` run an arbitrary command as root, not just a fixed verb. That is
+# unavoidable: the whole point is letting the AI author a fix for findings no
+# fixed command can model. The safety boundary is NOT this sudoers rule; it
+# is upstream, in rootmote-agent itself: the exact script text (not a label or
+# a hash) is baked into the confirmation token's action hash before mint, so
+# a token can only ever be replayed against the identical script the operator
+# biometrically approved (see securityFixTokenBinding / tokenBindingForKind
+# and MaxScriptBytes in internal/security), and runbook.materialise forces
+# Risk=high whenever such a step is proposed so the mobile client always
+# requires a fresh per-step biometric rather than a batch "approve all".
+#
+# The storage rules route through `nsenter --mount=/proc/1/ns/mnt` because a
+# plain sudo-escalated child inherits the calling process's mount namespace —
+# it would still see ProtectSystem=strict's read-only bind mounts even as
+# root. Joining PID 1's real, unsandboxed mount namespace first is what
+# actually reaches the rest of the host filesystem.
+#
+# Visudo syntax: use `Defaults!cmnd setenv` would re-enable env leakage;
+# keep the default env_reset.
+rootmote ALL=(root) NOPASSWD: /usr/sbin/ufw, /sbin/ufw, /usr/bin/firewall-cmd, /bin/firewall-cmd
+rootmote ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /bin/systemctl reboot
+rootmote ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /sbin/nginx -t
+rootmote ALL=(root) NOPASSWD: /usr/sbin/apache2ctl configtest, /usr/bin/apache2ctl configtest, /usr/sbin/apachectl configtest, /usr/bin/apachectl configtest
+rootmote ALL=(root) NOPASSWD: /usr/sbin/httpd -t, /usr/bin/httpd -t, /sbin/httpd -t
+rootmote ALL=(root) NOPASSWD: /usr/bin/caddy validate, /usr/bin/caddy validate --config *, /usr/local/bin/caddy validate, /usr/local/bin/caddy validate --config *
+rootmote ALL=(root) NOPASSWD: /bin/kill -TERM *, /bin/kill -KILL *, /usr/bin/kill -TERM *, /usr/bin/kill -KILL *
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/apt-get install -y auditd, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/apt-get install -y auditd
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/dnf install -y audit, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/dnf install -y audit
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/yum install -y audit, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/yum install -y audit
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /sbin/apk add audit, /bin/nsenter --mount=/proc/1/ns/mnt -- /sbin/apk add audit
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/systemctl enable --now auditd, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/systemctl enable --now auditd
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /bin/sh -c *, /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/sh -c *
+rootmote ALL=(root) NOPASSWD: /bin/nsenter --mount=/proc/1/ns/mnt -- /bin/sh -c *, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/sh -c *
+
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/rm -f *, /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/rm -rf *, /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /bin/rm -f *, /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /bin/rm -rf *
+rootmote ALL=(root) NOPASSWD: /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/rm -f *, /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/rm -rf *, /bin/nsenter --mount=/proc/1/ns/mnt -- /bin/rm -f *, /bin/nsenter --mount=/proc/1/ns/mnt -- /bin/rm -rf *
+rootmote ALL=(root) NOPASSWD: /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/journalctl --vacuum-size=*, /usr/bin/nsenter --mount=/proc/1/ns/mnt -- /bin/journalctl --vacuum-size=*
+rootmote ALL=(root) NOPASSWD: /bin/nsenter --mount=/proc/1/ns/mnt -- /usr/bin/journalctl --vacuum-size=*, /bin/nsenter --mount=/proc/1/ns/mnt -- /bin/journalctl --vacuum-size=*

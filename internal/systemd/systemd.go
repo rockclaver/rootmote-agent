@@ -5,7 +5,7 @@
 // Every mutating action must go through the existing auth.confirm flow on the
 // server side; this package owns the *protected-unit* blocklist that refuses
 // stop/disable on units the agent must never shoot in the foot
-// (sshd/claver-agent/caddy/init), returning a typed error before any client
+// (sshd/rootmote-agent/caddy/init), returning a typed error before any client
 // call is made.
 package systemd
 
@@ -127,8 +127,8 @@ func New(cfg Config) (*Manager, error) {
 		"sshd.service":                "SSH daemon is the transport into the agent",
 		"ssh.service":                 "SSH daemon is the transport into the agent",
 		"com.openssh.sshd":            "SSH daemon is the transport into the agent",
-		"claver-agent.service":        "Claver agent supervises itself; refuse self-shutdown",
-		"com.rockclaver.claver-agent": "Claver agent supervises itself; refuse self-shutdown",
+		"rootmote-agent.service":        "Rootmote agent supervises itself; refuse self-shutdown",
+		"com.rockclaver.rootmote-agent": "Rootmote agent supervises itself; refuse self-shutdown",
 		"caddy.service":               "Caddy terminates TLS for preview tunnels",
 		"homebrew.mxcl.caddy":         "Caddy terminates TLS for preview tunnels",
 		"init.scope":                  "pid-1/init must never be stopped",

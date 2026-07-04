@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 type fakeRuntime struct {
@@ -672,7 +672,7 @@ func TestAgentCommandArgs_MapRunModesToCliFlags(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := agentCommandArgs(tc.agent, tc.mode, "/var/lib/claver")
+			got := agentCommandArgs(tc.agent, tc.mode, "/var/lib/rootmote")
 			if !contains(got, tc.wantArg) {
 				t.Fatalf("args = %#v want %q", got, tc.wantArg)
 			}
@@ -681,7 +681,7 @@ func TestAgentCommandArgs_MapRunModesToCliFlags(t *testing.T) {
 }
 
 func TestAgentCommandArgs_AddPersistentSkillDirs(t *testing.T) {
-	home := "/var/lib/claver"
+	home := "/var/lib/rootmote"
 	codexArgs := agentCommandArgs("codex", "manual", home)
 	if !contains(codexArgs, "--add-dir") || !contains(codexArgs, filepath.Join(home, ".codex", "skills")) {
 		t.Fatalf("codex args missing persistent skills dir: %#v", codexArgs)
@@ -693,20 +693,20 @@ func TestAgentCommandArgs_AddPersistentSkillDirs(t *testing.T) {
 }
 
 func TestTmuxRuntimeEnvUsesConfiguredHome(t *testing.T) {
-	rt := TmuxRuntime{ExtraPath: "/opt/claver/bin", HomeDir: "/var/lib/claver"}
+	rt := TmuxRuntime{ExtraPath: "/opt/rootmote/bin", HomeDir: "/var/lib/rootmote"}
 	env := rt.envWithPath()
-	if !contains(env, "HOME=/var/lib/claver") {
+	if !contains(env, "HOME=/var/lib/rootmote") {
 		t.Fatalf("env missing configured HOME: %#v", env)
 	}
-	if !contains(env, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
+	if !contains(env, "CLAUDE_CONFIG_DIR=/var/lib/rootmote/.claude") {
 		t.Fatalf("env missing configured CLAUDE_CONFIG_DIR: %#v", env)
 	}
-	if !contains(env, "CODEX_HOME=/var/lib/claver/.codex") {
+	if !contains(env, "CODEX_HOME=/var/lib/rootmote/.codex") {
 		t.Fatalf("env missing configured CODEX_HOME: %#v", env)
 	}
 	foundPath := false
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "PATH=/opt/claver/bin:") || kv == "PATH=/opt/claver/bin" {
+		if strings.HasPrefix(kv, "PATH=/opt/rootmote/bin:") || kv == "PATH=/opt/rootmote/bin" {
 			foundPath = true
 			break
 		}
@@ -715,16 +715,16 @@ func TestTmuxRuntimeEnvUsesConfiguredHome(t *testing.T) {
 		t.Fatalf("env missing configured PATH prefix: %#v", env)
 	}
 	flags := strings.Join(rt.tmuxEnvFlags(), "\n")
-	if !strings.Contains(flags, "HOME=/var/lib/claver") {
+	if !strings.Contains(flags, "HOME=/var/lib/rootmote") {
 		t.Fatalf("tmux flags missing HOME: %q", flags)
 	}
-	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
+	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR=/var/lib/rootmote/.claude") {
 		t.Fatalf("tmux flags missing CLAUDE_CONFIG_DIR: %q", flags)
 	}
-	if !strings.Contains(flags, "CODEX_HOME=/var/lib/claver/.codex") {
+	if !strings.Contains(flags, "CODEX_HOME=/var/lib/rootmote/.codex") {
 		t.Fatalf("tmux flags missing CODEX_HOME: %q", flags)
 	}
-	if !strings.Contains(flags, "PATH=/opt/claver/bin") {
+	if !strings.Contains(flags, "PATH=/opt/rootmote/bin") {
 		t.Fatalf("tmux flags missing PATH prefix: %q", flags)
 	}
 }
@@ -750,7 +750,7 @@ func TestTmuxRuntimeEnvStripsAmbientAnthropicCredentials(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bad")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "bad")
 	t.Setenv("CODEX_HOME", "/tmp/wrong-codex-home")
-	rt := TmuxRuntime{ExtraPath: "/opt/claver/bin", HomeDir: "/var/lib/claver"}
+	rt := TmuxRuntime{ExtraPath: "/opt/rootmote/bin", HomeDir: "/var/lib/rootmote"}
 	env := strings.Join(rt.envWithPath(), "\n")
 	for _, forbidden := range []string{
 		"ANTHROPIC_API_KEY=bad",

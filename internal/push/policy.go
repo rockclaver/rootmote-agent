@@ -1,6 +1,6 @@
 package push
 
-import "github.com/rockclaver/claver-agent/internal/notifications"
+import "github.com/rockclaver/rootmote-agent/internal/notifications"
 
 // Kind is the pref key used to classify a notification for push routing.
 // Usually equal to notifications.Notification.Type, except infra.alert,

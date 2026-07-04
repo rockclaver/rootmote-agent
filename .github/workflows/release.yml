@@ -32,35 +32,35 @@ jobs:
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
               -trimpath \
-              -ldflags "-s -w -X github.com/rockclaver/claver-agent/internal/version.Version=${version}" \
-              -o "dist/claver-agent-linux-${arch}" \
-              ./cmd/claver-agent
+              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${version}" \
+              -o "dist/rootmote-agent-linux-${arch}" \
+              ./cmd/rootmote-agent
           done
 
           for arch in amd64 arm64; do
             GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build \
               -trimpath \
-              -ldflags "-s -w -X github.com/rockclaver/claver-agent/internal/version.Version=${version}" \
-              -o "dist/claver-agent-darwin-${arch}" \
-              ./cmd/claver-agent
+              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${version}" \
+              -o "dist/rootmote-agent-darwin-${arch}" \
+              ./cmd/rootmote-agent
           done
 
-          cp systemd/claver-agent.service dist/claver-agent.service
-          cp systemd/claver-agent-firewall.sudoers dist/claver-agent-firewall.sudoers
-          cp systemd/claver-agent-sudo.tmpfiles.conf dist/claver-agent-sudo.tmpfiles.conf
+          cp systemd/rootmote-agent.service dist/rootmote-agent.service
+          cp systemd/rootmote-agent-firewall.sudoers dist/rootmote-agent-firewall.sudoers
+          cp systemd/rootmote-agent-sudo.tmpfiles.conf dist/rootmote-agent-sudo.tmpfiles.conf
           cp scripts/install-macos.sh dist/install-macos.sh
-          (cd dist && sha256sum claver-agent-* install-macos.sh > SHA256SUMS)
+          (cd dist && sha256sum rootmote-agent-* install-macos.sh > SHA256SUMS)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/claver-agent-linux-amd64
-            dist/claver-agent-linux-arm64
-            dist/claver-agent-darwin-amd64
-            dist/claver-agent-darwin-arm64
-            dist/claver-agent.service
-            dist/claver-agent-firewall.sudoers
-            dist/claver-agent-sudo.tmpfiles.conf
+            dist/rootmote-agent-linux-amd64
+            dist/rootmote-agent-linux-arm64
+            dist/rootmote-agent-darwin-amd64
+            dist/rootmote-agent-darwin-arm64
+            dist/rootmote-agent.service
+            dist/rootmote-agent-firewall.sudoers
+            dist/rootmote-agent-sudo.tmpfiles.conf
             dist/install-macos.sh
             dist/SHA256SUMS

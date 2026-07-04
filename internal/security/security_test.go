@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/firewall"
-	agentprocess "github.com/rockclaver/claver-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/firewall"
+	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 )
 
 type fakeFirewall struct {
@@ -131,7 +131,7 @@ func TestAudit_ClearsPublicPortFindingOnceFirewallBlocksIt(t *testing.T) {
 			Action:   firewall.ActionDeny,
 			Protocol: firewall.ProtoTCP,
 			Port:     6379,
-			Comment:  "Claver security audit",
+			Comment:  "Rootmote security audit",
 		}},
 		SSHPorts: []int{22},
 	}}

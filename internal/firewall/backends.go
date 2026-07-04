@@ -32,7 +32,7 @@ type UFWBackend struct {
 
 // NewUFWBackend returns a ufw Backend using exec.CommandContext. Sudo is
 // auto-enabled when the agent is not running as root, matching the
-// packaged install where the agent runs as `claver`.
+// packaged install where the agent runs as `rootmote`.
 func NewUFWBackend() *UFWBackend {
 	return &UFWBackend{Run: defaultRunner, LookBin: exec.LookPath, Sudo: needsSudo()}
 }
@@ -265,7 +265,7 @@ func (f *FirewalldBackend) Remove(ctx context.Context, r Rule) error {
 }
 
 // needsSudo returns true when the current process is not running as
-// root. The packaged install runs the agent as `claver`, and ufw /
+// root. The packaged install runs the agent as `rootmote`, and ufw /
 // firewall-cmd require root, so we wrap with `sudo -n` via a
 // /etc/sudoers.d fragment shipped by the installer.
 func needsSudo() bool {

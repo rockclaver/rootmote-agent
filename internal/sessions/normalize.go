@@ -12,7 +12,7 @@ package sessions
 import (
 	"encoding/json"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Normalized SessionEvent.Type values for structured sessions.

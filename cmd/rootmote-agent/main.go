@@ -14,36 +14,36 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/actions"
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
-	"github.com/rockclaver/claver-agent/internal/alerts"
-	"github.com/rockclaver/claver-agent/internal/cliauth"
-	"github.com/rockclaver/claver-agent/internal/docker"
-	"github.com/rockclaver/claver-agent/internal/firewall"
-	gh "github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/infra"
-	"github.com/rockclaver/claver-agent/internal/inventory"
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	agentprocess "github.com/rockclaver/claver-agent/internal/process"
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/push"
-	"github.com/rockclaver/claver-agent/internal/review"
-	"github.com/rockclaver/claver-agent/internal/runbook"
-	"github.com/rockclaver/claver-agent/internal/security"
-	"github.com/rockclaver/claver-agent/internal/server"
-	"github.com/rockclaver/claver-agent/internal/sessions"
-	"github.com/rockclaver/claver-agent/internal/skills"
-	"github.com/rockclaver/claver-agent/internal/storage"
-	"github.com/rockclaver/claver-agent/internal/store"
-	"github.com/rockclaver/claver-agent/internal/systemd"
-	"github.com/rockclaver/claver-agent/internal/tooling"
-	"github.com/rockclaver/claver-agent/internal/version"
-	"github.com/rockclaver/claver-agent/internal/webserver"
+	"github.com/rockclaver/rootmote-agent/internal/actions"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/alerts"
+	"github.com/rockclaver/rootmote-agent/internal/cliauth"
+	"github.com/rockclaver/rootmote-agent/internal/docker"
+	"github.com/rockclaver/rootmote-agent/internal/firewall"
+	gh "github.com/rockclaver/rootmote-agent/internal/github"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
+	"github.com/rockclaver/rootmote-agent/internal/inventory"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/push"
+	"github.com/rockclaver/rootmote-agent/internal/review"
+	"github.com/rockclaver/rootmote-agent/internal/runbook"
+	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/server"
+	"github.com/rockclaver/rootmote-agent/internal/sessions"
+	"github.com/rockclaver/rootmote-agent/internal/skills"
+	"github.com/rockclaver/rootmote-agent/internal/storage"
+	"github.com/rockclaver/rootmote-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/tooling"
+	"github.com/rockclaver/rootmote-agent/internal/version"
+	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
 
-// defaultNotifyRelayURL is the org-operated claver-notify deployment (see
-// github.com/rockclaver/claver-notify). Override with --notify-relay-url or
-// CLAVER_NOTIFY_RELAY_URL to point at a self-hosted relay instead, or set
+// defaultNotifyRelayURL is the org-operated rootmote-notify deployment (see
+// github.com/rockclaver/rootmote-notify). Override with --notify-relay-url or
+// ROOTMOTE_NOTIFY_RELAY_URL to point at a self-hosted relay instead, or set
 // to "" to disable server-side push entirely.
 const defaultNotifyRelayURL = "https://notify.orivo.app"
 
@@ -55,12 +55,12 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
 	requirePairing := flag.Bool("require-pairing", true, "require the mobile app to present the control-plane pairing key on the WebSocket; disable only for local development")
-	notifyRelayURL := flag.String("notify-relay-url", envOr("CLAVER_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central claver-notify relay; set to empty to disable push")
-	notifyToken := flag.String("notify-token", envOr("CLAVER_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
-	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("CLAVER_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
-	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
-	codexRuntimeKind := flag.String("codex-runtime", envOr("CLAVER_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
-	serverID := flag.String("server-id", envOr("CLAVER_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
+	notifyRelayURL := flag.String("notify-relay-url", envOr("ROOTMOTE_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central rootmote-notify relay; set to empty to disable push")
+	notifyToken := flag.String("notify-token", envOr("ROOTMOTE_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
+	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("ROOTMOTE_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
+	runbookAgent := flag.String("runbook-agent", envOr("ROOTMOTE_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
+	codexRuntimeKind := flag.String("codex-runtime", envOr("ROOTMOTE_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
+	serverID := flag.String("server-id", envOr("ROOTMOTE_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -71,28 +71,28 @@ func main() {
 	}
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
-		log.Fatalf("claver-agent: mkdir data-dir: %v", err)
+		log.Fatalf("rootmote-agent: mkdir data-dir: %v", err)
 	}
 	controlPlaneKey, err := loadOrCreateControlPlaneKey(*dataDir)
 	if err != nil {
-		log.Fatalf("claver-agent: control-plane key: %v", err)
+		log.Fatalf("rootmote-agent: control-plane key: %v", err)
 	}
 	st, err := store.Open(filepath.Join(*dataDir, "state.db"))
 	if err != nil {
-		log.Fatalf("claver-agent: open state store: %v", err)
+		log.Fatalf("rootmote-agent: open state store: %v", err)
 	}
 	defer st.Close()
 
 	mgr, err := projects.New(filepath.Join(*dataDir, "projects"), st)
 	if err != nil {
-		log.Fatalf("claver-agent: init workspaces: %v", err)
+		log.Fatalf("rootmote-agent: init workspaces: %v", err)
 	}
 	toolingMgr, err := tooling.New(tooling.Config{
 		BinDir:    filepath.Join(*dataDir, "bin"),
 		NpmPrefix: filepath.Join(*dataDir, "npm-prefix"),
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init tooling: %v", err)
+		log.Fatalf("rootmote-agent: init tooling: %v", err)
 	}
 	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
 	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
@@ -107,7 +107,7 @@ func main() {
 		Store:   st,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init cliauth: %v", err)
+		log.Fatalf("rootmote-agent: init cliauth: %v", err)
 	}
 	terminalRuntime := sessions.TmuxRuntime{
 		ExtraPath: toolingMgr.BinDir(),
@@ -146,11 +146,11 @@ func main() {
 		ProjectRoot: filepath.Join(*dataDir, "projects"),
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init docker: %v", err)
+		log.Fatalf("rootmote-agent: init docker: %v", err)
 	}
 	infraMgr, err := infra.New(infra.Config{})
 	if err != nil {
-		log.Fatalf("claver-agent: init infra: %v", err)
+		log.Fatalf("rootmote-agent: init infra: %v", err)
 	}
 	storageMgr, err := storage.New(storage.Config{
 		HomeDir:      homeDirOr(*dataDir),
@@ -159,7 +159,7 @@ func main() {
 		Docker:       dockerMgr,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init storage: %v", err)
+		log.Fatalf("rootmote-agent: init storage: %v", err)
 	}
 	var serviceClient systemd.Client = systemd.NewSystemctlClient()
 	if runtime.GOOS == "darwin" {
@@ -167,15 +167,15 @@ func main() {
 	}
 	systemdMgr, err := systemd.New(systemd.Config{Client: serviceClient})
 	if err != nil {
-		log.Fatalf("claver-agent: init systemd: %v", err)
+		log.Fatalf("rootmote-agent: init systemd: %v", err)
 	}
 	webserverMgr, err := webserver.New(webserver.Config{Systemd: systemdMgr})
 	if err != nil {
-		log.Fatalf("claver-agent: init webservers: %v", err)
+		log.Fatalf("rootmote-agent: init webservers: %v", err)
 	}
 	processMgr, err := agentprocess.New(agentprocess.Config{Platform: runtime.GOOS})
 	if err != nil {
-		log.Fatalf("claver-agent: init process inspector: %v", err)
+		log.Fatalf("rootmote-agent: init process inspector: %v", err)
 	}
 	var socketReader firewall.SocketReader = firewall.NewSSCommandReader()
 	if runtime.GOOS == "darwin" {
@@ -187,14 +187,14 @@ func main() {
 		SSH:      firewall.SSHFromSockets{Reader: socketReader},
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init firewall: %v", err)
+		log.Fatalf("rootmote-agent: init firewall: %v", err)
 	}
 	securityMgr, err := security.New(security.Config{
 		Firewall:  firewallMgr,
 		Processes: processMgr,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init security audit: %v", err)
+		log.Fatalf("rootmote-agent: init security audit: %v", err)
 	}
 	notificationHub := notifications.NewHub()
 	alertMgr, err := alerts.New(alerts.Config{
@@ -204,7 +204,7 @@ func main() {
 		Sink:    notificationHub,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init alerts: %v", err)
+		log.Fatalf("rootmote-agent: init alerts: %v", err)
 	}
 
 	aiProposalMgr := aiproposal.New()
@@ -256,7 +256,7 @@ func main() {
 		Notifications: notificationHub,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init runbook: %v", err)
+		log.Fatalf("rootmote-agent: init runbook: %v", err)
 	}
 
 	// AI Action Plane orchestrator (Phase 1, read-only tracer). The host-query
@@ -275,7 +275,7 @@ func main() {
 		Notifications: notificationHub,
 	})
 	if err != nil {
-		log.Fatalf("claver-agent: init actions: %v", err)
+		log.Fatalf("rootmote-agent: init actions: %v", err)
 	}
 	pushDeliveryConfigured := false
 	inventoryMgr := inventory.New(inventory.Config{
@@ -316,14 +316,14 @@ func main() {
 	})
 	ln, err := srv.Listen()
 	if err != nil {
-		log.Fatalf("claver-agent: %v", err)
+		log.Fatalf("rootmote-agent: %v", err)
 	}
-	log.Printf("claver-agent %s listening on %s (data %s)", version.Version, ln.Addr(), *dataDir)
+	log.Printf("rootmote-agent %s listening on %s (data %s)", version.Version, ln.Addr(), *dataDir)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if err := sessionMgr.Rehydrate(ctx); err != nil {
-		log.Printf("claver-agent: rehydrate sessions: %v", err)
+		log.Printf("rootmote-agent: rehydrate sessions: %v", err)
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
@@ -334,7 +334,7 @@ func main() {
 	// (the notification hub + inbox keep delivering to connected sockets).
 	// With a relay URL configured, we additionally fan high-signal events
 	// out as system-level push so a backgrounded device still wakes the
-	// user. The relay (github.com/rockclaver/claver-notify) holds the one
+	// user. The relay (github.com/rockclaver/rootmote-notify) holds the one
 	// shared FCM service-account credential, so no per-install Firebase
 	// project is required: the agent self-registers for a bearer token on
 	// first run and persists it in agent_settings.
@@ -350,11 +350,11 @@ func main() {
 			registeredToken, regErr := push.Register(registerCtx, *notifyRelayURL, hostname, *notifyEnrollSecret, nil)
 			registerCancel()
 			if regErr != nil {
-				log.Printf("claver-agent: notify relay register failed, push disabled: %v", regErr)
+				log.Printf("rootmote-agent: notify relay register failed, push disabled: %v", regErr)
 			} else {
 				token = registeredToken
 				if putErr := st.PutAgentSetting("notify_relay_token", token); putErr != nil {
-					log.Printf("claver-agent: persist notify token: %v", putErr)
+					log.Printf("rootmote-agent: persist notify token: %v", putErr)
 				}
 			}
 		}
@@ -379,12 +379,12 @@ func main() {
 			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
 			defer pushCleanup()
 			pushDeliveryConfigured = true
-			log.Printf("claver-agent: notify relay push enabled (%s)", *notifyRelayURL)
+			log.Printf("rootmote-agent: notify relay push enabled (%s)", *notifyRelayURL)
 		}
 	}
 
 	if err := srv.Serve(ctx, ln); err != nil {
-		log.Fatalf("claver-agent serve: %v", err)
+		log.Fatalf("rootmote-agent serve: %v", err)
 	}
 }
 
@@ -397,14 +397,14 @@ func envOr(key, def string) string {
 
 func defaultDataDir() string {
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, "claver")
+		return filepath.Join(home, "rootmote")
 	}
-	return "./claver-data"
+	return "./rootmote-data"
 }
 
 // homeDirOr falls back to the parent of dataDir if $HOME isn't set, so the
 // CLIs' credential files land somewhere stable. On the systemd-managed agent
-// $HOME=/var/lib/claver, dataDir=/var/lib/claver/claver, parent matches.
+// $HOME=/var/lib/rootmote, dataDir=/var/lib/rootmote/rootmote, parent matches.
 func homeDirOr(dataDir string) string {
 	if h, err := os.UserHomeDir(); err == nil && h != "" {
 		return h
@@ -447,7 +447,7 @@ func loadOrCreateControlPlaneKey(dataDir string) (string, error) {
 	return key, nil
 }
 
-// printPairingKey implements `claver-agent pairing-key`: it prints the
+// printPairingKey implements `rootmote-agent pairing-key`: it prints the
 // control-plane pairing key so the mobile app can read it over SSH. It scans
 // the standard install locations so an operator can run it (as root / via
 // sudo) without knowing the daemon's exact data dir.
@@ -459,7 +459,7 @@ func printPairingKey(args []string) {
 	if *dataDir != "" {
 		candidates = append(candidates, *dataDir)
 	}
-	candidates = append(candidates, defaultDataDir(), "/var/lib/claver/claver")
+	candidates = append(candidates, defaultDataDir(), "/var/lib/rootmote/rootmote")
 	for _, dir := range candidates {
 		if b, err := os.ReadFile(controlPlaneKeyPath(dir)); err == nil {
 			if key := strings.TrimSpace(string(b)); key != "" {
@@ -468,5 +468,5 @@ func printPairingKey(args []string) {
 			}
 		}
 	}
-	log.Fatal("claver-agent: pairing key not found; is the agent installed and started?")
+	log.Fatal("rootmote-agent: pairing key not found; is the agent installed and started?")
 }

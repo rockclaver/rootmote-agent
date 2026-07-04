@@ -30,8 +30,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/github"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Kinds.
@@ -131,7 +131,7 @@ type Config struct {
 	// BinDir is prepended to PATH for the captive CLI process so the
 	// freshly-installed `claude`/`codex` resolves.
 	BinDir string
-	// HomeDir is the agent user's home (e.g. /var/lib/claver). Used to
+	// HomeDir is the agent user's home (e.g. /var/lib/rootmote). Used to
 	// locate the CLIs' credential files.
 	HomeDir string
 	// Vault encrypts stored credentials.
@@ -516,8 +516,8 @@ func (m *Manager) StartLogin(parent context.Context, kind, mode string) (*Login,
 		Kind:        kind,
 		Events:      ev,
 		events:      ev,
-		sessionName: "claver-auth-" + kind + "-" + id,
-		fifo:        filepath.Join(os.TempDir(), "claver-auth-"+id+".pipe"),
+		sessionName: "rootmote-auth-" + kind + "-" + id,
+		fifo:        filepath.Join(os.TempDir(), "rootmote-auth-"+id+".pipe"),
 		cancel:      cancel,
 	}
 	m.running[kind] = login

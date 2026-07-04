@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/github"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 func newTestManager(t *testing.T) *Manager {
@@ -461,7 +461,7 @@ func TestGitHubPrompts(t *testing.T) {
 	if got := parseGitHubLoginSuccessAccount("✓ Logged in as rockclaver"); got != "rockclaver" {
 		t.Fatalf("account = %q", got)
 	}
-	if got := parseGitHubStatusAccount("Logged in to github.com account rockclaver (/var/lib/claver/.config/gh/hosts.yml)"); got != "rockclaver" {
+	if got := parseGitHubStatusAccount("Logged in to github.com account rockclaver (/var/lib/rootmote/.config/gh/hosts.yml)"); got != "rockclaver" {
 		t.Fatalf("status account = %q", got)
 	}
 }

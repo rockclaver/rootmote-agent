@@ -7,7 +7,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
 )
 
 // HostMetricsSource provides a read-only snapshot of host metrics.

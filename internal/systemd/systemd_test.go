@@ -161,7 +161,7 @@ func TestAction_ProtectedGuardRejectsStopDisableBeforeClient(t *testing.T) {
 	}{
 		{"sshd", "sshd.service"},
 		{"ssh", "ssh.service"},
-		{"agent", "claver-agent.service"},
+		{"agent", "rootmote-agent.service"},
 		{"caddy", "caddy.service"},
 		{"init", "init.scope"},
 	}

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/docker"
+	"github.com/rockclaver/rootmote-agent/internal/docker"
 )
 
 func writeFile(t *testing.T, path string, size int) {
@@ -268,7 +268,7 @@ func TestClean_DockerCategory_DelegatesToPruner(t *testing.T) {
 // flagged.
 func TestProtectedPathGuard(t *testing.T) {
 	home := t.TempDir()
-	dataDir := filepath.Join(home, "claver")
+	dataDir := filepath.Join(home, "rootmote")
 	projectsRoot := filepath.Join(dataDir, "projects")
 	if err := os.MkdirAll(projectsRoot, 0o755); err != nil {
 		t.Fatal(err)
@@ -351,7 +351,7 @@ func TestBrowse(t *testing.T) {
 	writeFile(t, filepath.Join(home, "sub", "a.bin"), 10)
 	writeFile(t, filepath.Join(home, "sub", "b.bin"), 20)
 
-	dataDir := filepath.Join(home, "claver")
+	dataDir := filepath.Join(home, "rootmote")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -371,8 +371,8 @@ func TestBrowse(t *testing.T) {
 	if got := byName["sub"]; got.Size != 30 || !got.IsDir {
 		t.Fatalf("sub dir entry = %+v, want size 30", got)
 	}
-	if got := byName["claver"]; !got.Protected {
-		t.Fatalf("claver (data dir) entry must be protected: %+v", got)
+	if got := byName["rootmote"]; !got.Protected {
+		t.Fatalf("rootmote (data dir) entry must be protected: %+v", got)
 	}
 	if listing.Parent != filepath.Dir(home) {
 		t.Fatalf("Parent = %q, want %q", listing.Parent, filepath.Dir(home))
@@ -506,7 +506,7 @@ func TestDeepScan_CombinesCategoriesAndLargeFilesIntoTotal(t *testing.T) {
 // it lives on the same device as everything else.
 func TestDeepScan_ExcludesConfiguredDirectories(t *testing.T) {
 	root := t.TempDir()
-	dataDir := filepath.Join(root, "var", "lib", "claver")
+	dataDir := filepath.Join(root, "var", "lib", "rootmote")
 	writeFile(t, filepath.Join(dataDir, "state.db"), 9000)
 	writeFile(t, filepath.Join(root, "home", "dev", "video.mp4"), 2000)
 
@@ -715,7 +715,7 @@ func TestClearGlobFiles_RemovesEachMatchViaRemover(t *testing.T) {
 // AC: vacuumJournal runs `journalctl --vacuum-size=<floor>` through
 // m.remover.Run (not a raw execCommand), and surfaces a Run failure —
 // journalctl writes under /var/log/journal, outside
-// claver-agent.service's ReadWritePaths, so this needs the exact same
+// rootmote-agent.service's ReadWritePaths, so this needs the exact same
 // escalation fallback as an explicit file delete.
 func TestVacuumJournal_DelegatesToRemoverRun(t *testing.T) {
 	m := newTestManager(t, Config{
@@ -796,7 +796,7 @@ func TestDefaultRemoverNeedsEscalation(t *testing.T) {
 // AC: when a real, unprivileged os.Remove hits a genuine permission error,
 // defaultRemover.Remove escalates by shelling to
 // `sudo -n nsenter --mount=/proc/1/ns/mnt -- rm -f <path>` — the technique
-// that reaches past claver-agent.service's ProtectSystem=strict mount
+// that reaches past rootmote-agent.service's ProtectSystem=strict mount
 // namespace even for a sudo-escalated root child. Skips if the test
 // process itself is root, since root can't produce a real EACCES to prove
 // the fallback ever triggers.

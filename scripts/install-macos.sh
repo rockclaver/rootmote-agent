@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Claver macOS agent installer.
+# Rootmote macOS agent installer.
 #
 # Installs the agent as a per-user launchd LaunchAgent. Do not run this script
 # with sudo: Claude, Codex, GitHub CLI auth, transcripts, and installed skills
-# should live under the same macOS account that DevDeck reaches over SSH.
+# should live under the same macOS account that Rootmote reaches over SSH.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh | bash -s -- --version 0.1.2
+#   curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install-macos.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install-macos.sh | bash -s -- --version 0.1.2
 
 set -euo pipefail
 
 VERSION="${VERSION:-latest}"
-RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver-agent/releases/download}"
-RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/claver-agent/releases/latest}"
-LABEL="${LABEL:-com.rockclaver.claver-agent}"
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/rootmote-agent/releases/download}"
+RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/rootmote-agent/releases/latest}"
+LABEL="${LABEL:-com.rockclaver.rootmote-agent}"
 ADDR="${ADDR:-127.0.0.1:7676}"
-DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/ClaverAgent}"
+DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/RootmoteAgent}"
 BIN_DIR="$DATA_DIR/bin"
-BIN_DST="$BIN_DIR/claver-agent"
+BIN_DST="$BIN_DIR/rootmote-agent"
 FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
-LOG_DIR="$HOME/Library/Logs/ClaverAgent"
+LOG_DIR="$HOME/Library/Logs/RootmoteAgent"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_DST="$PLIST_DIR/$LABEL.plist"
 
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 BIN_DIR="$DATA_DIR/bin"
-BIN_DST="$BIN_DIR/claver-agent"
+BIN_DST="$BIN_DIR/rootmote-agent"
 FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -55,7 +55,7 @@ if [[ "$ADDR" != 127.0.0.1:* && "$ADDR" != localhost:* && "$ADDR" != "[::1]:"* &
 fi
 
 if [[ "$VERSION" == "latest" ]]; then
-  echo "resolving latest claver-agent release" >&2
+  echo "resolving latest rootmote-agent release" >&2
   resolved="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$RELEASES_LATEST_URL" || true)"
   VERSION="${resolved##*/tag/v}"
   if [[ -z "$VERSION" || "$VERSION" == "$resolved" ]]; then
@@ -76,17 +76,17 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-url="${RELEASE_BASE}/v${VERSION}/claver-agent-darwin-${arch}"
+url="${RELEASE_BASE}/v${VERSION}/rootmote-agent-darwin-${arch}"
 echo "downloading $url" >&2
-if ! curl -fsSL "$url" -o "$tmp/claver-agent"; then
-  echo "failed to download claver-agent ${VERSION} for darwin-${arch}" >&2
+if ! curl -fsSL "$url" -o "$tmp/rootmote-agent"; then
+  echo "failed to download rootmote-agent ${VERSION} for darwin-${arch}" >&2
   echo "expected release asset: $url" >&2
   exit 1
 fi
-chmod 0755 "$tmp/claver-agent"
+chmod 0755 "$tmp/rootmote-agent"
 
 install -d -m 0700 "$DATA_DIR" "$BIN_DIR" "$FRAGMENTS_DIR" "$LOG_DIR" "$PLIST_DIR"
-install -m 0755 "$tmp/claver-agent" "$BIN_DST"
+install -m 0755 "$tmp/rootmote-agent" "$BIN_DST"
 
 xml_escape() {
   local value="$1"
@@ -159,7 +159,7 @@ launchctl bootstrap "$domain" "$PLIST_DST"
 launchctl enable "$domain/$LABEL" >/dev/null 2>&1 || true
 launchctl kickstart -k "$domain/$LABEL" >/dev/null 2>&1 || true
 
-echo "installed claver-agent:"
+echo "installed rootmote-agent:"
 "$BIN_DST" --version
 echo "launchd service: $domain/$LABEL"
 echo "data dir: $DATA_DIR"
@@ -167,11 +167,11 @@ echo "logs: $LOG_DIR"
 
 local_name="$(scutil --get LocalHostName 2>/dev/null || true)"
 if [[ -n "$local_name" ]]; then
-  echo "DevDeck local host: ${local_name}.local"
+  echo "Rootmote local host: ${local_name}.local"
 fi
 for iface in en0 en1; do
   if ip="$(ipconfig getifaddr "$iface" 2>/dev/null)"; then
-    echo "DevDeck LAN IP ($iface): $ip"
+    echo "Rootmote LAN IP ($iface): $ip"
   fi
 done
 echo "Use SSH port 22 and your macOS username. Remote Login must be enabled."

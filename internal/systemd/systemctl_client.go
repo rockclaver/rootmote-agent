@@ -151,7 +151,7 @@ func (c *SystemctlClient) Action(ctx context.Context, name string, action Action
 	return nil
 }
 
-// Reboot runs `systemctl reboot`. The agent runs as the unprivileged `claver`
+// Reboot runs `systemctl reboot`. The agent runs as the unprivileged `rootmote`
 // user, so when it is not already root the call is wrapped in `sudo -n`
 // (matching the firewall backends); a sudoers grant authorizes the literal
 // `systemctl reboot` verb.

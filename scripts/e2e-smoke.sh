@@ -11,11 +11,11 @@ trap 'rm -rf "$DATA_DIR"; [[ -n "${AGENT_PID:-}" ]] && kill "$AGENT_PID" 2>/dev/
 PORT="${PORT:-7676}"
 
 echo "[smoke] building agent + smoke binaries"
-(cd "$ROOT" && go build -o "$DATA_DIR/claver-agent" ./cmd/claver-agent)
-(cd "$ROOT" && go build -o "$DATA_DIR/claver-e2e-smoke" ./cmd/e2e-smoke)
+(cd "$ROOT" && go build -o "$DATA_DIR/rootmote-agent" ./cmd/rootmote-agent)
+(cd "$ROOT" && go build -o "$DATA_DIR/rootmote-e2e-smoke" ./cmd/e2e-smoke)
 
 echo "[smoke] starting agent (data-dir=$DATA_DIR, addr=127.0.0.1:$PORT)"
-"$DATA_DIR/claver-agent" \
+"$DATA_DIR/rootmote-agent" \
   --addr "127.0.0.1:$PORT" \
   --data-dir "$DATA_DIR/state" \
   >"$DATA_DIR/agent.log" 2>&1 &
@@ -35,7 +35,7 @@ if ! kill -0 "$AGENT_PID" 2>/dev/null; then
 fi
 
 echo "[smoke] running e2e-smoke against ws://127.0.0.1:$PORT/ws"
-"$DATA_DIR/claver-e2e-smoke" \
+"$DATA_DIR/rootmote-e2e-smoke" \
   -ws "ws://127.0.0.1:$PORT/ws" \
   -workspace-root "$DATA_DIR/state/projects"
 

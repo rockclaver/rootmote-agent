@@ -1,4 +1,4 @@
-{"id":0,"result":{"userAgent":"claver-agent/0.142.4","codexHome":"/home/claver/.codex"}}
+{"id":0,"result":{"userAgent":"rootmote-agent/0.142.4","codexHome":"/home/rootmote/.codex"}}
 {"method":"remoteControl/status/changed","params":{"status":"disabled"}}
 {"method":"thread/started","params":{"thread":{"id":"th-1","status":{"type":"idle"}}}}
 {"method":"thread/status/changed","params":{"threadId":"th-1","status":{"type":"active","activeFlags":[]}}}

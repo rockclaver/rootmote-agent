@@ -160,7 +160,7 @@ func TestIssue43ProtectedPIDGuardRejectsBeforeSignal(t *testing.T) {
 		comm string
 	}{
 		{name: "pid1", pid: 1, comm: "init"},
-		{name: "agent", pid: 44, comm: "claver-agent"},
+		{name: "agent", pid: 44, comm: "rootmote-agent"},
 		{name: "sshd", pid: 55, comm: "sshd"},
 		{name: "tmux-pane", pid: 66, comm: "bash"},
 	} {
@@ -327,8 +327,8 @@ func TestSignalFlag_MapsTermAndKillToKillCLIFlags(t *testing.T) {
 
 func TestDarwinProcessList_UsesPSWhenProcfsIsUnavailable(t *testing.T) {
 	ps := `  10 root      0.0    512 Wed Jul  1 22:49:42 2026 /sbin/launchd
- 100 claver   12.5  2048 Wed Jul  1 22:50:10 2026 /Applications/Foo.app/Contents/MacOS/Foo --flag
- 200 claver    1.0  8192 Wed Jul  1 22:51:10 2026 /usr/sbin/sshd -i
+ 100 rootmote   12.5  2048 Wed Jul  1 22:50:10 2026 /Applications/Foo.app/Contents/MacOS/Foo --flag
+ 200 rootmote    1.0  8192 Wed Jul  1 22:51:10 2026 /usr/sbin/sshd -i
 `
 	mgr, err := New(Config{
 		Platform: "darwin",

@@ -1,5 +1,5 @@
 // Package projects implements the Project Workspace deep module: one
-// directory per project under ~/claver/projects/<id>, never shared, with
+// directory per project under ~/rootmote/projects/<id>, never shared, with
 // git operations exposed at a small, testable surface.
 package projects
 
@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // ErrDirtyTree signals that a branch operation refused to act on a workspace

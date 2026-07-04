@@ -22,8 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
-	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
 )
 
 // DefaultThrottle is the minimum gap between two auto-proposals for the same
@@ -84,7 +84,7 @@ type Grounding struct {
 }
 
 // Snapshotter produces a Grounding for the current host. The wiring in
-// claver-agent main injects a closure that calls infra/systemd/process/
+// rootmote-agent main injects a closure that calls infra/systemd/process/
 // firewall managers; tests can supply a static struct.
 type Snapshotter interface {
 	Snapshot(ctx context.Context) Grounding

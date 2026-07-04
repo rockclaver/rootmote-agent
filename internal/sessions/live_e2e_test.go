@@ -2,7 +2,7 @@ package sessions
 
 // live_e2e_test.go is the Phase 7 live end-to-end suite. Every test here drives
 // the REAL `claude` / `codex` CLIs and makes real model calls, so each is gated
-// behind CLAVER_LIVE_CLAUDE / CLAVER_LIVE_CODEX and skipped in CI and on
+// behind ROOTMOTE_LIVE_CLAUDE / ROOTMOTE_LIVE_CODEX and skipped in CI and on
 // unauthenticated hosts. The flows mirror the plan's acceptance criteria: basic
 // turn, tool-with-approval, plan mode (Claude), interrupt, and reconnect/replay.
 //
@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 func requireLive(t *testing.T, envVar, bin string) {
@@ -109,7 +109,7 @@ func (ls *liveSession) prompt(t *testing.T, text string) {
 // --- Claude --------------------------------------------------------------
 
 func TestLiveClaude_BasicTurn(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CLAUDE", "claude")
+	requireLive(t, "ROOTMOTE_LIVE_CLAUDE", "claude")
 	ls := startLiveRuntime(t, "claude", "manual")
 	ls.prompt(t, "Reply with exactly the word: pong")
 	ls.coll.waitForType(t, EvTurn, 90*time.Second)
@@ -119,7 +119,7 @@ func TestLiveClaude_BasicTurn(t *testing.T) {
 }
 
 func TestLiveClaude_ToolApproval(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CLAUDE", "claude")
+	requireLive(t, "ROOTMOTE_LIVE_CLAUDE", "claude")
 	ls := startLiveRuntime(t, "claude", "manual") // default permission mode gates edits
 	stop := make(chan struct{})
 	autoApprove(ls, stop)
@@ -141,7 +141,7 @@ func TestLiveClaude_ToolApproval(t *testing.T) {
 }
 
 func TestLiveClaude_PlanMode(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CLAUDE", "claude")
+	requireLive(t, "ROOTMOTE_LIVE_CLAUDE", "claude")
 	ls := startLiveRuntime(t, "claude", "manual")
 	if err := ls.rt.SetMode(context.Background(), ls.id, ModePlan); err != nil {
 		t.Fatalf("set plan mode: %v", err)
@@ -166,7 +166,7 @@ func TestLiveClaude_PlanMode(t *testing.T) {
 }
 
 func TestLiveClaude_Interrupt(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CLAUDE", "claude")
+	requireLive(t, "ROOTMOTE_LIVE_CLAUDE", "claude")
 	ls := startLiveRuntime(t, "claude", "yolo") // no approval gating; just a long generation
 	ls.prompt(t, "Write a very long, detailed essay of at least 1200 words about the complete history of computing. Do not stop early.")
 
@@ -194,14 +194,14 @@ func TestLiveClaude_Interrupt(t *testing.T) {
 }
 
 func TestLiveClaude_ReconnectReplay(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CLAUDE", "claude")
+	requireLive(t, "ROOTMOTE_LIVE_CLAUDE", "claude")
 	liveReconnectReplay(t, "claude")
 }
 
 // --- Codex ---------------------------------------------------------------
 
 func TestLiveCodex_BasicTurn(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CODEX", "codex")
+	requireLive(t, "ROOTMOTE_LIVE_CODEX", "codex")
 	ls := startLiveRuntime(t, "codex", "manual")
 	ls.prompt(t, "Reply with exactly the word: pong")
 	ls.coll.waitForType(t, EvTurn, 120*time.Second)
@@ -211,7 +211,7 @@ func TestLiveCodex_BasicTurn(t *testing.T) {
 }
 
 func TestLiveCodex_ToolApproval(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CODEX", "codex")
+	requireLive(t, "ROOTMOTE_LIVE_CODEX", "codex")
 	ls := startLiveRuntime(t, "codex", "manual") // on-request policy gates exec/patch
 	stop := make(chan struct{})
 	autoApprove(ls, stop)
@@ -230,7 +230,7 @@ func TestLiveCodex_ToolApproval(t *testing.T) {
 }
 
 func TestLiveCodex_Interrupt(t *testing.T) {
-	requireLive(t, "CLAVER_LIVE_CODEX", "codex")
+	requireLive(t, "ROOTMOTE_LIVE_CODEX", "codex")
 	ls := startLiveRuntime(t, "codex", "yolo")
 	ls.prompt(t, "Write a very long, detailed essay of at least 1200 words about the complete history of computing. Do not stop early.")
 	time.Sleep(4 * time.Second)

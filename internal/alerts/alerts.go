@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/infra"
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/store"
-	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 const (

@@ -1,6 +1,6 @@
-# claver-agent
+# rootmote-agent
 
-The VPS-side companion for [Claver](https://github.com/rockclaver/claver). A single Go binary, supervised by
+The VPS-side companion for [Rootmote](https://github.com/rockclaver/rootmote). A single Go binary, supervised by
 `systemd`, that binds only to `127.0.0.1` and speaks a JSON-over-WebSocket
 protocol to the mobile app over an SSH-forwarded port.
 
@@ -30,14 +30,14 @@ go build ./...
 ## Run locally
 
 ```sh
-go run ./cmd/claver-agent --addr 127.0.0.1:7676
+go run ./cmd/rootmote-agent --addr 127.0.0.1:7676
 ```
 
 The agent refuses to start if `--addr` is anything other than a loopback IP.
 Interactive Claude and Codex sessions run with a stable agent HOME. On the
-systemd install that HOME is `/var/lib/claver`, so CLI auth, transcripts, and
-skills installed by the agents live under `/var/lib/claver/.claude` and
-`/var/lib/claver/.codex` instead of the project workspace. The agent also adds
+systemd install that HOME is `/var/lib/rootmote`, so CLI auth, transcripts, and
+skills installed by the agents live under `/var/lib/rootmote/.claude` and
+`/var/lib/rootmote/.codex` instead of the project workspace. The agent also adds
 the relevant `skills` directory to each CLI's writable roots, so skill installs
 persist across sessions, logins, and binary upgrades.
 
@@ -46,18 +46,18 @@ persist across sessions, logins, and binary upgrades.
 | Flag | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--addr` | | `127.0.0.1:7676` | Loopback bind address for the WebSocket control plane. |
-| `--data-dir` | | `$HOME/claver` | Directory for `state.db`, project workspaces, tool installs, and token vault files. |
-| `--caddy-fragments-dir` | `CLAVER_CADDY_FRAGMENTS_DIR` | `/etc/caddy/claver` | Directory where preview site-block fragments are written. |
-| `--preview-expected-ip` | `CLAVER_PREVIEW_EXPECTED_IP` | unset | Optional DNS guard; preview setup requires wildcard DNS to resolve to this IP. |
+| `--data-dir` | | `$HOME/rootmote` | Directory for `state.db`, project workspaces, tool installs, and token vault files. |
+| `--caddy-fragments-dir` | `ROOTMOTE_CADDY_FRAGMENTS_DIR` | `/etc/caddy/rootmote` | Directory where preview site-block fragments are written. |
+| `--preview-expected-ip` | `ROOTMOTE_PREVIEW_EXPECTED_IP` | unset | Optional DNS guard; preview setup requires wildcard DNS to resolve to this IP. |
 | `--version` | | `false` | Print the installed agent version and exit. |
 
 Examples:
 
 ```sh
 # Local development
-go run ./cmd/claver-agent \
+go run ./cmd/rootmote-agent \
   --addr 127.0.0.1:7676 \
-  --data-dir ./claver-data
+  --data-dir ./rootmote-data
 ```
 
 ## Network Access
@@ -66,16 +66,16 @@ The agent control plane must stay private. It binds to loopback and the mobile
 app reaches it by opening an SSH tunnel to `127.0.0.1:7676` on the managed
 host. Do not expose port `7676` on a public interface.
 
-For a VPS with a public SSH address, add the server normally in DevDeck.
+For a VPS with a public SSH address, add the server normally in Rootmote.
 
 For a MacBook on the same Wi-Fi/LAN as the phone, use direct SSH:
 
 1. Enable **System Settings → General → Sharing → Remote Login** on the Mac.
-2. Install and start `claver-agent` with the macOS installer below.
-3. Add the Mac in DevDeck using either:
+2. Install and start `rootmote-agent` with the macOS installer below.
+3. Add the Mac in Rootmote using either:
    - the Mac's Bonjour name, for example `Peters-MacBook-Pro.local`; or
    - the Mac's LAN IP, for example `192.168.1.145`.
-4. Use SSH port `22`, the macOS username, and the public key DevDeck shows in
+4. Use SSH port `22`, the macOS username, and the public key Rootmote shows in
    the app.
 
 The direct MacBook path does not require Tailscale on the phone. It does require
@@ -94,7 +94,7 @@ prefer a private overlay network such as Tailscale:
    MagicDNS name.
 3. Enable SSH on the host. On macOS this is **System Settings → General →
    Sharing → Remote Login**.
-4. Add the host in DevDeck using the Tailscale IP or MagicDNS name, port `22`,
+4. Add the host in Rootmote using the Tailscale IP or MagicDNS name, port `22`,
    your SSH username, and the SSH key you authorized on that host.
 
 For unattended Linux servers, Tailscale supports auth keys:
@@ -111,19 +111,19 @@ the tailnet ACL and the operational tradeoffs.
 For a systemd install, prefer an override instead of editing the packaged unit:
 
 ```sh
-sudo systemctl edit claver-agent
+sudo systemctl edit rootmote-agent
 ```
 
 ```ini
 [Service]
-Environment=CLAVER_PREVIEW_EXPECTED_IP=203.0.113.10
+Environment=ROOTMOTE_PREVIEW_EXPECTED_IP=203.0.113.10
 ```
 
 Then reload and restart:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart claver-agent
+sudo systemctl restart rootmote-agent
 ```
 
 ### GitHub setup
@@ -132,10 +132,10 @@ GitHub imports use GitHub CLI authentication. No custom OAuth app, callback URL,
 or Client ID is required.
 
 Install `gh` on the VPS, then sign in as the same user that runs
-`claver-agent`:
+`rootmote-agent`:
 
 ```sh
-sudo -u claver -H gh auth login \
+sudo -u rootmote -H gh auth login \
   --hostname github.com \
   --git-protocol https \
   --scopes repo,read:org,workflow \
@@ -155,7 +155,7 @@ go test ./...
 ## Install on a VPS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install.sh \
   | sudo bash
 ```
 
@@ -163,41 +163,41 @@ By default the installer resolves the latest GitHub release. To pin a specific
 version, pass `--version`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install.sh \
   | sudo bash -s -- --version 0.1.2
 ```
 
-The installer creates a `claver` system user, drops the binary at
-`/usr/local/bin/claver-agent`, installs the systemd unit, enables and starts
+The installer creates a `rootmote` system user, drops the binary at
+`/usr/local/bin/rootmote-agent`, installs the systemd unit, enables and starts
 the service, and prints the installed version on stdout. It also installs the
 OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH, and creates
-the persistent Claude/Codex skill roots under `/var/lib/claver`.
+the persistent Claude/Codex skill roots under `/var/lib/rootmote`.
 
 ## Install on macOS
 
 Enable Remote Login first, then install the agent as the macOS user that
-DevDeck will SSH into. Use the Mac's `.local` name or LAN IP when the phone is
+Rootmote will SSH into. Use the Mac's `.local` name or LAN IP when the phone is
 on the same network:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install-macos.sh \
   | bash
 ```
 
 To pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install-macos.sh \
   | bash -s -- --version 0.1.2
 ```
 
 The macOS installer creates a per-user LaunchAgent at
-`~/Library/LaunchAgents/com.rockclaver.claver-agent.plist`, installs the binary
-under `~/Library/Application Support/ClaverAgent/bin`, stores agent data under
-`~/Library/Application Support/ClaverAgent`, and writes logs to
-`~/Library/Logs/ClaverAgent`. Do not run it with `sudo`; the agent should use
+`~/Library/LaunchAgents/com.rockclaver.rootmote-agent.plist`, installs the binary
+under `~/Library/Application Support/RootmoteAgent/bin`, stores agent data under
+`~/Library/Application Support/RootmoteAgent`, and writes logs to
+`~/Library/Logs/RootmoteAgent`. Do not run it with `sudo`; the agent should use
 the same user-level Claude, Codex, GitHub CLI, and SSH state as the account
-DevDeck connects to.
+Rootmote connects to.
 
 macOS support is for running coding sessions, project operations, and the
 read-only Infrastructure views on the MacBook. The Overview tab uses native
@@ -223,8 +223,8 @@ versioned as `dev-<git-sha>` with a `-dirty` suffix when the tree has
 uncommitted changes.
 
 The requested version must already exist as a GitHub release. Push a tag such
-as `v0.1.0` to publish the `claver-agent-linux-amd64`,
-`claver-agent-linux-arm64`, `claver-agent-darwin-amd64`,
-`claver-agent-darwin-arm64`, `claver-agent.service`,
-`claver-agent-firewall.sudoers`, `claver-agent-sudo.tmpfiles.conf`, and
+as `v0.1.0` to publish the `rootmote-agent-linux-amd64`,
+`rootmote-agent-linux-arm64`, `rootmote-agent-darwin-amd64`,
+`rootmote-agent-darwin-arm64`, `rootmote-agent.service`,
+`rootmote-agent-firewall.sudoers`, `rootmote-agent-sudo.tmpfiles.conf`, and
 `install-macos.sh` assets consumed by the installers.

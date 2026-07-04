@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
 )
 
 type fakeMetrics struct {

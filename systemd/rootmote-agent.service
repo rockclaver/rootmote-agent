@@ -1,19 +1,19 @@
 [Unit]
-Description=Claver VPS Agent
-Documentation=https://github.com/rockclaver/claver
+Description=Rootmote VPS Agent
+Documentation=https://github.com/rockclaver/rootmote
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=claver
-Group=claver
-ExecStart=/usr/local/bin/claver-agent --addr 127.0.0.1:7676
+User=rootmote
+Group=rootmote
+ExecStart=/usr/local/bin/rootmote-agent --addr 127.0.0.1:7676
 Restart=on-failure
 RestartSec=2s
 
 # Hardening.
-# NoNewPrivileges MUST stay off: the agent runs as the unprivileged `claver`
+# NoNewPrivileges MUST stay off: the agent runs as the unprivileged `rootmote`
 # user and escalates privileged operations (firewall ufw/firewall-cmd from
 # issue #44, host reboot, terminating a suspicious process owned by another
 # user, and storage cleanup's file/journal deletion) through `sudo -n`,
@@ -35,7 +35,7 @@ RestartSec=2s
 # ("ticket") directory there on every call, even with NOPASSWD, and treats
 # being unable to (read-only filesystem) as a hard "a password is required"
 # failure rather than something NOPASSWD can route around. The installer's
-# claver-agent-sudo.tmpfiles.conf guarantees /run/sudo exists before this
+# rootmote-agent-sudo.tmpfiles.conf guarantees /run/sudo exists before this
 # unit starts (it's on tmpfs and empty on every boot).
 # All privileged mutations still pass through the agent's biometric +
 # single-use confirmation-token (+ firewall anti-lockout) pipeline before sudo.
@@ -45,7 +45,7 @@ PrivateTmp=true
 # The agent's *listener* is locked to loopback by an in-process self-check
 # (assertLoopback). It still needs outbound network to clone repos, talk to
 # GitHub CLI auth, previews, etc., so we leave egress open here.
-ReadWritePaths=/var/lib/claver /etc/caddy/claver /run/sudo
+ReadWritePaths=/var/lib/rootmote /etc/caddy/rootmote /run/sudo
 
 [Install]
 WantedBy=multi-user.target

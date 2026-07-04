@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/cliauth"
-	"github.com/rockclaver/claver-agent/internal/docker"
-	"github.com/rockclaver/claver-agent/internal/process"
-	"github.com/rockclaver/claver-agent/internal/store"
-	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/cliauth"
+	"github.com/rockclaver/rootmote-agent/internal/docker"
+	"github.com/rockclaver/rootmote-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 func TestSnapshotCapabilitiesReportsExistingAgentModules(t *testing.T) {

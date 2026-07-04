@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/rockclaver/claver-agent/internal/projects"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/projects"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 var (
@@ -767,7 +767,7 @@ func isClaudeFirstRunSetup(s string) bool {
 
 // TmuxRuntime exec's tmux to host agent CLIs. ExtraPath, when set, is
 // prepended to $PATH for the launched pane so per-user-installed CLIs
-// (e.g. claude/codex under /var/lib/claver/bin) resolve. Secrets, when set,
+// (e.g. claude/codex under /var/lib/rootmote/bin) resolve. Secrets, when set,
 // returns env-var assignments to inject into the new pane via `tmux -e` so
 // the CLI inherits subscription credentials.
 type TmuxRuntime struct {
@@ -965,7 +965,7 @@ func pathWithPrefix(prefix string) string {
 
 func (r TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
 	target := tmuxName(spec.SessionID) + ":0.0"
-	fifo := filepath.Join(os.TempDir(), "claver-"+spec.SessionID+".pipe")
+	fifo := filepath.Join(os.TempDir(), "rootmote-"+spec.SessionID+".pipe")
 	_ = os.Remove(fifo)
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		return fmt.Errorf("create tmux pipe: %w", err)
@@ -1282,7 +1282,7 @@ func (TmuxRuntime) Capture(ctx context.Context, sessionID string) (string, error
 }
 
 func tmuxName(sessionID string) string {
-	return "claver-" + filepath.Base(sessionID)
+	return "rootmote-" + filepath.Base(sessionID)
 }
 
 func shellQuote(s string) string {

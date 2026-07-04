@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/docker"
+	"github.com/rockclaver/rootmote-agent/internal/docker"
 )
 
 // Category IDs. Stable machine-readable strings used on the wire for both
@@ -154,8 +154,8 @@ type DeleteResult struct {
 }
 
 // remover is the escalation boundary for filesystem mutations that might
-// land outside claver-agent.service's ReadWritePaths=/var/lib/claver
-// /etc/caddy/claver — nearly everywhere else on a production host, since
+// land outside rootmote-agent.service's ReadWritePaths=/var/lib/rootmote
+// /etc/caddy/rootmote — nearly everywhere else on a production host, since
 // ProtectSystem=strict mounts the rest of the filesystem read-only inside
 // the unit's own private mount namespace. That restriction holds even for
 // a sudo-escalated root child: a plain execve (all sudo does) never leaves
@@ -163,7 +163,7 @@ type DeleteResult struct {
 // read-only bind mounts. The escalation path instead joins PID 1's real,
 // unsandboxed mount namespace first via `nsenter --mount=/proc/1/ns/mnt`
 // before running the target command as root — the same NoNewPrivileges=false
-// / sudoers.d NOPASSWD allowlist model claver-agent.service already exists
+// / sudoers.d NOPASSWD allowlist model rootmote-agent.service already exists
 // to support for reboot/ufw/firewall-cmd. Reads (Scan, Browse, DeepScan)
 // never need this: ProtectSystem=strict only blocks writes.
 type remover interface {
@@ -226,7 +226,7 @@ func (r defaultRemover) needsEscalation(err error) bool {
 }
 
 // escalate runs name with args as root inside PID 1's real mount
-// namespace, via the claver-agent-firewall.sudoers NOPASSWD allowlist.
+// namespace, via the rootmote-agent-firewall.sudoers NOPASSWD allowlist.
 func (r defaultRemover) escalate(ctx context.Context, name string, args ...string) ([]byte, error) {
 	_ = ctx
 	binPath, err := r.lookPath(name)

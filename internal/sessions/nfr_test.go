@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Phase 9 AC5: "Median end-to-end streaming latency under 250 ms over a

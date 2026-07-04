@@ -62,14 +62,14 @@ esac
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
-BIN="$OUT/claver-agent"
+BIN="$OUT/rootmote-agent"
 
 echo "[deploy] building linux/$ARCH from $ROOT"
-(cd "$ROOT" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -o "$BIN" ./cmd/claver-agent)
+(cd "$ROOT" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -o "$BIN" ./cmd/rootmote-agent)
 
-SERVICE_SRC="$ROOT/systemd/claver-agent.service"
-SUDOERS_SRC="$ROOT/systemd/claver-agent-firewall.sudoers"
-TMPFILES_SRC="$ROOT/systemd/claver-agent-sudo.tmpfiles.conf"
+SERVICE_SRC="$ROOT/systemd/rootmote-agent.service"
+SUDOERS_SRC="$ROOT/systemd/rootmote-agent-firewall.sudoers"
+TMPFILES_SRC="$ROOT/systemd/rootmote-agent-sudo.tmpfiles.conf"
 
 echo "[deploy] copying binary + systemd/sudoers/tmpfiles fragments to $TARGET:/tmp"
 scp -q "$BIN" "$SERVICE_SRC" "$SUDOERS_SRC" "$TMPFILES_SRC" "$TARGET:/tmp/"
@@ -77,23 +77,23 @@ scp -q "$BIN" "$SERVICE_SRC" "$SUDOERS_SRC" "$TMPFILES_SRC" "$TARGET:/tmp/"
 echo "[deploy] installing binary + config fragments on $TARGET"
 ssh "$TARGET" "
   set -euo pipefail
-  $SUDO install -m 0755 /tmp/claver-agent /usr/local/bin/claver-agent
-  $SUDO install -m 0644 /tmp/claver-agent.service /etc/systemd/system/claver-agent.service
-  $SUDO install -m 0644 /tmp/claver-agent-sudo.tmpfiles.conf /etc/tmpfiles.d/claver-agent-sudo.conf
-  $SUDO systemd-tmpfiles --create /etc/tmpfiles.d/claver-agent-sudo.conf
-  $SUDO install -m 0440 /tmp/claver-agent-firewall.sudoers /etc/sudoers.d/claver-agent-firewall.new
-  if $SUDO visudo -c -f /etc/sudoers.d/claver-agent-firewall.new >/dev/null; then
-    $SUDO mv /etc/sudoers.d/claver-agent-firewall.new /etc/sudoers.d/claver-agent-firewall
+  $SUDO install -m 0755 /tmp/rootmote-agent /usr/local/bin/rootmote-agent
+  $SUDO install -m 0644 /tmp/rootmote-agent.service /etc/systemd/system/rootmote-agent.service
+  $SUDO install -m 0644 /tmp/rootmote-agent-sudo.tmpfiles.conf /etc/tmpfiles.d/rootmote-agent-sudo.conf
+  $SUDO systemd-tmpfiles --create /etc/tmpfiles.d/rootmote-agent-sudo.conf
+  $SUDO install -m 0440 /tmp/rootmote-agent-firewall.sudoers /etc/sudoers.d/rootmote-agent-firewall.new
+  if $SUDO visudo -c -f /etc/sudoers.d/rootmote-agent-firewall.new >/dev/null; then
+    $SUDO mv /etc/sudoers.d/rootmote-agent-firewall.new /etc/sudoers.d/rootmote-agent-firewall
   else
-    echo 'warning: claver-agent-firewall sudoers fragment failed visudo check; leaving previous fragment in place' >&2
-    $SUDO rm -f /etc/sudoers.d/claver-agent-firewall.new
+    echo 'warning: rootmote-agent-firewall sudoers fragment failed visudo check; leaving previous fragment in place' >&2
+    $SUDO rm -f /etc/sudoers.d/rootmote-agent-firewall.new
   fi
   $SUDO systemctl daemon-reload
-  $SUDO systemctl restart claver-agent
-  rm -f /tmp/claver-agent /tmp/claver-agent.service /tmp/claver-agent-firewall.sudoers /tmp/claver-agent-sudo.tmpfiles.conf
+  $SUDO systemctl restart rootmote-agent
+  rm -f /tmp/rootmote-agent /tmp/rootmote-agent.service /tmp/rootmote-agent-firewall.sudoers /tmp/rootmote-agent-sudo.tmpfiles.conf
 "
 
 echo "[deploy] installed version on $TARGET:"
-ssh "$TARGET" "/usr/local/bin/claver-agent --version"
+ssh "$TARGET" "/usr/local/bin/rootmote-agent --version"
 
 echo "[deploy] ok"

@@ -1,10 +1,10 @@
-// Phase 9 AC6: end-to-end smoke harness driving the dockerized claver-agent
+// Phase 9 AC6: end-to-end smoke harness driving the dockerized rootmote-agent
 // through the protocol subset that doesn't require a real Claude/Codex agent
 // or GitHub OAuth: connect → create project → write a file into the project
 // workspace → diff.status sees the change → mint confirmation → review.approve
 // → audit.list records the decision.
 //
-// Run as: claver-e2e-smoke -ws ws://127.0.0.1:7676/ws -workspace-root /var/lib/claver/projects
+// Run as: rootmote-e2e-smoke -ws ws://127.0.0.1:7676/ws -workspace-root /var/lib/rootmote/projects
 package main
 
 import (
@@ -28,7 +28,7 @@ type frame struct {
 
 func main() {
 	wsURL := flag.String("ws", "ws://127.0.0.1:7676/ws", "agent WebSocket URL")
-	workspaceRoot := flag.String("workspace-root", "/var/lib/claver/projects", "directory where the agent stores project workspaces")
+	workspaceRoot := flag.String("workspace-root", "/var/lib/rootmote/projects", "directory where the agent stores project workspaces")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // publishNormalized appends a normalized structured event through the Manager's

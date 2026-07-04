@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // codex_runtime.go drives the `codex app-server` CLI over its JSON-RPC 2.0 stdio
@@ -238,7 +238,7 @@ func (c *codexConn) respondError(id json.RawMessage, code int, msg string) {
 // via spec.OnAgentSession so the Manager can persist it for later resume/fork.
 func (c *codexConn) handshake(ctx context.Context, spec RuntimeSpec) error {
 	if _, err := c.call(ctx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "claver-agent", "title": "Claver", "version": "1"},
+		"clientInfo": map[string]any{"name": "rootmote-agent", "title": "Rootmote", "version": "1"},
 	}); err != nil {
 		return fmt.Errorf("initialize: %w", err)
 	}

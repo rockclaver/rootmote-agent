@@ -1,4 +1,4 @@
-module github.com/rockclaver/claver-agent
+module github.com/rockclaver/rootmote-agent
 
 go 1.25.0
 

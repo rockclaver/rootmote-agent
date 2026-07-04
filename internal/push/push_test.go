@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // fakeHTTP records requests and replies with a script of canned responses.

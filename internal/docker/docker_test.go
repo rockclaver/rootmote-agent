@@ -300,10 +300,10 @@ func TestContainerListMapsSummaryFieldsAndProjectAssociation(t *testing.T) {
 				"com.docker.compose.service": "api",
 			},
 			Mounts: []MountSummary{{
-				Source: "/var/lib/claver/claver/projects/proj_1/app",
+				Source: "/var/lib/rootmote/rootmote/projects/proj_1/app",
 			}},
 		}}},
-		ProjectRoot: "/var/lib/claver/claver/projects",
+		ProjectRoot: "/var/lib/rootmote/rootmote/projects",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +377,7 @@ func TestContainerDetailRedactsEnvironmentAndMapsInspectFields(t *testing.T) {
 			Ports:         []PortSummary{{PrivatePort: 80, PublicPort: 8080, Type: "tcp"}},
 			Mounts: []MountSummary{{
 				Type:        "bind",
-				Source:      "/var/lib/claver/claver/projects/proj_2/app",
+				Source:      "/var/lib/rootmote/rootmote/projects/proj_2/app",
 				Destination: "/app",
 			}},
 			Labels: map[string]string{
@@ -389,7 +389,7 @@ func TestContainerDetailRedactsEnvironmentAndMapsInspectFields(t *testing.T) {
 				{Key: "API_TOKEN", Value: "REDACTED", Redacted: true},
 			},
 		}},
-		ProjectRoot: "/var/lib/claver/claver/projects",
+		ProjectRoot: "/var/lib/rootmote/rootmote/projects",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -457,7 +457,7 @@ func TestRedactEnvRedactsAuthStyleKeys(t *testing.T) {
 	}
 }
 
-// AC issue #27: only the small set of known compose/claver labels is forwarded
+// AC issue #27: only the small set of known compose/rootmote labels is forwarded
 // to the client. Free-form labels — which operators sometimes use to stash
 // secrets — must be filtered out at the agent boundary so the UI never
 // receives them, regardless of what the Docker daemon returns.
@@ -988,7 +988,7 @@ func TestManagerPrune_DelegatesToClientAndSurfacesErrors(t *testing.T) {
 
 func startUnixDockerServer(t *testing.T, handler http.HandlerFunc) string {
 	t.Helper()
-	socketPath := fmt.Sprintf("/tmp/claver-docker-%d.sock", time.Now().UnixNano())
+	socketPath := fmt.Sprintf("/tmp/rootmote-docker-%d.sock", time.Now().UnixNano())
 	_ = os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {

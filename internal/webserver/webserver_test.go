@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 type fakeSystemd struct {

@@ -10,14 +10,14 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/aiproposal"
-	"github.com/rockclaver/claver-agent/internal/firewall"
-	"github.com/rockclaver/claver-agent/internal/infra"
-	agentprocess "github.com/rockclaver/claver-agent/internal/process"
-	"github.com/rockclaver/claver-agent/internal/review"
-	"github.com/rockclaver/claver-agent/internal/security"
-	"github.com/rockclaver/claver-agent/internal/store"
-	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
+	"github.com/rockclaver/rootmote-agent/internal/firewall"
+	"github.com/rockclaver/rootmote-agent/internal/infra"
+	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
+	"github.com/rockclaver/rootmote-agent/internal/review"
+	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 // proposalFromResp extracts the proposal object from a successful

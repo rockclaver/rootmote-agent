@@ -212,7 +212,7 @@ type CliToken struct {
 
 // ProjectMemory is one long-lived note the agent reuses across sessions for a
 // project: a convention, a gotcha, a decision, or a file-level note. Rows are
-// user-owned and rendered only by Claver. SourceSessionID, when set, records
+// user-owned and rendered only by Rootmote. SourceSessionID, when set, records
 // which AI session proposed the entry.
 type ProjectMemory struct {
 	ID              string
@@ -550,7 +550,7 @@ CREATE TABLE IF NOT EXISTS notification_prefs (
 		return err
 	}
 	// client_server_id is the mobile app's own identifier for the server this
-	// device connected to when it registered (DevDeck mints a client-side id
+	// device connected to when it registered (Rootmote mints a client-side id
 	// per configured server; the agent has no notion of it otherwise). Stored
 	// per-device so Hub.Forward can stamp the right value into deep_link
 	// payloads instead of the agent's internal "local" rule-bucket id, which

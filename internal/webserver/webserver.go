@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 type Kind string
@@ -103,7 +103,7 @@ func defaultPaths() map[Kind][]string {
 			"/etc/caddy/Caddyfile",
 			"/etc/caddy/*.caddy",
 			"/etc/caddy/conf.d/*.caddy",
-			"/etc/caddy/claver/*.caddy",
+			"/etc/caddy/rootmote/*.caddy",
 			"/opt/homebrew/etc/Caddyfile",
 			"/opt/homebrew/etc/caddy/Caddyfile",
 			"/opt/homebrew/etc/caddy/*.caddy",

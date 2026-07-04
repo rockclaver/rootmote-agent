@@ -1,10 +1,10 @@
 // Package push delivers agent-side notifications to registered mobile
-// devices via a central claver-notify relay.
+// devices via a central rootmote-notify relay.
 //
 // Earlier versions of this package spoke to Firebase Cloud Messaging's HTTP
 // v1 API directly, which meant every self-hosted agent had to provision its
 // own Firebase project and service-account key. That per-install setup cost
-// is gone: the relay (github.com/rockclaver/claver-notify) holds the one
+// is gone: the relay (github.com/rockclaver/rootmote-notify) holds the one
 // shared FCM service-account credential, and every agent authenticates to
 // it with a lightweight bearer token obtained via Register.
 //
@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/notifications"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // Message is the minimal message shape we hand to the relay. We include
@@ -53,7 +53,7 @@ func defaultHTTPClient(c HTTPDoer) HTTPDoer {
 	return &http.Client{Timeout: 15 * time.Second}
 }
 
-// Register calls a claver-notify deployment's enrollment endpoint and returns
+// Register calls a rootmote-notify deployment's enrollment endpoint and returns
 // a fresh bearer token for this installation. label is an optional
 // human-readable hint (e.g. hostname) the relay stores alongside the token so
 // an operator can identify it later; it need not be unique. enrollSecret, when
@@ -96,14 +96,14 @@ func Register(ctx context.Context, baseURL, label, enrollSecret string, httpClie
 	return out.Token, nil
 }
 
-// RelayClient sends messages through a central claver-notify relay instead
+// RelayClient sends messages through a central rootmote-notify relay instead
 // of talking to FCM directly. Construct with NewRelayClient. Safe for
 // concurrent use (it is stateless beyond its HTTP client).
 type RelayClient struct {
-	// BaseURL is the claver-notify deployment, e.g. "https://notify.example.com".
+	// BaseURL is the rootmote-notify deployment, e.g. "https://notify.example.com".
 	BaseURL string
 	// Token authenticates this agent installation to the relay. Obtain one
-	// via Register and persist it (see cmd/claver-agent).
+	// via Register and persist it (see cmd/rootmote-agent).
 	Token string
 	HTTP  HTTPDoer
 }

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 func newManager(t *testing.T) *Manager {
@@ -17,7 +17,7 @@ func newManager(t *testing.T) *Manager {
 		t.Skip("git not available in PATH")
 	}
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "claver.db"))
+	st, err := store.Open(filepath.Join(dir, "rootmote.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -27,14 +27,14 @@ func newManager(t *testing.T) *Manager {
 		t.Fatalf("new mgr: %v", err)
 	}
 	// Local git identity so commits in tests don't fail in clean CI envs.
-	t.Setenv("GIT_AUTHOR_NAME", "claver-test")
+	t.Setenv("GIT_AUTHOR_NAME", "rootmote-test")
 	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.invalid")
-	t.Setenv("GIT_COMMITTER_NAME", "claver-test")
+	t.Setenv("GIT_COMMITTER_NAME", "rootmote-test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.invalid")
 	return m
 }
 
-// AC: "Create-empty ... produces a workspace under ~/claver/projects/<id> with
+// AC: "Create-empty ... produces a workspace under ~/rootmote/projects/<id> with
 // correct ownership." (We assert the workspace directory exists at the
 // derived path under the manager's root and is owned by the calling user —
 // implicit on the file we just created.)
@@ -53,7 +53,7 @@ func TestCreateEmpty_ProducesWorkspaceAndRow(t *testing.T) {
 	}
 }
 
-// AC: "Import-clone flow produces a workspace under ~/claver/projects/<id>."
+// AC: "Import-clone flow produces a workspace under ~/rootmote/projects/<id>."
 // We seed a bare repo locally and clone from it via file:// to avoid network.
 func TestImport_ClonesIntoWorkspace(t *testing.T) {
 	m := newManager(t)
@@ -414,9 +414,9 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"LC_ALL=C",
-		"GIT_AUTHOR_NAME=claver-test",
+		"GIT_AUTHOR_NAME=rootmote-test",
 		"GIT_AUTHOR_EMAIL=test@example.invalid",
-		"GIT_COMMITTER_NAME=claver-test",
+		"GIT_COMMITTER_NAME=rootmote-test",
 		"GIT_COMMITTER_EMAIL=test@example.invalid",
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {

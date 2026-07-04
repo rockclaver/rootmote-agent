@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
 // warnRecorder captures structuredSink.warn calls so a test can assert a
