@@ -222,6 +222,33 @@ func TestSocketClientContainerAction_UsesActionDeadlineAndStrictStatus(t *testin
 	}
 }
 
+// AC: docker inspect's RestartCount surfaces on ContainerDetail so the crash-
+// loop monitor evaluator can detect repeated restarts.
+func TestSocketClientContainer_SurfacesRestartCount(t *testing.T) {
+	socket := startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/containers/abc123/json" {
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"Id": "abc123",
+			"Name": "/api-1",
+			"RestartCount": 4,
+			"Config": {"Image": "api:latest"},
+			"State": {"Status": "running"},
+			"HostConfig": {"RestartPolicy": {"Name": "always"}}
+		}`))
+	})
+	c := NewSocketClient(socket)
+	got, err := c.Container(context.Background(), "abc123")
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	if got.RestartCount != 4 {
+		t.Fatalf("RestartCount = %d, want 4", got.RestartCount)
+	}
+}
+
 // AC: missing Docker is distinguishable from a down daemon.
 func TestStatusMissingDocker(t *testing.T) {
 	m := newManager(t, fakeClient{err: errors.New("wrap: " + ErrNotInstalled.Error())})

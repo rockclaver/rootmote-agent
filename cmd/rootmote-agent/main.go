@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	gh "github.com/rockclaver/rootmote-agent/internal/github"
 	"github.com/rockclaver/rootmote-agent/internal/infra"
 	"github.com/rockclaver/rootmote-agent/internal/inventory"
+	"github.com/rockclaver/rootmote-agent/internal/monitor"
 	"github.com/rockclaver/rootmote-agent/internal/notifications"
 	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 	"github.com/rockclaver/rootmote-agent/internal/projects"
@@ -301,33 +303,69 @@ func main() {
 		log.Printf("rootmote-agent: init watchtower client: %v (watchtower disabled)", err)
 		wtClient = nil
 	}
+
+	// Watchtower Phase 2 local monitor engine (issue #78): the agent-side
+	// state machine that evaluates the disk/inode/memory/docker/systemd
+	// collectors and emits signed firing/resolved transitions to the relay.
+	// Constructed only when the watchtower client exists; started below on
+	// the same enrollment gate as the heartbeat loop.
+	var monMgr *monitor.Manager
+	if wtClient != nil {
+		monMgr, err = monitor.New(monitor.Config{
+			Infra:   infraMgr,
+			Docker:  dockerMgr,
+			Systemd: systemdMgr,
+			Store:   st,
+			Client:  wtClient,
+		})
+		if err != nil {
+			log.Printf("rootmote-agent: init monitor engine: %v (local monitors disabled)", err)
+			monMgr = nil
+		}
+	}
+	var monitorStartOnce sync.Once
+	startMonitorEngine := func() {
+		if monMgr == nil || wtClient == nil {
+			return
+		}
+		monitorStartOnce.Do(func() {
+			// Mirror watchtower.Client.EnsureRunning: these loops belong to
+			// the agent process, not to the WebSocket request that enabled
+			// Watchtower.
+			bg := context.Background()
+			monMgr.Start(bg)
+			go syncMonitorsLoop(bg, wtClient, monMgr)
+			log.Printf("rootmote-agent: watchtower monitor engine started")
+		})
+	}
 	srv := server.New(server.Config{
-		Addr:            *addr,
-		Projects:        mgr,
-		Sessions:        sessionMgr,
-		Skills:          skills.New(homeDirOr(*dataDir)),
-		Review:          reviewMgr,
-		GitHub:          githubMgr,
-		Tooling:         toolingMgr,
-		Auth:            authMgr,
-		Docker:          dockerMgr,
-		Infra:           infraMgr,
-		Systemd:         systemdMgr,
-		Webservers:      webserverMgr,
-		Processes:       processMgr,
-		Firewall:        firewallMgr,
-		Storage:         storageMgr,
-		Security:        securityMgr,
-		Alerts:          alertMgr,
-		AIProposals:     aiProposalMgr,
-		Notifications:   notificationHub,
-		Runbook:         runbookMgr,
-		Actions:         actionsMgr,
-		Inventory:       inventoryMgr,
-		PushDevices:     st,
-		Watchtower:      wtClient,
-		ControlPlaneKey: controlPlaneKey,
-		RequirePairing:  *requirePairing,
+		Addr:                *addr,
+		Projects:            mgr,
+		Sessions:            sessionMgr,
+		Skills:              skills.New(homeDirOr(*dataDir)),
+		Review:              reviewMgr,
+		GitHub:              githubMgr,
+		Tooling:             toolingMgr,
+		Auth:                authMgr,
+		Docker:              dockerMgr,
+		Infra:               infraMgr,
+		Systemd:             systemdMgr,
+		Webservers:          webserverMgr,
+		Processes:           processMgr,
+		Firewall:            firewallMgr,
+		Storage:             storageMgr,
+		Security:            securityMgr,
+		Alerts:              alertMgr,
+		AIProposals:         aiProposalMgr,
+		Notifications:       notificationHub,
+		Runbook:             runbookMgr,
+		Actions:             actionsMgr,
+		Inventory:           inventoryMgr,
+		PushDevices:         st,
+		Watchtower:          wtClient,
+		OnWatchtowerEnabled: startMonitorEngine,
+		ControlPlaneKey:     controlPlaneKey,
+		RequirePairing:      *requirePairing,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -355,6 +393,13 @@ func main() {
 	if wtClient != nil && (*watchtowerRelayURL != "" || wtClient.Creds() != nil) {
 		wtClient.EnsureRunning(0)
 		log.Printf("rootmote-agent: watchtower heartbeat loop started")
+	}
+
+	// Watchtower Phase 2 local monitor engine: start at boot for a resumed
+	// enrollment. First-time mobile enrollment invokes the same idempotent
+	// callback from watchtower.enable.
+	if *watchtowerRelayURL != "" || (wtClient != nil && wtClient.Creds() != nil) {
+		startMonitorEngine()
 	}
 
 	// Push delivery: optional. The agent stays fully functional without it
@@ -472,6 +517,33 @@ func loadOrCreateControlPlaneKey(dataDir string) (string, error) {
 		return "", err
 	}
 	return key, nil
+}
+
+// syncMonitorsLoop periodically pulls the relay-owned monitor definitions and
+// overlays them on the engine's built-in defaults, so mobile CRUD (create /
+// edit / disable) reaches the agent. It runs an immediate sync, then every
+// minute until ctx is done. A failed sync is logged and retried on the next
+// tick; the engine keeps evaluating whatever definitions it last had.
+func syncMonitorsLoop(ctx context.Context, wt *watchtower.Client, mon *monitor.Manager) {
+	sync := func() {
+		defs, err := wt.SyncMonitors(ctx)
+		if err != nil {
+			log.Printf("rootmote-agent: monitor sync: %v", err)
+			return
+		}
+		mon.SetSyncedDefinitions(monitor.DefinitionsFromSync(defs))
+	}
+	sync()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sync()
+		}
+	}
 }
 
 // printPairingKey implements `rootmote-agent pairing-key`: it prints the

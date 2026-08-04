@@ -58,6 +58,10 @@ type DiskMetric struct {
 	AvailableBytes uint64  `json:"available_bytes,omitempty"`
 	UsedBytes      uint64  `json:"used_bytes,omitempty"`
 	Percent        float64 `json:"percent,omitempty"`
+	InodesTotal    uint64  `json:"inodes_total,omitempty"`
+	InodesFree     uint64  `json:"inodes_free,omitempty"`
+	InodesUsed     uint64  `json:"inodes_used,omitempty"`
+	InodePercent   float64 `json:"inode_percent,omitempty"`
 	Available      bool    `json:"available"`
 	Reason         string  `json:"reason,omitempty"`
 	Message        string  `json:"message,omitempty"`
@@ -589,7 +593,29 @@ func (m *Manager) collectDisks(mounts []mount) []DiskMetric {
 		if total > 0 {
 			percent = float64(used) * 100 / float64(total)
 		}
-		out = append(out, DiskMetric{Mountpoint: row.path, Filesystem: row.fs, TotalBytes: total, AvailableBytes: avail, UsedBytes: used, Percent: percent, Available: true})
+		inodesTotal := uint64(st.Files)
+		inodesFree := uint64(st.Ffree)
+		inodesUsed := uint64(0)
+		inodePercent := 0.0
+		if inodesTotal > 0 {
+			if inodesFree <= inodesTotal {
+				inodesUsed = inodesTotal - inodesFree
+			}
+			inodePercent = float64(inodesUsed) * 100 / float64(inodesTotal)
+		}
+		out = append(out, DiskMetric{
+			Mountpoint:     row.path,
+			Filesystem:     row.fs,
+			TotalBytes:     total,
+			AvailableBytes: avail,
+			UsedBytes:      used,
+			Percent:        percent,
+			InodesTotal:    inodesTotal,
+			InodesFree:     inodesFree,
+			InodesUsed:     inodesUsed,
+			InodePercent:   inodePercent,
+			Available:      true,
+		})
 	}
 	return out
 }
@@ -739,6 +765,78 @@ func unavailableCPU(err error) CPUMetric {
 		msg = err.Error()
 	}
 	return CPUMetric{MetricReason: MetricReason{Available: false, Reason: ReasonUnavailable, Message: msg}}
+}
+
+var (
+	oomTimestampRe = regexp.MustCompile(`^\[([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\]`)
+	oomKilledRe    = regexp.MustCompile(`[Oo]ut of memory:.*Killed process (\d+)\s*\(([^)]+)\)`)
+	oomContainerRe = regexp.MustCompile(`(?:/docker/|docker-|cri-containerd-|libpod-)([a-f0-9]{12,64})`)
+)
+
+// OOMEvent is a single kernel out-of-memory kill, parsed from dmesg.
+type OOMEvent struct {
+	At          time.Time `json:"at"`
+	PID         int       `json:"pid,omitempty"`
+	Process     string    `json:"process,omitempty"`
+	ContainerID string    `json:"container_id,omitempty"`
+}
+
+// ParseOOMEvents is a pure parser for `dmesg -T` / kernel log output. It
+// recognizes both host-level ("Out of memory: Killed process ...") and
+// cgroup-scoped ("Memory cgroup out of memory: Killed process ...") kill
+// lines. A leading dmesg -T timestamp (e.g. "[Sat Aug  1 12:34:56 2026]")
+// sets the event time; lines without one use now. Non-matching lines are
+// ignored.
+func ParseOOMEvents(raw []byte, now time.Time) []OOMEvent {
+	var out []OOMEvent
+	lastContainerID := ""
+	sc := bufio.NewScanner(strings.NewReader(string(raw)))
+	for sc.Scan() {
+		line := sc.Text()
+		if container := oomContainerRe.FindStringSubmatch(line); container != nil {
+			lastContainerID = container[1]
+		}
+		match := oomKilledRe.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		pid, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		at := now
+		if ts := oomTimestampRe.FindStringSubmatch(line); ts != nil {
+			if parsed, err := time.Parse("Mon Jan _2 15:04:05 2006", ts[1]); err == nil {
+				at = parsed
+			}
+		}
+		out = append(out, OOMEvent{
+			At: at, PID: pid, Process: match[2], ContainerID: lastContainerID,
+		})
+		lastContainerID = ""
+	}
+	return out
+}
+
+// OOMEvents returns kernel OOM-killer events observed at or after since.
+// Linux reads them from `dmesg -T`; darwin has no equivalent kernel OOM log
+// and returns nil, nil.
+func (m *Manager) OOMEvents(ctx context.Context, since time.Time) ([]OOMEvent, error) {
+	if m.platform != "linux" {
+		return nil, nil
+	}
+	raw, err := m.command(ctx, "dmesg", "-T")
+	if err != nil {
+		return nil, err
+	}
+	events := ParseOOMEvents(raw, m.now())
+	out := make([]OOMEvent, 0, len(events))
+	for _, ev := range events {
+		if !ev.At.Before(since) {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
 }
 
 func unavailableNet(err error) NetworkMetric {

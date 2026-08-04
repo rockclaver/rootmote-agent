@@ -125,6 +125,10 @@ type Config struct {
 	// any) whether or not the agent is enrolled yet -- enrollment happens
 	// here, driven by the mobile app.
 	Watchtower *watchtower.Client
+	// OnWatchtowerEnabled starts Phase 2 monitor evaluation/sync after a
+	// successful first-time enrollment. It must be idempotent because both
+	// boot-time resume and repeated enable calls may invoke it.
+	OnWatchtowerEnabled func()
 	// ControlPlaneKey is the pairing secret the mobile app must present as an
 	// Authorization: Bearer header on the WebSocket upgrade. Generated and
 	// persisted by the agent; fetched by the app over the operator-
@@ -3968,6 +3972,9 @@ func (s *Server) dispatchWatchtower(ctx context.Context, c *websocket.Conn, writ
 		// on first call, independent of this WebSocket connection's lifetime --
 		// heartbeats must keep flowing after the mobile app disconnects.
 		s.cfg.Watchtower.EnsureRunning(0)
+		if s.cfg.OnWatchtowerEnabled != nil {
+			s.cfg.OnWatchtowerEnabled()
+		}
 		s.writeOK(ctx, c, writeMu, f.ID, "watchtower.enable", map[string]any{
 			"serverId": creds.ServerID, "agentId": creds.AgentID, "status": "protected",
 		})

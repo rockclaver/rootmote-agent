@@ -204,6 +204,7 @@ type ContainerDetail struct {
 	Ports           []PortSummary     `json:"ports,omitempty"`
 	Mounts          []MountSummary    `json:"mounts,omitempty"`
 	RestartPolicy   string            `json:"restart_policy,omitempty"`
+	RestartCount    int               `json:"restart_count,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
 	ComposeProject  string            `json:"compose_project,omitempty"`
 	ComposeService  string            `json:"compose_service,omitempty"`
@@ -771,9 +772,10 @@ func (c *SocketClient) Containers(ctx context.Context) ([]ContainerSummary, erro
 // Container calls GET /containers/{id}/json and redacts environment values.
 func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetail, error) {
 	var raw struct {
-		ID     string `json:"Id"`
-		Name   string `json:"Name"`
-		Config struct {
+		ID           string `json:"Id"`
+		Name         string `json:"Name"`
+		RestartCount int    `json:"RestartCount"`
+		Config       struct {
 			Image  string            `json:"Image"`
 			Cmd    []string          `json:"Cmd"`
 			Env    []string          `json:"Env"`
@@ -846,6 +848,7 @@ func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetai
 		Ports:           ports,
 		Mounts:          mounts,
 		RestartPolicy:   raw.HostConfig.RestartPolicy.Name,
+		RestartCount:    raw.RestartCount,
 		Labels:          composeLabels(raw.Config.Labels),
 		EnvironmentVars: redactEnv(raw.Config.Env),
 	}, nil

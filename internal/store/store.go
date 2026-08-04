@@ -272,6 +272,20 @@ type InfraCost struct {
 	FetchedAt   time.Time
 }
 
+// MonitorState is the persisted runtime state-machine node for one Phase 2
+// local monitor (issue #78), keyed by "<kind>:<target>" so an incident's true
+// FirstFailureAt survives an agent restart mid-episode instead of resetting
+// to the restart time.
+type MonitorState struct {
+	Key              string
+	State            string
+	ConsecutiveFail  int
+	ConsecutiveOK    int
+	FirstFailureAt   time.Time
+	LastTransitionAt time.Time
+	UpdatedAt        time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -521,11 +535,20 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 	PRIMARY KEY(job_id, seq),
 	FOREIGN KEY(job_id) REFERENCES action_jobs(id) ON DELETE CASCADE
 );
-
 CREATE TABLE IF NOT EXISTS notification_prefs (
 	type         TEXT PRIMARY KEY,
 	push_enabled INTEGER NOT NULL,
 	updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS monitor_states (
+	key                 TEXT PRIMARY KEY,
+	state               TEXT NOT NULL,
+	consecutive_fail    INTEGER NOT NULL DEFAULT 0,
+	consecutive_ok      INTEGER NOT NULL DEFAULT 0,
+	first_failure_at    INTEGER,
+	last_transition_at  INTEGER NOT NULL,
+	updated_at          INTEGER NOT NULL
 );
 `)
 	if err != nil {
@@ -836,6 +859,57 @@ func (s *Store) AlertAcks() (map[string]time.Time, error) {
 			return nil, err
 		}
 		out[key] = time.Unix(firedAt, 0)
+	}
+	return out, rows.Err()
+}
+
+// PutMonitorState upserts the runtime state-machine node for one Phase 2
+// local monitor (issue #78), keyed by MonitorState.Key ("<kind>:<target>").
+// FirstFailureAt is stored NULL when zero so a monitor that has never failed
+// doesn't fabricate an episode start time.
+func (s *Store) PutMonitorState(ms MonitorState) error {
+	var firstFailureAt *time.Time
+	if !ms.FirstFailureAt.IsZero() {
+		firstFailureAt = &ms.FirstFailureAt
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO monitor_states (key, state, consecutive_fail, consecutive_ok, first_failure_at, last_transition_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET
+		   state = excluded.state,
+		   consecutive_fail = excluded.consecutive_fail,
+		   consecutive_ok = excluded.consecutive_ok,
+		   first_failure_at = excluded.first_failure_at,
+		   last_transition_at = excluded.last_transition_at,
+		   updated_at = excluded.updated_at`,
+		ms.Key, ms.State, ms.ConsecutiveFail, ms.ConsecutiveOK, nullableUnix(firstFailureAt), ms.LastTransitionAt.Unix(), ms.UpdatedAt.Unix(),
+	)
+	return err
+}
+
+// ListMonitorStates returns every persisted monitor runtime state. The agent
+// loads this once at boot so an in-progress episode's FirstFailureAt survives
+// a restart instead of resetting to the restart time.
+func (s *Store) ListMonitorStates() ([]MonitorState, error) {
+	rows, err := s.db.Query(`SELECT key, state, consecutive_fail, consecutive_ok, first_failure_at, last_transition_at, updated_at FROM monitor_states`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MonitorState
+	for rows.Next() {
+		var ms MonitorState
+		var firstFailureAt sql.NullInt64
+		var lastTransitionAt, updatedAt int64
+		if err := rows.Scan(&ms.Key, &ms.State, &ms.ConsecutiveFail, &ms.ConsecutiveOK, &firstFailureAt, &lastTransitionAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		if firstFailureAt.Valid {
+			ms.FirstFailureAt = time.Unix(firstFailureAt.Int64, 0)
+		}
+		ms.LastTransitionAt = time.Unix(lastTransitionAt, 0)
+		ms.UpdatedAt = time.Unix(updatedAt, 0)
+		out = append(out, ms)
 	}
 	return out, rows.Err()
 }

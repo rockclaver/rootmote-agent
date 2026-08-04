@@ -266,3 +266,106 @@ func TestIssue41MetricsSubscribe_EmitsAndStopsOnCancel(t *testing.T) {
 		t.Fatal("subscribe did not stop after cancel")
 	}
 }
+
+func TestDiskMetric_InodeCapacityDerivedFromStatfs(t *testing.T) {
+	got := (&Manager{statFS: func(path string) (syscall.Statfs_t, error) {
+		return syscall.Statfs_t{Blocks: 100, Bavail: 25, Bsize: 4096, Files: 1000, Ffree: 250}, nil
+	}}).collectDisks([]mount{{fs: "ext4", path: "/"}})
+	if len(got) != 1 {
+		t.Fatalf("disks = %+v", got)
+	}
+	d := got[0]
+	if d.InodesTotal != 1000 || d.InodesFree != 250 || d.InodesUsed != 750 {
+		t.Fatalf("inodes = %+v", d)
+	}
+	if d.InodePercent != 75 {
+		t.Fatalf("inode percent = %v, want 75", d.InodePercent)
+	}
+}
+
+func TestDiskMetric_InodeCapacityZeroFilesGuard(t *testing.T) {
+	got := (&Manager{statFS: func(path string) (syscall.Statfs_t, error) {
+		return syscall.Statfs_t{Blocks: 100, Bavail: 25, Bsize: 4096, Files: 0, Ffree: 0}, nil
+	}}).collectDisks([]mount{{fs: "tmpfs", path: "/tmp"}})
+	if len(got) != 1 {
+		t.Fatalf("disks = %+v", got)
+	}
+	d := got[0]
+	if d.InodesTotal != 0 || d.InodesFree != 0 || d.InodesUsed != 0 || d.InodePercent != 0 {
+		t.Fatalf("expected zero inode stats when Files == 0, got %+v", d)
+	}
+	if !d.Available {
+		t.Fatalf("disk should remain available when inode fields are zero")
+	}
+}
+
+func TestParseOOMEvents_HostAndCgroupKillsWithTimestamps(t *testing.T) {
+	now := time.Unix(500, 0).UTC()
+	raw := []byte(strings.Join([]string{
+		"[Sat Aug  1 12:34:56 2026] Out of memory: Killed process 1234 (postgres) total-vm:1000kB",
+		"not an oom line, should be ignored",
+		"[Sat Aug  1 12:35:09 2026] oom-kill:task_memcg=/docker/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"[Sat Aug  1 12:35:10 2026] Memory cgroup out of memory: Killed process 5678 (node) score 900",
+		"garbage garbage garbage",
+	}, "\n"))
+	got := ParseOOMEvents(raw, now)
+	if len(got) != 2 {
+		t.Fatalf("events = %+v, want 2", got)
+	}
+	wantFirst := time.Date(2026, time.August, 1, 12, 34, 56, 0, time.UTC)
+	if !got[0].At.Equal(wantFirst) || got[0].PID != 1234 || got[0].Process != "postgres" {
+		t.Fatalf("event[0] = %+v", got[0])
+	}
+	wantSecond := time.Date(2026, time.August, 1, 12, 35, 10, 0, time.UTC)
+	if !got[1].At.Equal(wantSecond) || got[1].PID != 5678 || got[1].Process != "node" ||
+		got[1].ContainerID != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("event[1] = %+v", got[1])
+	}
+}
+
+func TestParseOOMEvents_NoTimestampFallsBackToNow(t *testing.T) {
+	now := time.Unix(999, 0)
+	got := ParseOOMEvents([]byte("Out of memory: Killed process 42 (worker)\n"), now)
+	if len(got) != 1 {
+		t.Fatalf("events = %+v, want 1", got)
+	}
+	if !got[0].At.Equal(now) || got[0].PID != 42 || got[0].Process != "worker" {
+		t.Fatalf("event = %+v", got[0])
+	}
+}
+
+func TestManagerOOMEvents_UsesDmesgAndFiltersBySince(t *testing.T) {
+	now := time.Unix(2000, 0)
+	cmds := fakeCommand{
+		"dmesg -T": []byte(strings.Join([]string{
+			"[Sat Aug  1 10:00:00 2026] Out of memory: Killed process 1 (old)",
+			"[Sat Aug  1 12:00:00 2026] Out of memory: Killed process 2 (recent)",
+		}, "\n")),
+	}
+	mgr, err := New(Config{Platform: "linux", Command: cmds.run, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, time.August, 1, 11, 0, 0, 0, time.UTC)
+	got, err := mgr.OOMEvents(context.Background(), since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PID != 2 || got[0].Process != "recent" {
+		t.Fatalf("OOMEvents = %+v, want only the recent kill", got)
+	}
+}
+
+func TestManagerOOMEvents_DarwinReturnsNil(t *testing.T) {
+	mgr, err := New(Config{Platform: "darwin", Command: func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("darwin OOMEvents must not shell out")
+		return nil, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr.OOMEvents(context.Background(), time.Time{})
+	if err != nil || got != nil {
+		t.Fatalf("darwin OOMEvents = (%+v, %v), want (nil, nil)", got, err)
+	}
+}

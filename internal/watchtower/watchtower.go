@@ -135,6 +135,11 @@ type Client struct {
 	mu      sync.Mutex
 	creds   *Creds
 	runOnce sync.Once
+	// queueMu serializes EnqueueMonitorEvent/FlushQueue access to the
+	// offline monitor-event queue file, kept separate from mu (which
+	// guards creds/seq) so a slow SendMonitorEvents call inside
+	// FlushQueue never blocks an unrelated Heartbeat tick.
+	queueMu sync.Mutex
 }
 
 // NewClient constructs a Client, loading any existing credential file from
@@ -387,6 +392,13 @@ func (c *Client) Run(ctx context.Context, interval time.Duration) {
 			}
 			if err := c.Heartbeat(ctx); err != nil {
 				c.log("heartbeat failed: %v", err)
+				continue
+			}
+			// A successful heartbeat proves the relay is reachable again.
+			// Drain transitions queued while offline even when no new
+			// monitor transition occurs after reconnect.
+			if err := c.FlushQueue(ctx); err != nil {
+				c.log("monitor queue flush failed: %v", err)
 			}
 		}
 	}

@@ -26,11 +26,15 @@ func TestWatchtowerEnable_EnrollsAndStartsLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	started := 0
 
 	payload, _ := json.Marshal(map[string]string{
 		"relayUrl": relay.URL, "enrollmentCode": "code-1",
 	})
-	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Watchtower: wt}, "watchtower.enable", payload)
+	resp := dockerRoundTripConfig(t, Config{
+		Addr: "127.0.0.1:0", Watchtower: wt,
+		OnWatchtowerEnabled: func() { started++ },
+	}, "watchtower.enable", payload)
 	if resp.Kind != "watchtower.enable" {
 		t.Fatalf("kind = %q, payload = %s", resp.Kind, resp.Payload)
 	}
@@ -48,6 +52,9 @@ func TestWatchtowerEnable_EnrollsAndStartsLoop(t *testing.T) {
 
 	if got := wt.Creds(); got == nil || got.AgentID != "agt_ws" {
 		t.Fatalf("client not enrolled after watchtower.enable: %+v", got)
+	}
+	if started != 1 {
+		t.Fatalf("OnWatchtowerEnabled calls = %d, want 1", started)
 	}
 }
 
