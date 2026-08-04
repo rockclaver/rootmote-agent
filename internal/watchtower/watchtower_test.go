@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -171,13 +172,13 @@ func TestClientOpensNoListener(t *testing.T) {
 // Enroll succeeds concurrently.
 func TestRun_UnenrolledIsNonFatal(t *testing.T) {
 	dir := t.TempDir()
-	var hits int
+	var hits atomic.Int32
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/agents/register":
 			_ = json.NewEncoder(w).Encode(registerResponse{AgentID: "agt_x", ServerID: "srv_x", Secret: "cc"})
 		case "/v1/agents/heartbeat":
-			hits++
+			hits.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -201,8 +202,8 @@ func TestRun_UnenrolledIsNonFatal(t *testing.T) {
 
 	// Give Run a couple of unenrolled ticks first.
 	time.Sleep(30 * time.Millisecond)
-	if hits != 0 {
-		t.Fatalf("hits = %d before enroll, want 0", hits)
+	if hits.Load() != 0 {
+		t.Fatalf("hits = %d before enroll, want 0", hits.Load())
 	}
 
 	if _, err := c.Enroll(context.Background(), relay.URL, "code"); err != nil {
@@ -210,7 +211,7 @@ func TestRun_UnenrolledIsNonFatal(t *testing.T) {
 	}
 
 	deadline := time.After(2 * time.Second)
-	for hits == 0 {
+	for hits.Load() == 0 {
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for a heartbeat after enrollment")
