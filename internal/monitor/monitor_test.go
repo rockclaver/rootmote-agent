@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -39,10 +40,14 @@ func (f *fakeStateStore) ListMonitorStates() ([]store.MonitorState, error) {
 // fakeSender records enqueued events; FlushQueue is a no-op (the real
 // offline-queue behavior is covered in the watchtower package's AC8 tests).
 type fakeSender struct {
-	events []watchtower.MonitorEvent
+	events     []watchtower.MonitorEvent
+	enqueueErr error
 }
 
 func (f *fakeSender) EnqueueMonitorEvent(ev watchtower.MonitorEvent) error {
+	if f.enqueueErr != nil {
+		return f.enqueueErr
+	}
 	f.events = append(f.events, ev)
 	return nil
 }
@@ -215,6 +220,29 @@ func TestStateMachine_CooldownSuppressesImmediateRefire(t *testing.T) {
 	h.tick()
 	if got := h.sender.countTo("firing"); got != 2 {
 		t.Fatalf("firing events after cooldown = %d, want 2", got)
+	}
+}
+
+func TestStateMachine_EnqueueFailureDoesNotCommitFiring(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.infra.metrics = diskSample(95)
+	h.tick()
+	h.tick()
+	h.sender.enqueueErr = errors.New("disk full")
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 0 {
+		t.Fatalf("firing events after enqueue failure = %d, want 0", got)
+	}
+	if state := State(h.m.states[key(KindDiskCapacity, "/")].State); state != StatePending {
+		t.Fatalf("state after enqueue failure = %s, want pending", state)
+	}
+	h.sender.enqueueErr = nil
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing events after enqueue recovery = %d, want 1", got)
+	}
+	if h.sender.events[0].EventID == "" {
+		t.Fatal("firing event has no stable event id")
 	}
 }
 
@@ -399,6 +427,9 @@ func TestSyncedDisable_StopsEvaluation(t *testing.T) {
 		Kind: KindDiskCapacity, Target: "/", Enabled: false, Severity: "critical",
 		FailureThreshold: 3, RecoveryThreshold: 3, CooldownSeconds: 300, FiringThreshold: 90, RecoveryValue: 85,
 	}})
+	if state := State(h.m.states[key(KindDiskCapacity, "/")].State); state != StateMuted {
+		t.Fatalf("state after disable = %s, want muted", state)
+	}
 	h.infra.metrics = diskSample(99) // would fire if enabled
 	for range 5 {
 		h.tick()

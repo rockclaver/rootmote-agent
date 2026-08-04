@@ -19,6 +19,7 @@ import (
 type MonitorEvent struct {
 	// MonitorID is the relay's monitor id when known to the agent, else "":
 	// the relay resolves the row by (agentId's server, kind, target).
+	EventID        string
 	MonitorID      string
 	MonitorKind    string
 	Target         string
@@ -35,6 +36,7 @@ type MonitorEvent struct {
 // monitor_events payload -- times as RFC3339 strings, matching the wire
 // contract byte-for-byte.
 type monitorEventWire struct {
+	EventID        string            `json:"eventId"`
 	MonitorID      string            `json:"monitorId"`
 	MonitorKind    string            `json:"monitorKind"`
 	Target         string            `json:"target"`
@@ -49,6 +51,7 @@ type monitorEventWire struct {
 
 func toMonitorEventWire(e MonitorEvent) monitorEventWire {
 	return monitorEventWire{
+		EventID:        e.EventID,
 		MonitorID:      e.MonitorID,
 		MonitorKind:    e.MonitorKind,
 		Target:         e.Target,
@@ -73,6 +76,7 @@ func fromMonitorEventWire(w monitorEventWire) (MonitorEvent, error) {
 	}
 	return MonitorEvent{
 		MonitorID:      w.MonitorID,
+		EventID:        w.EventID,
 		MonitorKind:    w.MonitorKind,
 		Target:         w.Target,
 		FromState:      w.FromState,

@@ -61,8 +61,8 @@ func TestEnqueueFlush_SurvivesDoerErrorsPreservesFirstFailureAt(t *testing.T) {
 	// A firing/resolved pair for one monitor is bounded to two events on
 	// flush so the relay can reconstruct the incident and its recovery.
 	events := []MonitorEvent{
-		{MonitorKind: "disk_capacity", Target: "/", FromState: "pending", ToState: "firing", Severity: "critical", FirstFailureAt: firstFailure, OccurredAt: fixedNow.Add(-9 * time.Minute), Summary: "disk / at 92%"},
-		{MonitorKind: "disk_capacity", Target: "/", FromState: "recovering", ToState: "resolved", Severity: "critical", FirstFailureAt: earlierFirstFailure, OccurredAt: fixedNow, Summary: "disk / recovered"},
+		{EventID: "mevt_fire", MonitorKind: "disk_capacity", Target: "/", FromState: "pending", ToState: "firing", Severity: "critical", FirstFailureAt: firstFailure, OccurredAt: fixedNow.Add(-9 * time.Minute), Summary: "disk / at 92%"},
+		{EventID: "mevt_resolve", MonitorKind: "disk_capacity", Target: "/", FromState: "recovering", ToState: "resolved", Severity: "critical", FirstFailureAt: earlierFirstFailure, OccurredAt: fixedNow, Summary: "disk / recovered"},
 	}
 	for _, ev := range events {
 		if err := c.EnqueueMonitorEvent(ev); err != nil {
@@ -101,8 +101,8 @@ func TestEnqueueFlush_SurvivesDoerErrorsPreservesFirstFailureAt(t *testing.T) {
 	if err := json.Unmarshal(doer.sentPayload, &sent); err != nil {
 		t.Fatalf("decode sent payload: %v", err)
 	}
-	if len(sent.Events) != 2 {
-		t.Fatalf("condensed batch has %d events, want firing + resolved", len(sent.Events))
+	if len(sent.Events) != 2 || sent.Events[0].EventID != "mevt_fire" || sent.Events[1].EventID != "mevt_resolve" {
+		t.Fatalf("condensed batch = %+v, want stable-id firing + resolved", sent.Events)
 	}
 	if sent.Events[0].FromState != "pending" || sent.Events[0].ToState != "firing" {
 		t.Fatalf("first transition = %s->%s, want pending->firing", sent.Events[0].FromState, sent.Events[0].ToState)
@@ -207,9 +207,9 @@ func TestSendMonitorEvents_BuildsCorrectlySignedEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.creds, _ = LoadCreds(dir)
-
 	ev := MonitorEvent{
-		MonitorKind: "docker_container", Target: "web", FromState: "pending", ToState: "firing",
+		EventID: "mevt_123", MonitorKind: "docker_container", Target: "web",
+		FromState: "pending", ToState: "firing",
 		Severity: "critical", FirstFailureAt: fixedNow.Add(-time.Minute), OccurredAt: fixedNow,
 		Summary: "web is exited", Attributes: map[string]string{"state": "exited"},
 	}
@@ -234,8 +234,9 @@ func TestSendMonitorEvents_BuildsCorrectlySignedEnvelope(t *testing.T) {
 	if payload.Kind != "monitor_events" {
 		t.Fatalf("payload.Kind = %q, want monitor_events", payload.Kind)
 	}
-	if len(payload.Events) != 1 || payload.Events[0].MonitorKind != "docker_container" || payload.Events[0].Target != "web" {
-		t.Fatalf("payload.Events = %+v, want one docker_container/web event", payload.Events)
+	if len(payload.Events) != 1 || payload.Events[0].EventID != "mevt_123" ||
+		payload.Events[0].MonitorKind != "docker_container" || payload.Events[0].Target != "web" {
+		t.Fatalf("payload.Events = %+v, want stable-id docker_container/web event", payload.Events)
 	}
 
 	wantHash := PayloadHash(env.Payload)

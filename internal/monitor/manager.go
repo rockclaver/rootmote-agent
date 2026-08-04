@@ -2,8 +2,11 @@ package monitor
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,13 +118,44 @@ func New(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// SetSyncedDefinitions overlays the relay's monitor definitions (translated
-// from watchtower.Client.SyncMonitors's []watchtower.MonitorDef by the
-// caller) on top of the built-in defaults. Call periodically; a synced
-// definition with Enabled=false stops evaluation of that (kind,target) on
-// the very next tick.
+// SetSyncedDefinitions overlays the relay's monitor definitions and records
+// disabled runtime nodes as muted immediately. Evaluators intentionally
+// produce no observations for disabled definitions, so waiting for the next
+// tick would otherwise leave their persisted state stuck at firing.
 func (m *Manager) SetSyncedDefinitions(defs []Definition) {
 	m.defs.SetSynced(defs)
+	now := m.now()
+	var updates []store.MonitorState
+
+	m.mu.Lock()
+	for _, def := range defs {
+		if def.Enabled {
+			continue
+		}
+		prefix := string(def.Kind) + ":"
+		if def.Target != wildcardTarget {
+			k := key(def.Kind, def.Target)
+			rt := store.MonitorState{Key: k, State: string(StateMuted), LastTransitionAt: now, UpdatedAt: now}
+			m.states[k] = rt
+			updates = append(updates, rt)
+			continue
+		}
+		for k := range m.states {
+			if !strings.HasPrefix(k, prefix) {
+				continue
+			}
+			rt := store.MonitorState{Key: k, State: string(StateMuted), LastTransitionAt: now, UpdatedAt: now}
+			m.states[k] = rt
+			updates = append(updates, rt)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, rt := range updates {
+		if err := m.store.PutMonitorState(rt); err != nil {
+			m.logf("monitor: persist muted state %s: %v", rt.Key, err)
+		}
+	}
 }
 
 // DefinitionsFromSync translates the relay's agent-facing monitor DTOs
@@ -225,32 +259,52 @@ func (m *Manager) process(ctx context.Context, kind Kind, obs Observation) {
 
 	newRt, tr := stepState(rt, obs.Failing, now, def)
 	newRt.UpdatedAt = now
-	m.states[k] = newRt
 	m.mu.Unlock()
 
+	if tr != nil {
+		eventID, err := newMonitorEventID()
+		if err != nil {
+			m.logf("monitor: mint event id %s: %v", k, err)
+			return
+		}
+		event := watchtower.MonitorEvent{
+			EventID:        eventID,
+			MonitorKind:    string(kind),
+			Target:         obs.Target,
+			FromState:      string(tr.from),
+			ToState:        string(tr.to),
+			Severity:       def.Severity,
+			FirstFailureAt: newRt.FirstFailureAt,
+			OccurredAt:     now,
+			Summary:        obs.Summary,
+			Attributes:     obs.Attributes,
+		}
+		// Queue first. If the process dies after this point, the transition
+		// can be replayed; persisting firing first could lose the only page.
+		if err := m.client.EnqueueMonitorEvent(event); err != nil {
+			m.logf("monitor: enqueue event %s: %v", k, err)
+			return
+		}
+	}
+
+	m.mu.Lock()
+	m.states[k] = newRt
+	m.mu.Unlock()
 	if err := m.store.PutMonitorState(newRt); err != nil {
 		m.logf("monitor: persist state %s: %v", k, err)
 	}
 	if tr == nil {
 		return
 	}
-
-	event := watchtower.MonitorEvent{
-		MonitorKind:    string(kind),
-		Target:         obs.Target,
-		FromState:      string(tr.from),
-		ToState:        string(tr.to),
-		Severity:       def.Severity,
-		FirstFailureAt: newRt.FirstFailureAt,
-		OccurredAt:     now,
-		Summary:        obs.Summary,
-		Attributes:     obs.Attributes,
-	}
-	if err := m.client.EnqueueMonitorEvent(event); err != nil {
-		m.logf("monitor: enqueue event %s: %v", k, err)
-		return
-	}
 	if err := m.client.FlushQueue(ctx); err != nil {
 		m.logf("monitor: flush queue after %s: %v", k, err)
 	}
+}
+
+func newMonitorEventID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "mevt_" + hex.EncodeToString(raw[:]), nil
 }
