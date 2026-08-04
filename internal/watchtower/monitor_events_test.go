@@ -126,6 +126,46 @@ func TestEnqueueFlush_SurvivesDoerErrorsPreservesFirstFailureAt(t *testing.T) {
 	}
 }
 
+func TestFlushQueue_MigratesLegacyMissingEventIDBeforeSend(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	doer := &erroringThenOKDoer{failUntil: 1}
+	c := &Client{DataDir: dir, AgentVersion: "1.2.3", HTTP: doer, Now: func() time.Time { return now }}
+	if err := saveCreds(dir, &Creds{RelayURL: "http://relay.example", AgentID: "agt_legacy", ServerID: "srv_legacy", Secret: "abcdef00"}); err != nil {
+		t.Fatal(err)
+	}
+	c.creds, _ = LoadCreds(dir)
+	if err := saveMonitorQueue(dir, []MonitorEvent{{
+		MonitorKind: "disk_capacity", Target: "/", FromState: "pending", ToState: "firing",
+		FirstFailureAt: now.Add(-time.Minute), OccurredAt: now,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.FlushQueue(context.Background()); err == nil {
+		t.Fatal("first flush unexpectedly succeeded")
+	}
+	queued, err := loadMonitorQueue(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 || queued[0].EventID == "" {
+		t.Fatalf("legacy queue was not durably assigned an event id: %+v", queued)
+	}
+	migratedID := queued[0].EventID
+
+	if err := c.FlushQueue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var sent monitorEventsPayload
+	if err := json.Unmarshal(doer.sentPayload, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent.Events) != 1 || sent.Events[0].EventID != migratedID {
+		t.Fatalf("sent legacy event id = %+v, want %q", sent.Events, migratedID)
+	}
+}
+
 // reconnectDoer fails the first heartbeat, accepts the next one, then
 // signals when Run automatically flushes the queued monitor batch.
 type reconnectDoer struct {

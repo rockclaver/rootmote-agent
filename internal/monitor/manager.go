@@ -2,8 +2,6 @@ package monitor
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"log"
 	"strings"
@@ -262,7 +260,7 @@ func (m *Manager) process(ctx context.Context, kind Kind, obs Observation) {
 	m.mu.Unlock()
 
 	if tr != nil {
-		eventID, err := newMonitorEventID()
+		eventID, err := watchtower.NewMonitorEventID()
 		if err != nil {
 			m.logf("monitor: mint event id %s: %v", k, err)
 			return
@@ -299,12 +297,4 @@ func (m *Manager) process(ctx context.Context, kind Kind, obs Observation) {
 	if err := m.client.FlushQueue(ctx); err != nil {
 		m.logf("monitor: flush queue after %s: %v", k, err)
 	}
-}
-
-func newMonitorEventID() (string, error) {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
-	}
-	return "mevt_" + hex.EncodeToString(raw[:]), nil
 }

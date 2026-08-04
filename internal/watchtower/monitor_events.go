@@ -3,6 +3,8 @@ package watchtower
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +32,16 @@ type MonitorEvent struct {
 	OccurredAt     time.Time
 	Summary        string
 	Attributes     map[string]string
+}
+
+// NewMonitorEventID mints the stable id persisted with a queued transition.
+// The same id is reused across envelope retries, allowing relay idempotency.
+func NewMonitorEventID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "mevt_" + hex.EncodeToString(raw[:]), nil
 }
 
 // monitorEventWire is the exact JSON shape one event takes inside the
@@ -245,7 +257,26 @@ func (c *Client) EnqueueMonitorEvent(ev MonitorEvent) error {
 		return err
 	}
 	events = append(events, ev)
+	if _, err := ensureMonitorEventIDs(events); err != nil {
+		return err
+	}
 	return saveMonitorQueue(c.DataDir, events)
+}
+
+func ensureMonitorEventIDs(events []MonitorEvent) (bool, error) {
+	changed := false
+	for i := range events {
+		if events[i].EventID != "" {
+			continue
+		}
+		id, err := NewMonitorEventID()
+		if err != nil {
+			return false, err
+		}
+		events[i].EventID = id
+		changed = true
+	}
+	return changed, nil
 }
 
 func monitorEventKey(e MonitorEvent) string { return e.MonitorKind + ":" + e.Target }
@@ -328,6 +359,17 @@ func (c *Client) FlushQueue(ctx context.Context) error {
 	if n == 0 {
 		c.queueMu.Unlock()
 		return nil
+	}
+	if changed, err := ensureMonitorEventIDs(events); err != nil {
+		c.queueMu.Unlock()
+		return err
+	} else if changed {
+		// Persist migration before sending. A lost response must retry with
+		// the same IDs rather than recreate incidents.
+		if err := saveMonitorQueue(c.DataDir, events); err != nil {
+			c.queueMu.Unlock()
+			return err
+		}
 	}
 	condensed := condenseMonitorEvents(events)
 	c.queueMu.Unlock()
