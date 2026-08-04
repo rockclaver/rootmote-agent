@@ -42,6 +42,7 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
 	"github.com/rockclaver/rootmote-agent/internal/tooling"
 	"github.com/rockclaver/rootmote-agent/internal/version"
+	"github.com/rockclaver/rootmote-agent/internal/watchtower"
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
 
@@ -117,6 +118,13 @@ type Config struct {
 	// PushDevices, when non-nil, enables push.register / push.unregister
 	// for FCM device-token management.
 	PushDevices *store.Store
+	// Watchtower, when non-nil, enables watchtower.enable / watchtower.status
+	// (Watchtower Phase 1 cloud spine tracer: enroll this agent against a
+	// relay and report enrollment state). The client already exists
+	// (constructed in cmd/rootmote-agent from the persisted cred file, if
+	// any) whether or not the agent is enrolled yet -- enrollment happens
+	// here, driven by the mobile app.
+	Watchtower *watchtower.Client
 	// ControlPlaneKey is the pairing secret the mobile app must present as an
 	// Authorization: Bearer header on the WebSocket upgrade. Generated and
 	// persisted by the agent; fetched by the app over the operator-
@@ -546,6 +554,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "push.register", "push.unregister", "push.list",
 		"notifications.prefs.list", "notifications.prefs.set":
 		s.dispatchPush(ctx, c, writeMu, f)
+	case "watchtower.enable", "watchtower.status":
+		s.dispatchWatchtower(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -3925,6 +3935,55 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "notifications.prefs.set", map[string]any{"ok": true})
+	}
+}
+
+// dispatchWatchtower owns the Watchtower Phase 1 cloud spine tracer:
+// enrolling this agent against a relay (mobile-driven, using the
+// enrollmentCode minted when the user added the server) and reporting
+// enrollment state back to the app. No confirmation-token gate: enabling
+// Watchtower only starts an outbound heartbeat loop, mirroring the
+// ungated push.register write it sits next to.
+func (s *Server) dispatchWatchtower(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Watchtower == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "watchtower not configured")
+		return
+	}
+	switch f.Kind {
+	case "watchtower.enable":
+		var in struct {
+			RelayURL       string `json:"relayUrl"`
+			EnrollmentCode string `json:"enrollmentCode"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.RelayURL == "" || in.EnrollmentCode == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "relayUrl and enrollmentCode required")
+			return
+		}
+		creds, err := s.cfg.Watchtower.Enroll(ctx, in.RelayURL, in.EnrollmentCode)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "watchtower_error", err.Error())
+			return
+		}
+		// EnsureRunning starts the heartbeat loop against context.Background()
+		// on first call, independent of this WebSocket connection's lifetime --
+		// heartbeats must keep flowing after the mobile app disconnects.
+		s.cfg.Watchtower.EnsureRunning(0)
+		s.writeOK(ctx, c, writeMu, f.ID, "watchtower.enable", map[string]any{
+			"serverId": creds.ServerID, "agentId": creds.AgentID, "status": "protected",
+		})
+	case "watchtower.status":
+		creds := s.cfg.Watchtower.Creds()
+		if creds == nil {
+			s.writeOK(ctx, c, writeMu, f.ID, "watchtower.status", map[string]any{"enrolled": false})
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "watchtower.status", map[string]any{
+			"enrolled": true,
+			"relayUrl": creds.RelayURL,
+			"serverId": creds.ServerID,
+			"agentId":  creds.AgentID,
+			"status":   "protected",
+		})
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
 	"github.com/rockclaver/rootmote-agent/internal/tooling"
 	"github.com/rockclaver/rootmote-agent/internal/version"
+	"github.com/rockclaver/rootmote-agent/internal/watchtower"
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
 
@@ -58,6 +59,7 @@ func main() {
 	notifyRelayURL := flag.String("notify-relay-url", envOr("ROOTMOTE_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central rootmote-notify relay; set to empty to disable push")
 	notifyToken := flag.String("notify-token", envOr("ROOTMOTE_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
 	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("ROOTMOTE_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
+	watchtowerRelayURL := flag.String("watchtower-relay-url", envOr("ROOTMOTE_WATCHTOWER_RELAY_URL", ""), "base URL of the Watchtower relay (github.com/rockclaver/rootmote-watchtower); starts the outbound heartbeat loop at boot. Leave empty to stay opt-out until enrolled via the watchtower.enable control-plane kind (also auto-resumes at boot if a prior enrollment's cred file exists)")
 	runbookAgent := flag.String("runbook-agent", envOr("ROOTMOTE_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
 	codexRuntimeKind := flag.String("codex-runtime", envOr("ROOTMOTE_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
 	serverID := flag.String("server-id", envOr("ROOTMOTE_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
@@ -287,6 +289,18 @@ func main() {
 		Auth:           authMgr,
 	})
 
+	// Watchtower Phase 1 tracer (issue #79): a pure outbound heartbeat
+	// client. Constructed unconditionally (from any prior enrollment's cred
+	// file, if present) so the watchtower.enable control-plane kind can
+	// enroll it on demand even when the agent boots with no relay
+	// pre-configured. Non-fatal: a failure to even load the cred file
+	// (e.g. permission issue) disables the watchtower.* kinds rather than
+	// blocking agent startup.
+	wtClient, err := watchtower.NewClient(*dataDir, version.Version, nil)
+	if err != nil {
+		log.Printf("rootmote-agent: init watchtower client: %v (watchtower disabled)", err)
+		wtClient = nil
+	}
 	srv := server.New(server.Config{
 		Addr:            *addr,
 		Projects:        mgr,
@@ -311,6 +325,7 @@ func main() {
 		Actions:         actionsMgr,
 		Inventory:       inventoryMgr,
 		PushDevices:     st,
+		Watchtower:      wtClient,
 		ControlPlaneKey: controlPlaneKey,
 		RequirePairing:  *requirePairing,
 	})
@@ -329,6 +344,18 @@ func main() {
 	alertMgr.Start(ctx)
 	runbookCleanup := runbookMgr.Start(ctx)
 	defer runbookCleanup()
+
+	// Watchtower heartbeat loop: opt-in. Starts at boot when either a relay
+	// URL is pre-configured (--watchtower-relay-url / ROOTMOTE_WATCHTOWER_RELAY_URL)
+	// or a prior enrollment's cred file already exists (resuming after a
+	// restart). Otherwise the loop starts lazily the first time the mobile
+	// app calls the watchtower.enable control-plane kind. Either way, at
+	// most one loop ever runs (EnsureRunning is idempotent) and unenrolled
+	// ticks are a non-fatal no-op.
+	if wtClient != nil && (*watchtowerRelayURL != "" || wtClient.Creds() != nil) {
+		wtClient.EnsureRunning(0)
+		log.Printf("rootmote-agent: watchtower heartbeat loop started")
+	}
 
 	// Push delivery: optional. The agent stays fully functional without it
 	// (the notification hub + inbox keep delivering to connected sockets).
