@@ -230,7 +230,7 @@ func (m *Manager) propose(ctx context.Context, executionID, incidentID string, r
 		// exactly what content was proposed" -- the diagnosis it was derived
 		// from, the AI output version that produced it, and the content hash
 		// any later approval is bound to.
-		if err := m.appendAudit(exec, "remediation.proposed", map[string]any{
+		proposed := map[string]any{
 			"risk":             string(rb.Risk),
 			"blocked":          rb.Blocked,
 			"steps":            len(rb.Steps),
@@ -238,11 +238,23 @@ func (m *Manager) propose(ctx context.Context, executionID, incidentID string, r
 			"provider_version": rb.ProviderVersion,
 			"content_hash":     hash,
 			"schema_version":   rb.SchemaVersion,
-		}); err != nil {
+		}
+		if err := m.appendAudit(exec, "remediation.proposed", proposed); err != nil {
+			return store.RemediationExecution{}, err
+		}
+		// ...and the relay needs the same facts to build its redacted
+		// runbook projection: without a projected runbook_proposed it has
+		// no record of what was approved, so Watchtower can never attribute
+		// a recovery to a Rootmote runbook.
+		if _, err := m.appendEvent(ctx, executionID, "runbook_proposed", proposed); err != nil {
 			return store.RemediationExecution{}, err
 		}
 		if rb.Blocked {
-			if err := m.appendAudit(exec, "remediation.blocked_l3", map[string]any{"reason": rb.BlockedReason}); err != nil {
+			blocked := map[string]any{"reason": rb.BlockedReason, "risk": string(rb.Risk)}
+			if err := m.appendAudit(exec, "remediation.blocked_l3", blocked); err != nil {
+				return store.RemediationExecution{}, err
+			}
+			if _, err := m.appendEvent(ctx, executionID, "runbook_blocked", blocked); err != nil {
 				return store.RemediationExecution{}, err
 			}
 		}
@@ -282,7 +294,11 @@ func (m *Manager) Approve(ctx context.Context, executionID, requestedHash, token
 	}
 	exec.Status = store.RemediationApproved
 	exec.UpdatedAt = now
-	if err := m.appendAudit(exec, "remediation.approved", map[string]any{"token_id": tokenID}); err != nil {
+	approved := map[string]any{"token_id": tokenID}
+	if err := m.appendAudit(exec, "remediation.approved", approved); err != nil {
+		return store.RemediationExecution{}, err
+	}
+	if _, err := m.appendEvent(ctx, executionID, "runbook_approved", approved); err != nil {
 		return store.RemediationExecution{}, err
 	}
 	return exec, nil
@@ -304,7 +320,11 @@ func (m *Manager) Decline(ctx context.Context, executionID, reason string) (stor
 	}
 	exec.Status = store.RemediationDeclined
 	exec.UpdatedAt = now
-	if err := m.appendAudit(exec, "remediation.declined", map[string]any{"reason": reason}); err != nil {
+	declined := map[string]any{"reason": reason}
+	if err := m.appendAudit(exec, "remediation.declined", declined); err != nil {
+		return store.RemediationExecution{}, err
+	}
+	if _, err := m.appendEvent(ctx, executionID, "runbook_declined", declined); err != nil {
 		return store.RemediationExecution{}, err
 	}
 	return exec, nil
@@ -366,7 +386,11 @@ func (m *Manager) Execute(ctx context.Context, executionID, requestedHash string
 	}
 	exec.Status = store.RemediationExecuting
 	exec.UpdatedAt = startAt
-	if err := m.appendAudit(exec, "remediation.execute.started", map[string]any{"steps": len(rb.Steps)}); err != nil {
+	started := map[string]any{"steps": len(rb.Steps)}
+	if err := m.appendAudit(exec, "remediation.execute.started", started); err != nil {
+		return store.RemediationExecution{}, err
+	}
+	if _, err := m.appendEvent(ctx, executionID, "execution_started", started); err != nil {
 		return store.RemediationExecution{}, err
 	}
 
@@ -408,7 +432,14 @@ func (m *Manager) Execute(ctx context.Context, executionID, requestedHash string
 	}
 	exec.Status = store.RemediationVerifying
 	exec.UpdatedAt = verifyAt
+	// The relay opens its external verification request off this event: the
+	// runbook's external monitor ids are what it re-probes, and it applies
+	// its own severity-derived stability window when none is supplied.
+	verifying := map[string]any{"monitor_ids": rb.ExternalMonitorIDs}
 	if err := m.appendAudit(exec, "remediation.verifying", nil); err != nil {
+		return store.RemediationExecution{}, err
+	}
+	if _, err := m.appendEvent(ctx, executionID, "verification_started", verifying); err != nil {
 		return store.RemediationExecution{}, err
 	}
 

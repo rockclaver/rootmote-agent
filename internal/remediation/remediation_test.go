@@ -558,11 +558,25 @@ func TestManager_Execute_BoundsPersistedStepOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
+	// Select the step_result explicitly: Propose/Approve/Execute also emit
+	// lifecycle milestone events (which the relay projection needs), so the
+	// step output is not events[0].
 	var data struct {
 		Output string `json:"output"`
 	}
-	if err := json.Unmarshal([]byte(events[0].Data), &data); err != nil {
-		t.Fatal(err)
+	var found bool
+	for _, ev := range events {
+		if ev.Type != "step_result" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+			t.Fatal(err)
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatal("no step_result event persisted")
 	}
 	if len(data.Output) > maxStepOutputBytes+len("...[truncated]") {
 		t.Fatalf("persisted output length = %d, bound = %d", len(data.Output), maxStepOutputBytes+len("...[truncated]"))
@@ -783,7 +797,10 @@ func TestManager_Subscribe_ReplayLiveBoundaryExactlyOnce(t *testing.T) {
 		t.Fatalf("append persisted event: %v", err)
 	}
 
-	ch, cancel, err := m.Subscribe(ctx, e.ID, 0)
+	// Replay from just before the persisted event so this test still
+	// exercises the replay/live boundary and nothing else: Propose emits
+	// lifecycle milestones of its own ahead of it.
+	ch, cancel, err := m.Subscribe(ctx, e.ID, persisted.Seq-1)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -928,4 +945,145 @@ func indexOfString(haystack []string, needle string) int {
 		}
 	}
 	return -1
+}
+
+// projectedKinds returns the event types the Projector observed, in order.
+func projectedKinds(p *fakeProjector) []string {
+	out := make([]string, 0, len(p.events))
+	for _, ev := range p.events {
+		out = append(out, ev.Type)
+	}
+	return out
+}
+
+// The relay builds its redacted runbook/execution projections purely from the
+// lifecycle events the agent projects. Without runbook_proposed it never
+// records what was approved, and without verification_started it never opens
+// the external verification request -- which is what makes "a command exited
+// zero" different from "the incident actually recovered", and what makes
+// Watchtower's "resolved with a Rootmote runbook" metric attributable at all.
+func TestManager_ProjectsFullLifecycleToRelay(t *testing.T) {
+	proj := &fakeProjector{}
+	m, _ := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok-audit-1"}, &fakeVerifier{result: VerificationResult{Passed: true, Detail: "healthy"}}, proj)
+	ctx := context.Background()
+
+	rb := twoStepRunbook("rb-1", false)
+	rb.ExternalMonitorIDs = []string{"mon_ext_1"}
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, "ex-1", e.RunbookHash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	got := projectedKinds(proj)
+	want := []string{
+		"runbook_proposed", "runbook_approved", "execution_started",
+		"step_result", "step_result", "verification_started", "internal_verification",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("projected kinds = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("projected kinds = %v, want %v", got, want)
+		}
+	}
+
+	// The relay needs the approval facts on the projected proposal, and the
+	// external monitor ids on verification start.
+	var proposed struct {
+		Risk        string `json:"risk"`
+		ContentHash string `json:"content_hash"`
+		Steps       int    `json:"steps"`
+	}
+	if err := json.Unmarshal([]byte(proj.events[0].Data), &proposed); err != nil {
+		t.Fatal(err)
+	}
+	if proposed.Risk == "" || proposed.ContentHash != e.RunbookHash || proposed.Steps != len(rb.Steps) {
+		t.Fatalf("runbook_proposed data = %+v, want risk + content hash %q + %d steps", proposed, e.RunbookHash, len(rb.Steps))
+	}
+	var approved struct {
+		TokenID string `json:"token_id"`
+	}
+	if err := json.Unmarshal([]byte(proj.events[1].Data), &approved); err != nil {
+		t.Fatal(err)
+	}
+	if approved.TokenID != "tok-audit-1" {
+		t.Fatalf("runbook_approved token_id = %q, want the token's AUDIT id", approved.TokenID)
+	}
+	var verifying struct {
+		MonitorIDs []string `json:"monitor_ids"`
+	}
+	if err := json.Unmarshal([]byte(proj.events[5].Data), &verifying); err != nil {
+		t.Fatal(err)
+	}
+	if len(verifying.MonitorIDs) != 1 || verifying.MonitorIDs[0] != "mon_ext_1" {
+		t.Fatalf("verification_started monitor_ids = %v, want [mon_ext_1]", verifying.MonitorIDs)
+	}
+}
+
+// A declined proposal must project the decline, and never an execution.
+func TestManager_ProjectsDeclineWithoutExecution(t *testing.T) {
+	proj := &fakeProjector{}
+	m, _ := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, proj)
+	ctx := context.Background()
+	e, err := m.Propose(ctx, "ex-1", "inc-1", twoStepRunbook("rb-1", false))
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Decline(ctx, e.ID, "not now"); err != nil {
+		t.Fatalf("decline: %v", err)
+	}
+	got := projectedKinds(proj)
+	want := []string{"runbook_proposed", "runbook_declined"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("projected kinds = %v, want %v", got, want)
+	}
+}
+
+// A destructive L3 runbook is blocked at proposal time; the relay must see
+// that it was blocked, not that it silently never ran.
+func TestManager_ProjectsBlockedL3(t *testing.T) {
+	proj := &fakeProjector{}
+	m, _ := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, proj)
+	if _, err := m.Propose(context.Background(), "ex-1", "inc-1", twoStepRunbook("rb-1", true)); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	got := projectedKinds(proj)
+	want := []string{"runbook_proposed", "runbook_blocked"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("projected kinds = %v, want %v", got, want)
+	}
+}
+
+// A failing step must project execution_started then remediation_failed, and
+// must NOT project a verification start -- nothing recovered.
+func TestManager_ProjectsFailedExecutionWithoutVerification(t *testing.T) {
+	proj := &fakeProjector{}
+	m, _ := newTestManager(t, &fakeExecutor{results: map[int]StepResult{0: {ExitCode: 1, Output: "boom"}}}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, proj)
+	ctx := context.Background()
+	e, err := m.Propose(ctx, "ex-1", "inc-1", twoStepRunbook("rb-1", false))
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, "ex-1", e.RunbookHash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	got := projectedKinds(proj)
+	for _, kind := range got {
+		if kind == "verification_started" || kind == "internal_verification" {
+			t.Fatalf("failed execution projected %q: %v", kind, got)
+		}
+	}
+	if got[len(got)-1] != "remediation_failed" {
+		t.Fatalf("projected kinds = %v, want to end in remediation_failed", got)
+	}
 }

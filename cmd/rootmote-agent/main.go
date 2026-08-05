@@ -45,14 +45,6 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
 
-// noopRemediationProjector is the Task 3 placeholder Projector: every
-// remediation event is already durable in the local store before this is
-// called (see remediation.Manager.appendEvent), so a no-op here only means
-// no relay projection yet -- Task 4 wires the real HTTP client.
-type noopRemediationProjector struct{}
-
-func (noopRemediationProjector) Project(context.Context, store.RemediationEvent) error { return nil }
-
 // defaultNotifyRelayURL is the org-operated rootmote-notify deployment (see
 // github.com/rockclaver/rootmote-notify). Override with --notify-relay-url or
 // ROOTMOTE_NOTIFY_RELAY_URL to point at a self-hosted relay instead, or set
@@ -210,19 +202,36 @@ func main() {
 		log.Fatalf("rootmote-agent: init security audit: %v", err)
 	}
 
+	// Watchtower Phase 1 tracer (issue #79): a pure outbound heartbeat
+	// client. Constructed unconditionally (from any prior enrollment's cred
+	// file, if present) so the watchtower.enable control-plane kind can
+	// enroll it on demand even when the agent boots with no relay
+	// pre-configured. Non-fatal: a failure to even load the cred file
+	// (e.g. permission issue) disables the watchtower.* kinds rather than
+	// blocking agent startup.
+	wtClient, err := watchtower.NewClient(*dataDir, version.Version, nil)
+	if err != nil {
+		log.Printf("rootmote-agent: init watchtower client: %v (watchtower disabled)", err)
+		wtClient = nil
+	}
+
 	// Remediation owns the durable "approve, execute, verify" lifecycle for
 	// one approved runbook (issue #74). The typed StepExecutor/
 	// InternalVerifier adapters reuse exactly the same systemd/process/
 	// firewall/security managers infra.service.action / infra.process.kill
 	// / infra.firewall.rule_* / security.fix mutate through -- no second,
-	// unguarded execution path. The Projector is a no-op until the relay
-	// HTTP projection client (Task 4) is wired.
+	// unguarded execution path. The Projector posts every lifecycle event
+	// to the relay through the watchtower client (issue #74 Task 4) via
+	// watchtower.RemediationProjector, which redacts to the relay's
+	// accepted wire shape and resolves each event's incident from st.
+	// wtClient may be nil (watchtower disabled); RemediationProjector is a
+	// safe no-op in that case, exactly like an unenrolled client.
 	remediationMgr, err := remediation.New(remediation.Config{
 		Store:     st,
 		Executor:  server.NewRemediationStepExecutor(systemdMgr, processMgr, firewallMgr, securityMgr),
 		Validator: server.NewRemediationApprovalValidator(reviewMgr, st),
 		Verifier:  server.NewRemediationInternalVerifier(systemdMgr, firewallMgr),
-		Projector: noopRemediationProjector{},
+		Projector: watchtower.RemediationProjector{Client: wtClient, Store: st},
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init remediation: %v", err)
@@ -317,19 +326,6 @@ func main() {
 		PushConfigured: func() bool { return pushDeliveryConfigured },
 		Auth:           authMgr,
 	})
-
-	// Watchtower Phase 1 tracer (issue #79): a pure outbound heartbeat
-	// client. Constructed unconditionally (from any prior enrollment's cred
-	// file, if present) so the watchtower.enable control-plane kind can
-	// enroll it on demand even when the agent boots with no relay
-	// pre-configured. Non-fatal: a failure to even load the cred file
-	// (e.g. permission issue) disables the watchtower.* kinds rather than
-	// blocking agent startup.
-	wtClient, err := watchtower.NewClient(*dataDir, version.Version, nil)
-	if err != nil {
-		log.Printf("rootmote-agent: init watchtower client: %v (watchtower disabled)", err)
-		wtClient = nil
-	}
 
 	// Watchtower Phase 2 local monitor engine (issue #78): the agent-side
 	// state machine that evaluates the disk/inode/memory/docker/systemd
