@@ -339,9 +339,9 @@ func (m *Manager) proposeAndMaterialiseErr(ctx context.Context, a Alert, propose
 	if err != nil {
 		return Runbook{}, err
 	}
-	rb := m.materialise(ctx, a, p)
-	if rb.ID == "" {
-		return Runbook{}, errors.New("runbook: AI proposer did not produce a runbook")
+	rb, err := m.materialise(ctx, a, p)
+	if err != nil {
+		return Runbook{}, err
 	}
 	return rb, nil
 }
@@ -392,7 +392,7 @@ func classifyProposal(p Proposal) (Risk, bool) {
 // runbook as L3 regardless of the model's self-reported risk.
 func forcesL3(steps []Step) bool {
 	for _, step := range steps {
-		if isRunScriptStep(step) || isFirewallLockoutStep(step) {
+		if isRunScriptStep(step) || isFirewallLockoutStep(step) || isSecurityClosePortSSHStep(step) {
 			return true
 		}
 	}
@@ -408,6 +408,16 @@ func isRunScriptStep(step Step) bool {
 	}
 	kind, _ := step.Params["kind"].(string)
 	return kind == "run_script"
+}
+
+// isSecurityClosePortSSHStep is the security.fix equivalent of denying SSH
+// in the firewall: closing port 22 is always L3, regardless of its backend.
+func isSecurityClosePortSSHStep(step Step) bool {
+	if step.Kind != aiproposal.KindSecurityFix {
+		return false
+	}
+	kind, _ := step.Params["kind"].(string)
+	return kind == "close_port" && intFrom(step.Params["port"]) == 22
 }
 
 // isFirewallLockoutStep reports whether a firewall mutation can lock the
@@ -433,7 +443,7 @@ func isFirewallLockoutStep(step Step) bool {
 // materialise records the runbook, fans steps out as aiproposals (unless
 // blocked as L3), and emits one "infra.runbook" notification with the
 // deep-link payload.
-func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook {
+func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) (Runbook, error) {
 	now := m.cfg.Now()
 	id := randomID()
 
@@ -495,6 +505,16 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		}
 	}
 
+	// Hash before storing or creating any aiproposal. A malformed Params map
+	// (for example a function or NaN smuggled in by a non-CLI proposer)
+	// rejects the entire runbook fail-closed: no panic, no storage, and no
+	// executable proposal fan-out.
+	hash, err := ContentHash(rb)
+	if err != nil {
+		return Runbook{}, fmt.Errorf("runbook: content hash: %w", err)
+	}
+	rb.ContentHash = hash
+
 	// "no automated fix recommended" path: persist the runbook with
 	// Skipped=true, emit no proposal cards, emit no push. The summary still
 	// surfaces in inbox so the operator can see the AI considered it.
@@ -505,9 +525,8 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		} else {
 			rb.SkippedMsg = "no automated fix recommended"
 		}
-		rb.ContentHash = mustContentHash(rb)
 		m.store(rb)
-		return rb
+		return rb, nil
 	}
 
 	// Blocked L3 path: the runbook is fully recorded and audited (steps,
@@ -517,10 +536,9 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 	// (Task 3) rejects an L3 runbook outright even if one somehow reached
 	// it; this package additionally never gives it anything to execute.
 	if rb.Blocked {
-		rb.ContentHash = mustContentHash(rb)
 		m.store(rb)
 		m.publish(ctx, rb)
-		return rb
+		return rb, nil
 	}
 
 	for _, step := range rb.Steps {
@@ -552,23 +570,9 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		rb.ProposalIDs = append(rb.ProposalIDs, ap.ID)
 	}
 
-	rb.ContentHash = mustContentHash(rb)
 	m.store(rb)
 	m.publish(ctx, rb)
-	return rb
-}
-
-// mustContentHash computes rb's content hash, treating a hash failure as a
-// programmer error: Params originates from json.Unmarshal (string, float64,
-// bool, nil, []any, map[string]any only) and is therefore always
-// marshalable, so ContentHash cannot fail on any runbook this package
-// constructs.
-func mustContentHash(rb Runbook) string {
-	hash, err := ContentHash(rb)
-	if err != nil {
-		panic(fmt.Sprintf("runbook: content hash: %v", err))
-	}
-	return hash
+	return rb, nil
 }
 
 // canonicalRunbook is the canonical, hashable shape of a Runbook: every
@@ -681,7 +685,6 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 		if name == "" || act == "" {
 			return "", "", "", nil, errors.New("service step missing name/action")
 		}
-		// Binding shape matches serviceLifecycleTokenBinding in server.
 		return "infra.service." + act, "infra", fmt.Sprintf("systemctl %s %s", act, name), []string{name}, nil
 	case aiproposal.KindProcessKill:
 		pid := intFrom(params["pid"])
@@ -695,28 +698,18 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 		}
 		return "infra.process.kill", "infra", fmt.Sprintf("kill -%s %d", sig, pid), []string{fmt.Sprintf("pid:%d:%d:%s", pid, startTicks, sig)}, nil
 	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
-		port := intFrom(params["port"])
-		if port <= 0 {
-			return "", "", "", nil, errors.New("firewall step missing port")
+		command, backend, firewallAction, port, proto, zone, err := firewallCommand(kind, params)
+		if err != nil {
+			return "", "", "", nil, err
 		}
-		proto, _ := params["protocol"].(string)
-		if proto == "" {
-			proto = "tcp"
-		}
-		actStr, _ := params["action"].(string)
-		source, _ := params["source"].(string)
 		verb := "rule_add"
-		cmdVerb := "insert"
 		if kind == aiproposal.KindFirewallRemove {
 			verb = "rule_remove"
-			cmdVerb = "delete"
 		}
-		policy := actStr
-		if policy == "" {
-			policy = "deny"
-		}
-		cmd := fmt.Sprintf("ufw %s %s %d/%s", cmdVerb, policy, port, proto)
-		return "infra.firewall." + verb, "infra", cmd, []string{fmt.Sprintf("%s:%s:%d:%s:%s", actStr, proto, port, source, "")}, nil
+		// Task 3 execution adapters MUST validate and enforce this same
+		// approved backend/action/zone tuple before mutation; display and
+		// token binding alone are not an execution authority.
+		return "infra.firewall." + verb, "infra", command, []string{fmt.Sprintf("%s:%s:%s:%d:%s", backend, firewallAction, zone, port, proto)}, nil
 	case aiproposal.KindSecurityFix:
 		fixKind, _ := params["kind"].(string)
 		if fixKind == "" {
@@ -727,17 +720,13 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 			if strings.TrimSpace(script) == "" {
 				return "", "", "", nil, errors.New("security fix step missing script")
 			}
-			// Bind to the exact script text (not a short label) so the
-			// confirmation token's action hash — and the displayed
-			// command — pin approval to precisely what will execute as
-			// root.
 			return "security.fix.run_script", "security", script, []string{script}, nil
 		}
-		cmd, err := securityFixCommand(fixKind, params)
+		command, err := securityFixCommand(fixKind, params)
 		if err != nil {
 			return "", "", "", nil, err
 		}
-		return "security.fix." + fixKind, "security", cmd, []string{securityFixTarget(fixKind, params)}, nil
+		return "security.fix." + fixKind, "security", command, []string{securityFixTarget(fixKind, params)}, nil
 	}
 	return "", "", "", nil, fmt.Errorf("runbook: unsupported step kind %q", kind)
 }
@@ -745,11 +734,13 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 func securityFixTarget(kind string, params map[string]any) string {
 	switch kind {
 	case "close_port":
+		backend, _ := params["backend"].(string)
+		zone, _ := params["zone"].(string)
 		proto, _ := params["protocol"].(string)
 		if proto == "" {
 			proto = "tcp"
 		}
-		return fmt.Sprintf("%s/%d", proto, intFrom(params["port"]))
+		return fmt.Sprintf("%s:%s:%s/%d", backend, zone, proto, intFrom(params["port"]))
 	case "kill_process":
 		return fmt.Sprintf("pid/%d/%d", intFrom(params["pid"]), uint64From(params["start_time_ticks"]))
 	case "enable_auditd":
@@ -762,15 +753,10 @@ func securityFixTarget(kind string, params map[string]any) string {
 func securityFixCommand(kind string, params map[string]any) (string, error) {
 	switch kind {
 	case "close_port":
-		proto, _ := params["protocol"].(string)
-		if proto == "" {
-			proto = "tcp"
-		}
-		port := intFrom(params["port"])
-		if port <= 0 {
-			return "", errors.New("close_port step missing port")
-		}
-		return fmt.Sprintf("iptables -A INPUT -p %s --dport %d -j DROP", proto, port), nil
+		// Task 3 execution adapters MUST validate and enforce the approved
+		// backend before mutation. This derived command is only exact if it
+		// corresponds to the backend that will execute it.
+		return closePortCommand(params)
 	case "kill_process":
 		pid := intFrom(params["pid"])
 		if pid <= 0 {
@@ -788,6 +774,72 @@ func securityFixCommand(kind string, params map[string]any) (string, error) {
 	}
 }
 
+func firewallCommand(kind aiproposal.Kind, params map[string]any) (command, backend, action string, port int, proto, zone string, err error) {
+	port = intFrom(params["port"])
+	if port <= 0 {
+		return "", "", "", 0, "", "", errors.New("firewall step missing port")
+	}
+	proto, _ = params["protocol"].(string)
+	if proto == "" {
+		proto = "tcp"
+	}
+	backend, _ = params["backend"].(string)
+	action, _ = params["action"].(string)
+	if backend == "" || action == "" {
+		return "", "", "", 0, "", "", errors.New("firewall step missing backend/action")
+	}
+	zone, _ = params["zone"].(string)
+	if zone == "" {
+		zone = "public"
+	}
+	switch backend {
+	case "ufw":
+		if action != "allow" && action != "deny" && action != "reject" {
+			return "", "", "", 0, "", "", fmt.Errorf("unsupported ufw action %q", action)
+		}
+		if kind == aiproposal.KindFirewallRemove {
+			return fmt.Sprintf("ufw delete %s %d/%s", action, port, proto), backend, action, port, proto, zone, nil
+		}
+		return fmt.Sprintf("ufw %s %d/%s", action, port, proto), backend, action, port, proto, zone, nil
+	case "firewalld":
+		if action != "allow" {
+			return "", "", "", 0, "", "", fmt.Errorf("unsupported firewalld action %q", action)
+		}
+		verb := "--add-port"
+		if kind == aiproposal.KindFirewallRemove {
+			verb = "--remove-port"
+		}
+		return fmt.Sprintf("firewall-cmd --zone=%s %s=%d/%s --permanent && firewall-cmd --reload", zone, verb, port, proto), backend, action, port, proto, zone, nil
+	default:
+		return "", "", "", 0, "", "", fmt.Errorf("unsupported firewall backend %q", backend)
+	}
+}
+
+func closePortCommand(params map[string]any) (string, error) {
+	port := intFrom(params["port"])
+	if port <= 0 {
+		return "", errors.New("close_port step missing port")
+	}
+	proto, _ := params["protocol"].(string)
+	if proto == "" {
+		proto = "tcp"
+	}
+	backend, _ := params["backend"].(string)
+	zone, _ := params["zone"].(string)
+	if zone == "" {
+		zone = "public"
+	}
+	switch backend {
+	case "ufw":
+		return fmt.Sprintf("ufw deny %d/%s", port, proto), nil
+	case "firewalld":
+		return fmt.Sprintf("firewall-cmd --zone=%s --remove-port=%d/%s --permanent && firewall-cmd --reload", zone, port, proto), nil
+	case "":
+		return "", errors.New("close_port step missing backend")
+	default:
+		return "", fmt.Errorf("unsupported firewall backend %q", backend)
+	}
+}
 func intFrom(v any) int {
 	switch n := v.(type) {
 	case float64:

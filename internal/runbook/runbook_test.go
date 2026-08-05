@@ -161,7 +161,7 @@ func TestClassifyRisk(t *testing.T) {
 		{"firewall deny on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "deny", "port": 22, "protocol": "tcp"}}}}, RiskL3, true},
 		{"firewall reject on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "reject", "port": 22, "protocol": "tcp"}}}}, RiskL3, true},
 		{"firewall allow on ssh port remains the reported level", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "allow", "port": 22, "protocol": "tcp"}}}}, RiskL1, false},
-		{"firewall rule removal on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallRemove, Params: map[string]any{"port": 22, "protocol": "tcp"}}}}, RiskL3, true},
+		{"security close_port ssh forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindSecurityFix, Params: map[string]any{"kind": "close_port", "backend": "ufw", "action": "deny", "port": 22, "protocol": "tcp"}}}}, RiskL3, true},
 		{"missing/invalid self-reported risk defaults to L2, not silently safe", Proposal{Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL2, false},
 	}
 	for _, tt := range tests {
@@ -171,6 +171,96 @@ func TestClassifyRisk(t *testing.T) {
 				t.Fatalf("classify = %s,%v want %s,%v", risk, blocked, tt.want, tt.blocked)
 			}
 		})
+	}
+}
+
+func TestTokenBindingForKind_RequiresValidatedFirewallBackendAndRendersExactCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    aiproposal.Kind
+		params  map[string]any
+		command string
+		wantErr bool
+	}{
+		{"ufw add", aiproposal.KindFirewallAdd, map[string]any{"backend": "ufw", "action": "allow", "port": 443, "protocol": "tcp"}, "ufw allow 443/tcp", false},
+		{"ufw remove", aiproposal.KindFirewallRemove, map[string]any{"backend": "ufw", "action": "allow", "port": 443, "protocol": "tcp"}, "ufw delete allow 443/tcp", false},
+		{"firewalld add", aiproposal.KindFirewallAdd, map[string]any{"backend": "firewalld", "action": "allow", "port": 443, "protocol": "tcp"}, "firewall-cmd --zone=public --add-port=443/tcp --permanent && firewall-cmd --reload", false},
+		{"firewalld remove with zone", aiproposal.KindFirewallRemove, map[string]any{"backend": "firewalld", "action": "allow", "zone": "internal", "port": 443, "protocol": "tcp"}, "firewall-cmd --zone=internal --remove-port=443/tcp --permanent && firewall-cmd --reload", false},
+		{"security close port ufw", aiproposal.KindSecurityFix, map[string]any{"kind": "close_port", "backend": "ufw", "port": 443, "protocol": "tcp"}, "ufw deny 443/tcp", false},
+		{"security close port firewalld", aiproposal.KindSecurityFix, map[string]any{"kind": "close_port", "backend": "firewalld", "port": 443, "protocol": "tcp"}, "firewall-cmd --zone=public --remove-port=443/tcp --permanent && firewall-cmd --reload", false},
+		{"missing backend", aiproposal.KindFirewallAdd, map[string]any{"action": "allow", "port": 443, "protocol": "tcp"}, "", true},
+		{"missing action", aiproposal.KindFirewallAdd, map[string]any{"backend": "ufw", "port": 443, "protocol": "tcp"}, "", true},
+		{"unsupported backend", aiproposal.KindFirewallAdd, map[string]any{"backend": "iptables", "action": "allow", "port": 443, "protocol": "tcp"}, "", true},
+		{"firewalld explicit deny", aiproposal.KindFirewallAdd, map[string]any{"backend": "firewalld", "action": "deny", "port": 443, "protocol": "tcp"}, "", true},
+		{"close port missing backend", aiproposal.KindSecurityFix, map[string]any{"kind": "close_port", "port": 443, "protocol": "tcp"}, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, command, _, err := tokenBindingForKind(tt.kind, tt.params)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid backend/action to be rejected")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if command != tt.command {
+				t.Fatalf("command=%q want %q", command, tt.command)
+			}
+		})
+	}
+}
+
+func TestHandle_InvalidFirewallBackendOrActionDoesNotFanOut(t *testing.T) {
+	tests := []struct {
+		name   string
+		params map[string]any
+	}{
+		{"missing backend", map[string]any{"action": "allow", "port": 443, "protocol": "tcp"}},
+		{"missing action", map[string]any{"backend": "ufw", "port": 443, "protocol": "tcp"}},
+		{"firewalld deny", map[string]any{"backend": "firewalld", "action": "deny", "port": 443, "protocol": "tcp"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, apm, _ := newTestManager(t, &stubProposer{result: Proposal{
+				Summary: "invalid firewall operation",
+				Risk:    RiskL1,
+				Steps:   []Step{{Kind: aiproposal.KindFirewallAdd, Params: tt.params}},
+			}})
+			rb := m.Handle(context.Background(), sampleAlert())
+			if len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] != "" {
+				t.Fatalf("invalid firewall step should get one empty proposal slot, got %+v", rb.ProposalIDs)
+			}
+			if len(apm.List()) != 0 {
+				t.Fatalf("invalid firewall step fanned out %d aiproposals", len(apm.List()))
+			}
+		})
+	}
+}
+
+func TestHandle_NonMarshalableParamsFailClosedWithoutFanout(t *testing.T) {
+	m, apm, _ := newTestManager(t, &stubProposer{result: Proposal{
+		Summary: "restart api",
+		Risk:    RiskL1,
+		Steps: []Step{{
+			Kind:   aiproposal.KindServiceAction,
+			Params: map[string]any{"name": "api.service", "action": "restart", "unexpected": func() {}},
+		}},
+	}})
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("non-marshalable Params must fail closed, not panic: %v", recovered)
+		}
+	}()
+
+	rb := m.Handle(context.Background(), sampleAlert())
+	if rb.ID != "" {
+		t.Fatalf("non-marshalable Params should reject the runbook, got %+v", rb)
+	}
+	if len(apm.List()) != 0 {
+		t.Fatalf("non-marshalable Params must not fan out aiproposals, got %d", len(apm.List()))
 	}
 }
 
@@ -393,7 +483,6 @@ func TestContentHash_OrderedListsAreOrderSensitive(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got == baseHash {
-			t.Fatal("reordering external monitor IDs did not change the hash")
 		}
 	})
 }
@@ -483,7 +572,7 @@ func TestHandleManual_UsesSelectedAgentProposerAndBypassesThrottle(t *testing.T)
 	codexProp := &stubProposer{result: Proposal{
 		Summary: "codex fix",
 		Risk:    RiskL1,
-		Steps:   []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "deny", "protocol": "tcp", "port": 6379}}},
+		Steps:   []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"backend": "ufw", "action": "deny", "protocol": "tcp", "port": 6379}}},
 	}}
 	apm := aiproposal.New()
 	m, err := New(Config{

@@ -221,7 +221,7 @@ func TestCLIProposer_PromptContainsAlertAndGroundingAndApprovalFields(t *testing
 			t.Fatalf("prompt missing risk level %q", level)
 		}
 	}
-	for _, field := range []string{"riskExplanation", "runAs", "affectedFiles", "affectedServices", "interruption", "rollback", "verification", "externalMonitorIds"} {
+	for _, field := range []string{"riskExplanation", "runAs", "affectedFiles", "affectedServices", "interruption", "rollback", "verification", "externalMonitorIds", "backend"} {
 		if !strings.Contains(capturedPrompt, field) {
 			t.Fatalf("prompt missing required approval field %q", field)
 		}
