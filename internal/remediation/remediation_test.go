@@ -38,13 +38,19 @@ func (f *fakeExecutor) ExecuteStep(ctx context.Context, step runbook.Step) (Step
 }
 
 type fakeValidator struct {
-	tokenID string
-	err     error
-	calls   int
+	tokenID     string
+	err         error
+	calls       int
+	token       string
+	executionID string
+	contentHash string
 }
 
 func (f *fakeValidator) Validate(ctx context.Context, token, executionID, contentHash string) (string, error) {
 	f.calls++
+	f.token = token
+	f.executionID = executionID
+	f.contentHash = contentHash
 	if f.err != nil {
 		return "", f.err
 	}
@@ -139,6 +145,10 @@ func TestManager_Execute_SequentialSuccessReachesVerifyingWithInitialVerificatio
 	}
 	if e.Status != store.RemediationApproved {
 		t.Fatalf("status after approve = %q", e.Status)
+	}
+	if val.calls != 1 || val.token != "raw-token" || val.executionID != "ex-1" || val.contentHash != e.RunbookHash {
+		t.Fatalf("validator received (%q, %q, %q), want raw token, execution ID, and validated runbook hash",
+			val.token, val.executionID, val.contentHash)
 	}
 
 	e, err = m.Execute(ctx, "ex-1", e.RunbookHash)
@@ -476,4 +486,47 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatalf("marshal: %v", err)
 	}
 	return string(b)
+}
+
+// A real store error during approved -> executing is not a duplicate-execute
+// race. It must reach the caller and must not run a host mutation. The
+// transition seam is private production plumbing with the store method as
+// its default, letting this test isolate the edge without a second database.
+func TestManager_Execute_TransitionStoreErrorDoesNotExecute(t *testing.T) {
+	exec := &fakeExecutor{}
+	val := &fakeValidator{tokenID: "tok-1"}
+	ver := &fakeVerifier{}
+	m, s := newTestManager(t, exec, val, ver, nil)
+	ctx := context.Background()
+
+	rb := twoStepRunbook("rb-1", false)
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	e, err = m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token")
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	transitionErr := errors.New("database is closed")
+	m.transitionExecution = func(id, from, to string, at time.Time) error {
+		if id == "ex-1" && from == store.RemediationApproved && to == store.RemediationExecuting {
+			return transitionErr
+		}
+		return s.TransitionExecution(id, from, to, at)
+	}
+	if _, err := m.Execute(ctx, "ex-1", e.RunbookHash); !errors.Is(err, transitionErr) {
+		t.Fatalf("execute error = %v, want transition storage error", err)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("store transition failure executed %d host steps", len(exec.calls))
+	}
+	got, err := s.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != store.RemediationApproved {
+		t.Fatalf("transition error changed status to %q", got.Status)
+	}
 }

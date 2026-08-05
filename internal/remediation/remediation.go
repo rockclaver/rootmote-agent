@@ -110,12 +110,13 @@ type Config struct {
 // is persisted to the store before this package returns or projects it, so
 // the ledger survives an agent restart -- see RecoverInterrupted.
 type Manager struct {
-	store     *store.Store
-	executor  StepExecutor
-	validator ApprovalValidator
-	verifier  InternalVerifier
-	projector Projector
-	now       func() time.Time
+	store               *store.Store
+	executor            StepExecutor
+	validator           ApprovalValidator
+	verifier            InternalVerifier
+	projector           Projector
+	now                 func() time.Time
+	transitionExecution func(id, from, to string, at time.Time) error
 }
 
 // New constructs a Manager. Store, Executor, Validator, and Verifier are
@@ -129,12 +130,13 @@ func New(cfg Config) (*Manager, error) {
 		now = time.Now
 	}
 	return &Manager{
-		store:     cfg.Store,
-		executor:  cfg.Executor,
-		validator: cfg.Validator,
-		verifier:  cfg.Verifier,
-		projector: cfg.Projector,
-		now:       now,
+		store:               cfg.Store,
+		executor:            cfg.Executor,
+		validator:           cfg.Validator,
+		verifier:            cfg.Verifier,
+		projector:           cfg.Projector,
+		now:                 now,
+		transitionExecution: cfg.Store.TransitionExecution,
 	}, nil
 }
 
@@ -297,7 +299,10 @@ func (m *Manager) Execute(ctx context.Context, executionID, requestedHash string
 	}
 
 	startAt := m.now()
-	if err := m.store.TransitionExecution(executionID, store.RemediationApproved, store.RemediationExecuting, startAt); err != nil {
+	if err := m.transitionExecution(executionID, store.RemediationApproved, store.RemediationExecuting, startAt); err != nil {
+		if !errors.Is(err, store.ErrConflict) {
+			return store.RemediationExecution{}, err
+		}
 		// Lost the race to another caller (or a duplicate landed between
 		// our GetExecution and here): reload and treat as idempotent.
 		reloaded, gerr := m.store.GetExecution(executionID)
