@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -287,5 +288,288 @@ func TestStore_PushDeviceRoundTripsAPNsToken(t *testing.T) {
 	}
 	if len(devices) != 1 || devices[0].APNsToken != "apns-2" {
 		t.Fatalf("apns_token not updated: %+v", devices)
+	}
+}
+
+// AC (#74 Task 2): a runbook is written once and never updated -- insert
+// then get round-trips the opaque JSON content and hash verbatim.
+func TestStore_RunbookImmutableInsertGet(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	t0 := time.Unix(1_700_000_000, 0)
+	rb := Runbook{
+		ID:          "rb-1",
+		IncidentID:  "inc-1",
+		ContentHash: "deadbeef",
+		Content:     `{"summary":"restart nginx"}`,
+		CreatedAt:   t0,
+	}
+	if err := s.CreateRunbook(rb); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := s.GetRunbook("rb-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ContentHash != rb.ContentHash || got.Content != rb.Content || got.IncidentID != rb.IncidentID {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	if !got.CreatedAt.Equal(t0) {
+		t.Fatalf("created_at = %v", got.CreatedAt)
+	}
+
+	// Immutable: re-inserting the same ID -- even with identical content --
+	// is a conflict, because runbook IDs are server-minted and a collision
+	// always signals a bug, never a retry to absorb.
+	if err := s.CreateRunbook(rb); !errors.Is(err, ErrConflict) {
+		t.Fatalf("re-create: got %v, want ErrConflict", err)
+	}
+
+	if _, err := s.GetRunbook("missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get missing: got %v, want ErrNotFound", err)
+	}
+}
+
+// AC (#74 Task 2): a retried "execute" call with the same client-minted ID
+// and identical (incident, runbook, hash) is idempotent -- it must not
+// perform a second insert/mutation.
+func TestStore_ExecutionIdempotentOnIdenticalReuse(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	t0 := time.Unix(1_700_000_000, 0)
+	e := RemediationExecution{
+		ID: "ex-1", IncidentID: "inc-1", RunbookID: "rb-1",
+		RunbookHash: "hash-1", Status: RemediationProposed, CreatedAt: t0, UpdatedAt: t0,
+	}
+	first, created, err := s.CreateExecution(e)
+	if err != nil || !created {
+		t.Fatalf("create: %+v created=%v err=%v", first, created, err)
+	}
+
+	second, created, err := s.CreateExecution(e)
+	if err != nil {
+		t.Fatalf("idempotent create: %v", err)
+	}
+	if created {
+		t.Fatalf("idempotent create reported a fresh insert")
+	}
+	if second.ID != first.ID || !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("idempotent reuse returned a different row: %+v vs %+v", second, first)
+	}
+
+	rows, err := s.db.Query(`SELECT COUNT(*) FROM remediation_executions WHERE id = ?`, "ex-1")
+	if err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	defer rows.Close()
+	var n int
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan count: %v", err)
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one stored row, got %d", n)
+	}
+}
+
+// AC (#74 Task 2): reusing a client-minted execution ID against a different
+// runbook/hash is a conflict, not an idempotent replay, and must not alter
+// the row already on disk.
+func TestStore_ExecutionConflictingReuseErrors(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	orig := RemediationExecution{
+		ID: "ex-1", IncidentID: "inc-1", RunbookID: "rb-1",
+		RunbookHash: "hash-1", Status: RemediationProposed,
+	}
+	if _, _, err := s.CreateExecution(orig); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	conflicting := orig
+	conflicting.RunbookHash = "hash-2"
+	if _, _, err := s.CreateExecution(conflicting); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting reuse: got %v, want ErrConflict", err)
+	}
+
+	got, err := s.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.RunbookHash != "hash-1" {
+		t.Fatalf("conflicting reuse mutated the stored row: %+v", got)
+	}
+}
+
+// AC (#74 Task 2): TransitionExecution is a compare-and-swap on status -- a
+// transition whose `from` matches the current row succeeds; one that
+// doesn't (an invalid jump, or a stale/duplicate caller) fails with
+// ErrConflict and leaves the row untouched. An unrecognized target status is
+// also rejected.
+func TestStore_TransitionExecutionValidAndInvalid(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	e := RemediationExecution{
+		ID: "ex-1", IncidentID: "inc-1", RunbookID: "rb-1",
+		RunbookHash: "hash-1", Status: RemediationProposed,
+	}
+	if _, _, err := s.CreateExecution(e); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	at := time.Unix(1_700_000_100, 0)
+	if err := s.TransitionExecution("ex-1", RemediationProposed, RemediationApproved, at); err != nil {
+		t.Fatalf("valid transition: %v", err)
+	}
+	got, err := s.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != RemediationApproved || !got.UpdatedAt.Equal(at) {
+		t.Fatalf("transition not applied: %+v", got)
+	}
+
+	// Stale `from`: the row is already "approved", not "proposed".
+	if err := s.TransitionExecution("ex-1", RemediationProposed, RemediationExecuting, at); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale transition: got %v, want ErrConflict", err)
+	}
+	// Unknown target status is rejected outright.
+	if err := s.TransitionExecution("ex-1", RemediationApproved, "not_a_status", at); err == nil {
+		t.Fatalf("expected error for unrecognized target status")
+	}
+	got, err = s.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get after rejected transitions: %v", err)
+	}
+	if got.Status != RemediationApproved {
+		t.Fatalf("rejected transitions mutated status: %+v", got)
+	}
+}
+
+// AC (#74 Task 2): events append with a monotonic per-execution sequence
+// and EventsAfter resumes correctly from a mid-stream cursor.
+func TestStore_RemediationEventsMonotonicAndEventsAfter(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if _, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-1", IncidentID: "inc-1", RunbookID: "rb-1", RunbookHash: "hash-1", Status: RemediationProposed,
+	}); err != nil {
+		t.Fatalf("create parent execution: %v", err)
+	}
+
+	for _, typ := range []string{"approved", "started", "step_result"} {
+		if _, err := s.AppendRemediationEvent(RemediationEvent{ExecutionID: "ex-1", Type: typ}); err != nil {
+			t.Fatalf("append %s: %v", typ, err)
+		}
+	}
+	all, err := s.RemediationEventsAfter("ex-1", 0)
+	if err != nil {
+		t.Fatalf("events after 0: %v", err)
+	}
+	if len(all) != 3 || all[0].Seq != 1 || all[1].Seq != 2 || all[2].Seq != 3 {
+		t.Fatalf("unexpected sequence: %+v", all)
+	}
+	if all[0].Type != "approved" || all[2].Type != "step_result" {
+		t.Fatalf("unexpected types: %+v", all)
+	}
+
+	after, err := s.RemediationEventsAfter("ex-1", 1)
+	if err != nil {
+		t.Fatalf("events after 1: %v", err)
+	}
+	if len(after) != 2 || after[0].Seq != 2 || after[1].Seq != 3 {
+		t.Fatalf("resume mismatch: %+v", after)
+	}
+}
+
+// AC (#74 Task 2): audit rows for one execution -- scoped via ProjectID, the
+// existing generic filter column -- come back newest-first, with the id
+// tiebreak, exactly as ListAudit already promises for every other caller.
+func TestStore_RemediationAuditOrdering(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	t0 := time.Unix(1_700_000_000, 0)
+	types := []string{"remediation.approved", "remediation.execute.started", "remediation.step.result"}
+	for _, typ := range types {
+		if _, err := s.AppendAudit(AuditEntry{Type: typ, ProjectID: "ex-1", CreatedAt: t0}); err != nil {
+			t.Fatalf("append audit %s: %v", typ, err)
+		}
+	}
+	rows, err := s.ListAudit("", "ex-1", 10)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+	// Equal timestamps -> newest id first.
+	if rows[0].Type != "remediation.step.result" || rows[1].Type != "remediation.execute.started" || rows[2].Type != "remediation.approved" {
+		t.Fatalf("unexpected order: %+v", rows)
+	}
+}
+
+// AC (#74 Task 2): an execution left "executing" or "verifying" across a
+// restart is recoverable -- InFlightExecutions surfaces it so the manager
+// can fail it closed instead of silently resuming (and possibly replaying a
+// command).
+func TestStore_InFlightExecutionsSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "rootmote.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-done", IncidentID: "inc-1", RunbookID: "rb-1", RunbookHash: "h1", Status: RemediationResolved,
+	}); err != nil {
+		t.Fatalf("create resolved: %v", err)
+	}
+	if _, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-mid", IncidentID: "inc-1", RunbookID: "rb-1", RunbookHash: "h1", Status: RemediationExecuting,
+	}); err != nil {
+		t.Fatalf("create in-flight: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	inFlight, err := s2.InFlightExecutions()
+	if err != nil {
+		t.Fatalf("in-flight: %v", err)
+	}
+	if len(inFlight) != 1 || inFlight[0].ID != "ex-mid" {
+		t.Fatalf("unexpected in-flight set: %+v", inFlight)
 	}
 }

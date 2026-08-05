@@ -286,8 +286,84 @@ type MonitorState struct {
 	UpdatedAt        time.Time
 }
 
+// Runbook is the persisted, immutable full remediation runbook (issue #74
+// Phase 6): the exact content the operator approved, stored as opaque JSON
+// so this package never depends on the runbook package's domain types (see
+// internal/runbook.Runbook, whose runbook.ContentHash the caller recomputes
+// into ContentHash before calling CreateRunbook). Rows are write-once --
+// there is no UpdateRunbook -- so ContentHash can never drift after the
+// operator has approved it.
+type Runbook struct {
+	ID          string
+	IncidentID  string
+	ContentHash string
+	Content     string // full runbook.Runbook, JSON-encoded
+	CreatedAt   time.Time
+}
+
+// Remediation execution statuses (issue #74 Phase 6). The lifecycle is
+// proposed -> approved -> executing -> verifying -> resolved, with
+// declined/blocked_l3 short-circuiting before execution and
+// remediation_failed reachable from executing or verifying. This package
+// never sets RemediationResolved itself -- that requires the external
+// stability window (issue #74 Task 3) -- but it is a defined status so
+// TransitionExecution recognizes it as a valid target once that logic
+// lands.
+const (
+	RemediationProposed          = "proposed"
+	RemediationApproved          = "approved"
+	RemediationExecuting         = "executing"
+	RemediationVerifying         = "verifying"
+	RemediationResolved          = "resolved"
+	RemediationRemediationFailed = "remediation_failed"
+	RemediationDeclined          = "declined"
+	RemediationBlockedL3         = "blocked_l3"
+)
+
+var remediationStatuses = map[string]bool{
+	RemediationProposed:          true,
+	RemediationApproved:          true,
+	RemediationExecuting:         true,
+	RemediationVerifying:         true,
+	RemediationResolved:          true,
+	RemediationRemediationFailed: true,
+	RemediationDeclined:          true,
+	RemediationBlockedL3:         true,
+}
+
+// RemediationExecution is one durable attempt to run an approved runbook end
+// to end. ID is client-minted so a retried "execute" call for the same
+// (IncidentID, RunbookID, RunbookHash) is idempotent instead of replaying a
+// command against the host -- see CreateExecution.
+type RemediationExecution struct {
+	ID          string
+	IncidentID  string
+	RunbookID   string
+	RunbookHash string
+	Status      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// RemediationEvent is one append-only entry in an execution's trail --
+// approval, step result, verification, failure -- mirroring
+// ActionJobEvent's per-parent monotonic sequence.
+type RemediationEvent struct {
+	ExecutionID string
+	Seq         int64
+	Type        string
+	Data        string
+	CreatedAt   time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrConflict is returned when a client-minted ID is reused for content that
+// does not match the row already on disk (runbook/execution reuse), or when
+// a status transition's expected starting state no longer matches the
+// stored row (an invalid jump, or a stale/duplicate caller).
+var ErrConflict = errors.New("conflicting reuse")
 
 // Store wraps a SQLite database.
 type Store struct {
@@ -549,6 +625,37 @@ CREATE TABLE IF NOT EXISTS monitor_states (
 	first_failure_at    INTEGER,
 	last_transition_at  INTEGER NOT NULL,
 	updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS remediation_runbooks (
+	id           TEXT PRIMARY KEY,
+	incident_id  TEXT NOT NULL DEFAULT '',
+	content_hash TEXT NOT NULL,
+	content      TEXT NOT NULL,
+	created_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS remediation_executions (
+	id           TEXT PRIMARY KEY,
+	incident_id  TEXT NOT NULL DEFAULT '',
+	runbook_id   TEXT NOT NULL DEFAULT '',
+	runbook_hash TEXT NOT NULL DEFAULT '',
+	status       TEXT NOT NULL,
+	created_at   INTEGER NOT NULL,
+	updated_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS remediation_executions_status_idx ON remediation_executions(status);
+CREATE INDEX IF NOT EXISTS remediation_executions_incident_idx ON remediation_executions(incident_id);
+
+CREATE TABLE IF NOT EXISTS remediation_events (
+	execution_id TEXT NOT NULL,
+	seq          INTEGER NOT NULL,
+	type         TEXT NOT NULL,
+	data         TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL,
+	PRIMARY KEY(execution_id, seq),
+	FOREIGN KEY(execution_id) REFERENCES remediation_executions(id) ON DELETE CASCADE
 );
 `)
 	if err != nil {
@@ -2185,4 +2292,224 @@ func nullableUnix(t *time.Time) any {
 		return nil
 	}
 	return t.Unix()
+}
+
+// CreateRunbook persists an immutable runbook. The row is write-once: a
+// second call with an already-used ID returns ErrConflict without touching
+// the stored row, whether or not the content matches -- runbook IDs are
+// server-minted, so a collision always signals a bug rather than a retry to
+// absorb.
+func (s *Store) CreateRunbook(rb Runbook) error {
+	if rb.CreatedAt.IsZero() {
+		rb.CreatedAt = time.Now()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO remediation_runbooks (id, incident_id, content_hash, content, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		rb.ID, rb.IncidentID, rb.ContentHash, rb.Content, rb.CreatedAt.Unix(),
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("runbook %s: %w", rb.ID, ErrConflict)
+		}
+		return err
+	}
+	return nil
+}
+
+// GetRunbook loads one immutable runbook by ID.
+func (s *Store) GetRunbook(id string) (Runbook, error) {
+	row := s.db.QueryRow(
+		`SELECT id, incident_id, content_hash, content, created_at
+		 FROM remediation_runbooks WHERE id = ?`, id,
+	)
+	var rb Runbook
+	var created int64
+	if err := row.Scan(&rb.ID, &rb.IncidentID, &rb.ContentHash, &rb.Content, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Runbook{}, fmt.Errorf("runbook %s: %w", id, ErrNotFound)
+		}
+		return Runbook{}, err
+	}
+	rb.CreatedAt = time.Unix(created, 0)
+	return rb, nil
+}
+
+// CreateExecution inserts a new remediation execution, or -- when e.ID
+// already exists -- returns the existing row unchanged, provided its
+// (IncidentID, RunbookID, RunbookHash) match e exactly. That makes a
+// retried "execute" call for the same runbook idempotent: created reports
+// whether this call performed the insert; false means a prior call already
+// owns this execution and the caller must not repeat any host mutation.
+// Reusing e.ID against different content returns ErrConflict and never
+// mutates the stored row.
+func (s *Store) CreateExecution(e RemediationExecution) (RemediationExecution, bool, error) {
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now()
+	}
+	if e.UpdatedAt.IsZero() {
+		e.UpdatedAt = e.CreatedAt
+	}
+	if !remediationStatuses[e.Status] {
+		return RemediationExecution{}, false, fmt.Errorf("remediation execution %s: invalid status %q", e.ID, e.Status)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO remediation_executions (id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.IncidentID, e.RunbookID, e.RunbookHash, e.Status, e.CreatedAt.Unix(), e.UpdatedAt.Unix(),
+	)
+	if err == nil {
+		return e, true, nil
+	}
+	if !isUniqueViolation(err) {
+		return RemediationExecution{}, false, err
+	}
+	existing, getErr := s.GetExecution(e.ID)
+	if getErr != nil {
+		return RemediationExecution{}, false, getErr
+	}
+	if existing.IncidentID != e.IncidentID || existing.RunbookID != e.RunbookID || existing.RunbookHash != e.RunbookHash {
+		return RemediationExecution{}, false, fmt.Errorf("remediation execution %s: %w", e.ID, ErrConflict)
+	}
+	return existing, false, nil
+}
+
+// GetExecution loads one remediation execution by ID.
+func (s *Store) GetExecution(id string) (RemediationExecution, error) {
+	row := s.db.QueryRow(
+		`SELECT id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at
+		 FROM remediation_executions WHERE id = ?`, id,
+	)
+	var e RemediationExecution
+	var created, updated int64
+	if err := row.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RemediationExecution{}, fmt.Errorf("remediation execution %s: %w", id, ErrNotFound)
+		}
+		return RemediationExecution{}, err
+	}
+	e.CreatedAt = time.Unix(created, 0)
+	e.UpdatedAt = time.Unix(updated, 0)
+	return e, nil
+}
+
+// TransitionExecution atomically moves an execution from `from` to `to`,
+// bumping updated_at, and fails with ErrConflict if the row's current status
+// is not `from` -- either because it never was (an invalid jump in the
+// lifecycle) or because a concurrent/duplicate caller already moved it. An
+// unrecognized target status is rejected outright.
+func (s *Store) TransitionExecution(id, from, to string, at time.Time) error {
+	if !remediationStatuses[to] {
+		return fmt.Errorf("remediation execution %s: invalid target status %q", id, to)
+	}
+	res, err := s.db.Exec(
+		`UPDATE remediation_executions SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		to, at.Unix(), id, from,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("remediation execution %s: transition %s -> %s: %w", id, from, to, ErrConflict)
+	}
+	return nil
+}
+
+// InFlightExecutions returns executions left in "executing" or "verifying"
+// -- the two statuses that mean a host command may have been mid-flight
+// when the agent last stopped. The caller (remediation.Manager, at startup)
+// recovers each into remediation_failed rather than resuming, since there is
+// no way to tell whether the last command actually completed on the host.
+func (s *Store) InFlightExecutions() ([]RemediationExecution, error) {
+	rows, err := s.db.Query(
+		`SELECT id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at
+		 FROM remediation_executions WHERE status IN (?, ?) ORDER BY created_at ASC`,
+		RemediationExecuting, RemediationVerifying,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RemediationExecution, 0)
+	for rows.Next() {
+		var e RemediationExecution
+		var created, updated int64
+		if err := rows.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &created, &updated); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(created, 0)
+		e.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// AppendRemediationEvent appends one event to an execution's trail,
+// assigning the next per-execution seq inside a transaction (mirroring
+// AppendActionJobEvent) so concurrent appends for the same execution can
+// never be assigned the same sequence number.
+func (s *Store) AppendRemediationEvent(event RemediationEvent) (RemediationEvent, error) {
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RemediationEvent{}, err
+	}
+	defer tx.Rollback()
+	var next sql.NullInt64
+	if err := tx.QueryRow(`SELECT MAX(seq) + 1 FROM remediation_events WHERE execution_id = ?`, event.ExecutionID).Scan(&next); err != nil {
+		return RemediationEvent{}, err
+	}
+	if next.Valid {
+		event.Seq = next.Int64
+	} else {
+		event.Seq = 1
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO remediation_events (execution_id, seq, type, data, created_at) VALUES (?, ?, ?, ?, ?)`,
+		event.ExecutionID, event.Seq, event.Type, event.Data, event.CreatedAt.Unix(),
+	); err != nil {
+		return RemediationEvent{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RemediationEvent{}, err
+	}
+	return event, nil
+}
+
+// RemediationEventsAfter returns an execution's events with seq > afterSeq
+// in ascending order, so a reconnecting client can resume its stream.
+func (s *Store) RemediationEventsAfter(executionID string, afterSeq int64) ([]RemediationEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT execution_id, seq, type, data, created_at
+		 FROM remediation_events WHERE execution_id = ? AND seq > ? ORDER BY seq ASC`,
+		executionID, afterSeq,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RemediationEvent, 0)
+	for rows.Next() {
+		var ev RemediationEvent
+		var created int64
+		if err := rows.Scan(&ev.ExecutionID, &ev.Seq, &ev.Type, &ev.Data, &created); err != nil {
+			return nil, err
+		}
+		ev.CreatedAt = time.Unix(created, 0)
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE constraint
+// failure (modernc.org/sqlite's error text), mirroring isDuplicateColumn's
+// text-match approach since the driver does not expose a typed error.
+func isUniqueViolation(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
