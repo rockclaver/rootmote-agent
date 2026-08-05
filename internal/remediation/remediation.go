@@ -226,8 +226,18 @@ func (m *Manager) propose(ctx context.Context, executionID, incidentID string, r
 		return store.RemediationExecution{}, err
 	}
 	if created {
+		// AC7: the audit must answer "where did this runbook come from and
+		// exactly what content was proposed" -- the diagnosis it was derived
+		// from, the AI output version that produced it, and the content hash
+		// any later approval is bound to.
 		if err := m.appendAudit(exec, "remediation.proposed", map[string]any{
-			"risk": string(rb.Risk), "blocked": rb.Blocked, "steps": len(rb.Steps),
+			"risk":             string(rb.Risk),
+			"blocked":          rb.Blocked,
+			"steps":            len(rb.Steps),
+			"diagnosis_id":     rb.DiagnosisID,
+			"provider_version": rb.ProviderVersion,
+			"content_hash":     hash,
+			"schema_version":   rb.SchemaVersion,
 		}); err != nil {
 			return store.RemediationExecution{}, err
 		}

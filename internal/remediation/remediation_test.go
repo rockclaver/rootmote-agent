@@ -832,3 +832,100 @@ func recvRemediationEvent(t *testing.T, ch <-chan store.RemediationEvent) store.
 	}
 	return store.RemediationEvent{}
 }
+
+// AC7 (issue #74): every step of a remediation is written to the audit
+// trail, in order -- the diagnosis the runbook came from, the AI output
+// version, the runbook content hash, the approval and its confirmation-token
+// ID, each command result, and the verification outcome. The opaque token
+// itself is NEVER recorded.
+func TestManager_AuditTrailCoversEveryRemediationStep(t *testing.T) {
+	exec := &fakeExecutor{}
+	val := &fakeValidator{tokenID: "tok-audit-1"}
+	ver := &fakeVerifier{result: VerificationResult{Passed: true, Detail: "service active"}}
+	m, s := newTestManager(t, exec, val, ver, nil)
+	ctx := context.Background()
+
+	rb := twoStepRunbook("rb-audit", false)
+	rb.DiagnosisID = "diag-audit-1"
+	rb.ProviderVersion = "claude-v9"
+	hash, err := runbook.ContentHash(rb)
+	if err != nil {
+		t.Fatalf("content hash: %v", err)
+	}
+	rb.ContentHash = hash
+
+	if _, err := m.Propose(ctx, "ex-audit", "inc-1", rb); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-audit", hash, "raw-secret-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, "ex-audit", hash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	entries, err := s.ListAudit("", "ex-audit", 100)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	// ListAudit returns newest-first; read the trail in the order it happened.
+	var types []string
+	for i := len(entries) - 1; i >= 0; i-- {
+		types = append(types, entries[i].Type)
+	}
+
+	for _, want := range []string{
+		"remediation.proposed",
+		"remediation.approved",
+		"remediation.execute.started",
+		"remediation.step.result",
+		"remediation.verifying",
+	} {
+		if indexOfString(types, want) < 0 {
+			t.Fatalf("audit trail missing %q: %v", want, types)
+		}
+	}
+	// Ordering: proposed -> approved -> started -> results -> verifying.
+	proposed := indexOfString(types, "remediation.proposed")
+	approved := indexOfString(types, "remediation.approved")
+	started := indexOfString(types, "remediation.execute.started")
+	verifying := indexOfString(types, "remediation.verifying")
+	if !(proposed < approved && approved < started && started < verifying) {
+		t.Fatalf("audit trail out of order: %v", types)
+	}
+
+	// Two step results, one per command.
+	var results int
+	for _, ty := range types {
+		if ty == "remediation.step.result" {
+			results++
+		}
+	}
+	if results != 2 {
+		t.Fatalf("step result audit rows = %d, want 2", results)
+	}
+
+	// The diagnosis reference, provider version and content hash are all
+	// recorded, and the raw token never is.
+	joined := ""
+	for _, e := range entries {
+		joined += e.Type + "|" + e.Summary + "|" + e.Data + "\n"
+	}
+	for _, want := range []string{"diag-audit-1", "claude-v9", hash, "tok-audit-1"} {
+		if indexOf(joined, want) < 0 {
+			t.Fatalf("audit trail missing %q", want)
+		}
+	}
+	if containsToken(joined, "raw-secret-token") {
+		t.Fatal("audit trail recorded the opaque confirmation token")
+	}
+}
+
+func indexOfString(haystack []string, needle string) int {
+	for i, v := range haystack {
+		if v == needle {
+			return i
+		}
+	}
+	return -1
+}
