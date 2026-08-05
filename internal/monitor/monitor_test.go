@@ -448,3 +448,26 @@ func TestSyncedWildcardDisable_StopsDynamicTargets(t *testing.T) {
 		t.Fatal("synced wildcard disable did not stop docker target api")
 	}
 }
+
+// --- relay-evaluated monitors are never evaluated locally ----------------
+
+func TestDefinitionsFromSync_SkipsRelayEvaluatedMonitors(t *testing.T) {
+	defs := []watchtower.MonitorDef{
+		{ID: "mon_agent", Kind: "disk_capacity", Target: "/", EvaluationLocation: "agent"},
+		{ID: "mon_default", Kind: "memory_pressure", Target: ""},
+		{ID: "mon_relay_http", Kind: "external_http", Target: "https://a.example", EvaluationLocation: "relay"},
+		{ID: "mon_relay_tls", Kind: "tls_expiry", Target: "a.example", EvaluationLocation: "relay"},
+	}
+	got := DefinitionsFromSync(defs)
+	if len(got) != 2 {
+		t.Fatalf("DefinitionsFromSync returned %d definitions, want 2: %+v", len(got), got)
+	}
+	for _, d := range got {
+		if d.Kind == "external_http" || d.Kind == "tls_expiry" {
+			t.Fatalf("relay-evaluated monitor %s leaked into agent definitions", d.ID)
+		}
+	}
+	if got[0].ID != "mon_agent" || got[1].ID != "mon_default" {
+		t.Fatalf("unexpected surviving definitions: %+v", got)
+	}
+}

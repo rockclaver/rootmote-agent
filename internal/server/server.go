@@ -553,7 +553,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"action.get",
 		"action.cancel":
 		s.dispatchAction(ctx, c, writeMu, f)
-	case "inventory.capabilities":
+	case "inventory.capabilities", "inventory.discover":
 		s.dispatchInventory(ctx, c, writeMu, f)
 	case "push.register", "push.unregister", "push.list",
 		"notifications.prefs.list", "notifications.prefs.set":
@@ -3833,7 +3833,30 @@ func (s *Server) dispatchInventory(ctx context.Context, c *websocket.Conn, write
 	case "inventory.capabilities":
 		snap := s.cfg.Inventory.SnapshotCapabilities(ctx)
 		s.writeOK(ctx, c, writeMu, f.ID, "inventory.capabilities", map[string]any{"snapshot": snap})
+	case "inventory.discover":
+		report := s.discoverHostInventory(ctx)
+		s.writeOK(ctx, c, writeMu, f.ID, "inventory.discover", report)
 	}
+}
+
+// discoverHostInventory wires the real infra/docker/systemd/webserver
+// managers into an inventory.Discoverer, nil-safe for any subsystem the
+// agent was not configured with.
+func (s *Server) discoverHostInventory(ctx context.Context) inventory.DiscoveryReport {
+	cfg := inventory.DiscoveryConfig{Now: s.cfg.Now}
+	if s.cfg.Infra != nil {
+		cfg.Infra = s.cfg.Infra
+	}
+	if s.cfg.Docker != nil {
+		cfg.Docker = s.cfg.Docker
+	}
+	if s.cfg.Systemd != nil {
+		cfg.Systemd = s.cfg.Systemd
+	}
+	if s.cfg.Webservers != nil {
+		cfg.Webserver = s.cfg.Webservers
+	}
+	return inventory.NewDiscoverer(cfg).Discover(ctx)
 }
 
 // dispatchPush owns FCM device-token registration. Tokens are stored on the

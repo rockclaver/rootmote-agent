@@ -161,6 +161,9 @@ func (m *Manager) SetSyncedDefinitions(defs []Definition) {
 func DefinitionsFromSync(defs []watchtower.MonitorDef) []Definition {
 	out := make([]Definition, 0, len(defs))
 	for _, d := range defs {
+		if d.EvaluationLocation != "" && d.EvaluationLocation != "agent" {
+			continue
+		}
 		out = append(out, Definition{
 			ID:                 d.ID,
 			Kind:               Kind(d.Kind),
