@@ -34,7 +34,7 @@ func TestRunbook_ListAndGetOverWS(t *testing.T) {
 		Throttle:      time.Millisecond,
 		Proposer: stubRunbookProposer{p: runbook.Proposal{
 			Summary: "restart api",
-			Risk:    runbook.RiskMedium,
+			Risk:    runbook.RiskL2,
 			Steps: []runbook.Step{{
 				Kind:        aiproposal.KindServiceAction,
 				Params:      map[string]any{"name": "api.service", "action": "restart"},

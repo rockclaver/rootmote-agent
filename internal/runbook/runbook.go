@@ -410,15 +410,24 @@ func isRunScriptStep(step Step) bool {
 	return kind == "run_script"
 }
 
-// isFirewallLockoutStep reports whether step removes the firewall rule
-// for port 22 (SSH) — the canonical "firewall lockout risk" the design
-// calls out as L3 even though infra.firewall.rule_remove is otherwise a
-// narrow, reversible mutation.
+// isFirewallLockoutStep reports whether a firewall mutation can lock the
+// agent's SSH transport out. Removing any port-22 rule, or adding a deny/
+// reject rule for port 22, is L3. The existing executor's anti-lockout
+// guard remains authoritative for whether a particular rule can run; this
+// classifier blocks risky remediation before it ever becomes executable.
 func isFirewallLockoutStep(step Step) bool {
-	if step.Kind != aiproposal.KindFirewallRemove {
+	if intFrom(step.Params["port"]) != 22 {
 		return false
 	}
-	return intFrom(step.Params["port"]) == 22
+	switch step.Kind {
+	case aiproposal.KindFirewallRemove:
+		return true
+	case aiproposal.KindFirewallAdd:
+		action, _ := step.Params["action"].(string)
+		return action == "deny" || action == "reject"
+	default:
+		return false
+	}
 }
 
 // materialise records the runbook, fans steps out as aiproposals (unless
@@ -585,10 +594,9 @@ type canonicalRunbook struct {
 }
 
 type canonicalStep struct {
-	Kind        string         `json:"kind"`
-	Params      map[string]any `json:"params"`
-	Command     string         `json:"command"`
-	Description string         `json:"description"`
+	Kind    string         `json:"kind"`
+	Params  map[string]any `json:"params"`
+	Command string         `json:"command"`
 }
 
 // ContentHash computes the canonical SHA-256 content hash of rb: the
@@ -641,10 +649,9 @@ func canonicalSteps(steps []Step) []canonicalStep {
 	out := make([]canonicalStep, len(steps))
 	for i, s := range steps {
 		out[i] = canonicalStep{
-			Kind:        string(s.Kind),
-			Params:      s.Params,
-			Command:     s.Command,
-			Description: s.Description,
+			Kind:    string(s.Kind),
+			Params:  s.Params,
+			Command: s.Command,
 		}
 	}
 	return out

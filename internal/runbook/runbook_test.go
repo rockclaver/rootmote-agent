@@ -158,6 +158,9 @@ func TestClassifyRisk(t *testing.T) {
 		{"configuration change", Proposal{Risk: RiskL2}, RiskL2, false},
 		{"raw shell forced destructive", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindSecurityFix, Params: map[string]any{"kind": "run_script", "script": "rm -rf /srv/app/cache"}}}}, RiskL3, true},
 		{"self-reported L3 is blocked even with no forcing step", Proposal{Risk: RiskL3, Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL3, true},
+		{"firewall deny on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "deny", "port": 22, "protocol": "tcp"}}}}, RiskL3, true},
+		{"firewall reject on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "reject", "port": 22, "protocol": "tcp"}}}}, RiskL3, true},
+		{"firewall allow on ssh port remains the reported level", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "allow", "port": 22, "protocol": "tcp"}}}}, RiskL1, false},
 		{"firewall rule removal on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallRemove, Params: map[string]any{"port": 22, "protocol": "tcp"}}}}, RiskL3, true},
 		{"missing/invalid self-reported risk defaults to L2, not silently safe", Proposal{Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL2, false},
 	}
@@ -215,8 +218,10 @@ func TestContentHashChangesForEveryApprovalField(t *testing.T) {
 // TestContentHashChangesForRemainingRequiredFields covers the immutable
 // shape fields the plan's table didn't enumerate explicitly (schema
 // version, incident/server/diagnosis IDs, risk, interruption, external
-// monitor IDs, step kind/params/description) so every field in the
-// canonical hash section of the design is actually load-bearing.
+// monitor IDs, step kind/params) so every field in the canonical hash
+// section of the design is actually load-bearing. Step Description is
+// deliberately omitted: it is explanatory prose, not approved executable
+// content.
 func TestContentHashChangesForRemainingRequiredFields(t *testing.T) {
 	base := completeRunbookFixture()
 	original := base.ContentHash
@@ -229,7 +234,6 @@ func TestContentHashChangesForRemainingRequiredFields(t *testing.T) {
 		func(r *Runbook) { r.Interruption = "extended outage" },
 		func(r *Runbook) { r.AffectedServices = append(r.AffectedServices, "extra.service") },
 		func(r *Runbook) { r.ExternalMonitorIDs = append(r.ExternalMonitorIDs, "mon-3") },
-		func(r *Runbook) { r.Steps[0].Description = "changed description" },
 		func(r *Runbook) { r.Steps[0].Params["name"] = "other.service" },
 		func(r *Runbook) { r.Steps[0].Kind = aiproposal.KindProcessKill },
 		func(r *Runbook) { r.Rollback[0].RunAs = "deploy" },
@@ -285,6 +289,24 @@ func TestContentHash_LifecycleFieldsExcluded(t *testing.T) {
 		if got != original {
 			t.Fatalf("lifecycle mutation #%d unexpectedly changed the content hash", i)
 		}
+	}
+}
+
+// TestContentHash_ExcludesStepDescription verifies explanatory step text
+// cannot invalidate an approval: the approved canonical field list contains
+// typed steps, normalized parameters, and exact command display, but not
+// free-text Step.Description.
+func TestContentHash_ExcludesStepDescription(t *testing.T) {
+	base := completeRunbookFixture()
+	candidate := cloneRunbook(base)
+	candidate.Steps[0].Description = "operator-facing prose changed after review"
+
+	got, err := ContentHash(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != base.ContentHash {
+		t.Fatalf("Step.Description-only mutation changed the hash: %s vs %s", got, base.ContentHash)
 	}
 }
 
