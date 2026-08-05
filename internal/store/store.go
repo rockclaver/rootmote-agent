@@ -359,15 +359,15 @@ var remediationKinds = map[string]bool{
 // rollback (Kind == RemediationKindRollback) reverses, and is empty for a
 // primary execution.
 type RemediationExecution struct {
-	ID                string
-	IncidentID        string
-	RunbookID         string
-	RunbookHash       string
-	Status            string
-	Kind              string
-	ParentExecutionID string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                string    `json:"id"`
+	IncidentID        string    `json:"incident_id"`
+	RunbookID         string    `json:"runbook_id"`
+	RunbookHash       string    `json:"runbook_hash"`
+	Status            string    `json:"status"`
+	Kind              string    `json:"kind"`
+	ParentExecutionID string    `json:"parent_execution_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // RemediationEvent is one append-only entry in an execution's trail --
