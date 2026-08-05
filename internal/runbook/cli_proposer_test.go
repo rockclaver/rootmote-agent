@@ -15,7 +15,7 @@ import (
 func TestCLIProposer_ParsesClaudeEnvelope(t *testing.T) {
 	// Real claude -p --output-format json wraps the assistant message in a
 	// {"result": "<assistant text>", ...} envelope. Verify we unwrap it.
-	body := `{"summary":"restart x","risk":"low","steps":[{"kind":"infra.service.action","params":{"name":"x.service","action":"restart"},"description":"d"}]}`
+	body := `{"summary":"restart x","risk":"L1","steps":[{"kind":"infra.service.action","params":{"name":"x.service","action":"restart"},"description":"d"}]}`
 	envelope := `{"type":"result","result":"` + escapeJSON(body) + `"}`
 	p := CLIProposer{
 		Agent: "claude",
@@ -27,7 +27,7 @@ func TestCLIProposer_ParsesClaudeEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Summary != "restart x" || got.Risk != RiskLow || len(got.Steps) != 1 {
+	if got.Summary != "restart x" || got.Risk != RiskL1 || len(got.Steps) != 1 {
 		t.Fatalf("bad parse: %+v", got)
 	}
 	if got.Steps[0].Kind != aiproposal.KindServiceAction {
@@ -37,7 +37,7 @@ func TestCLIProposer_ParsesClaudeEnvelope(t *testing.T) {
 
 func TestCLIProposer_ParsesDirectJSON(t *testing.T) {
 	// codex exec returns raw assistant text, no envelope.
-	body := `{"summary":"manual review","risk":"medium","steps":[]}`
+	body := `{"summary":"manual review","risk":"L0","steps":[]}`
 	p := CLIProposer{
 		Agent: "codex",
 		Exec: func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
@@ -72,7 +72,7 @@ func TestCLIProposer_DefaultExecResolvesFromBinDirPATH(t *testing.T) {
 	stub := filepath.Join(binDir, "codex")
 	script := `#!/bin/sh
 cat >/dev/null
-printf '{"summary":"from managed bin","risk":"low","steps":[]}'
+printf '{"summary":"from managed bin","risk":"L0","steps":[]}'
 `
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ printf '{"summary":"from managed bin","risk":"low","steps":[]}'
 }
 
 func TestCLIProposer_ParsesJSONInsideCodeFence(t *testing.T) {
-	body := "Here is the plan:\n```json\n{\"summary\":\"x\",\"risk\":\"low\",\"steps\":[]}\n```\nthat is all"
+	body := "Here is the plan:\n```json\n{\"summary\":\"x\",\"risk\":\"L0\",\"steps\":[]}\n```\nthat is all"
 	p := CLIProposer{
 		Agent: "codex",
 		Exec: func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
@@ -108,7 +108,7 @@ func TestCLIProposer_ParsesJSONInsideCodeFence(t *testing.T) {
 }
 
 func TestCLIProposer_ParsesCodexJSONLStream(t *testing.T) {
-	body := `{"summary":"deny exposed redis","risk":"high","steps":[{"kind":"infra.firewall.rule_add","params":{"action":"deny","protocol":"tcp","port":6379},"description":"block public redis"}]}`
+	body := `{"summary":"deny exposed redis","risk":"L2","steps":[{"kind":"infra.firewall.rule_add","params":{"action":"deny","protocol":"tcp","port":6379},"description":"block public redis"}]}`
 	stdout := strings.Join([]string{
 		`{"type":"session.started","session_id":"s1"}`,
 		`{"msg":{"type":"agent_message","message":"` + escapeJSON(body) + `"}}`,
@@ -124,7 +124,7 @@ func TestCLIProposer_ParsesCodexJSONLStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Summary != "deny exposed redis" || got.Risk != RiskHigh || len(got.Steps) != 1 {
+	if got.Summary != "deny exposed redis" || got.Risk != RiskL2 || len(got.Steps) != 1 {
 		t.Fatalf("bad parse: %+v", got)
 	}
 	if got.Steps[0].Kind != aiproposal.KindFirewallAdd {
@@ -154,6 +154,24 @@ func TestCLIProposer_UnparseableOutputReturnsError(t *testing.T) {
 	}
 }
 
+// TestCLIProposer_RejectsLegacyRiskAliasesWithSteps proves the strict new
+// contract: a proposal with non-empty steps but an old low/medium/high (or
+// any non-L0-L3) risk string is malformed output and must be rejected, not
+// silently coerced.
+func TestCLIProposer_RejectsLegacyRiskAliasesWithSteps(t *testing.T) {
+	for _, legacy := range []string{"low", "medium", "high", "", "L4"} {
+		body := `{"summary":"restart x","risk":"` + legacy + `","steps":[{"kind":"infra.service.action","params":{"name":"x.service","action":"restart"}}]}`
+		p := CLIProposer{
+			Exec: func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
+				return []byte(body), nil
+			},
+		}
+		if _, err := p.Propose(context.Background(), sampleAlert(), Grounding{}); err == nil {
+			t.Fatalf("risk=%q with non-empty steps should be rejected as malformed, got no error", legacy)
+		}
+	}
+}
+
 func TestCLIProposer_TimeoutEnforced(t *testing.T) {
 	p := CLIProposer{
 		Timeout: 5 * time.Millisecond,
@@ -175,12 +193,12 @@ func TestCLIProposer_TimeoutEnforced(t *testing.T) {
 	}
 }
 
-func TestCLIProposer_PromptContainsAlertAndGrounding(t *testing.T) {
+func TestCLIProposer_PromptContainsAlertAndGroundingAndApprovalFields(t *testing.T) {
 	var capturedPrompt string
 	p := CLIProposer{
 		Exec: func(_ context.Context, _ string, _ []string, _ []string, stdin string) ([]byte, error) {
 			capturedPrompt = stdin
-			return []byte(`{"summary":"ok","risk":"low","steps":[]}`), nil
+			return []byte(`{"summary":"ok","risk":"L0","steps":[]}`), nil
 		},
 	}
 	if _, err := p.Propose(context.Background(), sampleAlert(), Grounding{Metrics: "MX"}); err != nil {
@@ -198,12 +216,21 @@ func TestCLIProposer_PromptContainsAlertAndGrounding(t *testing.T) {
 	if !strings.Contains(capturedPrompt, "security.fix") {
 		t.Fatal("prompt missing security fix whitelist")
 	}
+	for _, level := range []string{"L0", "L1", "L2", "L3"} {
+		if !strings.Contains(capturedPrompt, level) {
+			t.Fatalf("prompt missing risk level %q", level)
+		}
+	}
+	for _, field := range []string{"riskExplanation", "runAs", "affectedFiles", "affectedServices", "interruption", "rollback", "verification", "externalMonitorIds"} {
+		if !strings.Contains(capturedPrompt, field) {
+			t.Fatalf("prompt missing required approval field %q", field)
+		}
+	}
 }
 
 // escapeJSON is a tiny helper to embed a JSON string inside another JSON
 // string literal in tests.
 func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return s
+	r := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\n", "\\n")
+	return r.Replace(s)
 }

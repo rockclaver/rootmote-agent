@@ -3,6 +3,7 @@ package runbook
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,10 +68,345 @@ func sampleAlert() Alert {
 	}
 }
 
+// completeRunbookFixture returns a fully populated, content-hashed Runbook
+// covering every approval-relevant field so hash tests can mutate a single
+// field at a time and assert the hash moves.
+func completeRunbookFixture() Runbook {
+	rb := Runbook{
+		ID:              "rb-1",
+		SchemaVersion:   SchemaVersion,
+		IncidentID:      "inc-1",
+		ServerID:        "srv-1",
+		DiagnosisID:     "diag-1",
+		ProviderVersion: "claude-1",
+		AlertKey:        "disk_usage:/",
+		Rule:            "disk_usage",
+		Target:          "/",
+		Summary:         "restart api and rotate logs",
+		RiskExplanation: "reversible service restart with a brief interruption",
+		Risk:            RiskL1,
+		RunAs:           "root",
+		Steps: []Step{
+			{
+				Kind:        aiproposal.KindServiceAction,
+				Params:      map[string]any{"name": "api.service", "action": "restart"},
+				Description: "restart api",
+				Command:     "systemctl restart api.service",
+			},
+		},
+		AffectedFiles:    []string{"/etc/api.conf", "/var/log/api.log"},
+		AffectedServices: []string{"api.service", "log-rotate.service"},
+		Interruption:     "api unavailable for ~5s during restart",
+		Rollback: []Command{
+			{Command: "systemctl start api.service", RunAs: "root", Description: "start api again if restart failed"},
+		},
+		Verification: []VerificationCheck{
+			{ID: "chk-1", Kind: "service_active", Target: "api.service", Description: "api.service is active"},
+		},
+		ExternalMonitorIDs: []string{"mon-1", "mon-2"},
+		CreatedAt:          time.Unix(1700000000, 0),
+	}
+	hash, err := ContentHash(rb)
+	if err != nil {
+		panic(err)
+	}
+	rb.ContentHash = hash
+	return rb
+}
+
+// cloneRunbook deep-copies rb's slice/map fields so a test can mutate the
+// clone without aliasing the original's backing arrays.
+func cloneRunbook(rb Runbook) Runbook {
+	c := rb
+	c.Steps = make([]Step, len(rb.Steps))
+	for i, s := range rb.Steps {
+		c.Steps[i] = s
+		c.Steps[i].Params = cloneParams(s.Params)
+	}
+	c.AffectedFiles = append([]string(nil), rb.AffectedFiles...)
+	c.AffectedServices = append([]string(nil), rb.AffectedServices...)
+	c.Rollback = append([]Command(nil), rb.Rollback...)
+	c.Verification = append([]VerificationCheck(nil), rb.Verification...)
+	c.ExternalMonitorIDs = append([]string(nil), rb.ExternalMonitorIDs...)
+	c.ProposalIDs = append([]string(nil), rb.ProposalIDs...)
+	return c
+}
+
+func cloneParams(p map[string]any) map[string]any {
+	if p == nil {
+		return nil
+	}
+	out := make(map[string]any, len(p))
+	for k, v := range p {
+		out[k] = v
+	}
+	return out
+}
+
+// TestClassifyRisk is the exact table from the Task 1 plan: self-reported
+// risk is honoured as a floor, but AI-authored raw shell always forces L3
+// and blocks execution regardless of what the model self-reported.
+func TestClassifyRisk(t *testing.T) {
+	tests := []struct {
+		name     string
+		proposal Proposal
+		want     Risk
+		blocked  bool
+	}{
+		{"read only", Proposal{Risk: RiskL0}, RiskL0, false},
+		{"service restart", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL1, false},
+		{"configuration change", Proposal{Risk: RiskL2}, RiskL2, false},
+		{"raw shell forced destructive", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindSecurityFix, Params: map[string]any{"kind": "run_script", "script": "rm -rf /srv/app/cache"}}}}, RiskL3, true},
+		{"self-reported L3 is blocked even with no forcing step", Proposal{Risk: RiskL3, Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL3, true},
+		{"firewall rule removal on ssh port forces destructive lockout risk", Proposal{Risk: RiskL1, Steps: []Step{{Kind: aiproposal.KindFirewallRemove, Params: map[string]any{"port": 22, "protocol": "tcp"}}}}, RiskL3, true},
+		{"missing/invalid self-reported risk defaults to L2, not silently safe", Proposal{Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}}}, RiskL2, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			risk, blocked := classifyProposal(tt.proposal)
+			if risk != tt.want || blocked != tt.blocked {
+				t.Fatalf("classify = %s,%v want %s,%v", risk, blocked, tt.want, tt.blocked)
+			}
+		})
+	}
+}
+
+func TestRisk_NoLowMediumHighAliasesExist(t *testing.T) {
+	// Compile-time-ish guard: the only valid Risk values are L0-L3. This
+	// test exists so a future regression that reintroduces a
+	// low/medium/high alias constant is caught the moment it's used here.
+	for _, r := range []Risk{RiskL0, RiskL1, RiskL2, RiskL3} {
+		if !r.valid() {
+			t.Fatalf("%q should be a valid risk level", r)
+		}
+	}
+	for _, r := range []Risk{"low", "medium", "high", ""} {
+		if r.valid() {
+			t.Fatalf("%q must not be a valid risk level", r)
+		}
+	}
+}
+
+// TestContentHashChangesForEveryApprovalField is the exact test from the
+// Task 1 plan: every approval-relevant field must move the hash.
+func TestContentHashChangesForEveryApprovalField(t *testing.T) {
+	base := completeRunbookFixture()
+	original := base.ContentHash
+	mutations := []func(*Runbook){
+		func(r *Runbook) { r.Steps[0].Command = "systemctl stop api" },
+		func(r *Runbook) { r.RunAs = "deploy" },
+		func(r *Runbook) { r.AffectedFiles = append(r.AffectedFiles, "/etc/api.conf") },
+		func(r *Runbook) { r.Rollback[0].Command = "systemctl restart api" },
+		func(r *Runbook) { r.Verification[0].Target = "api.socket" },
+	}
+	for _, mutate := range mutations {
+		candidate := cloneRunbook(base)
+		mutate(&candidate)
+		got, err := ContentHash(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == original {
+			t.Fatal("approval-relevant mutation did not change hash")
+		}
+	}
+}
+
+// TestContentHashChangesForRemainingRequiredFields covers the immutable
+// shape fields the plan's table didn't enumerate explicitly (schema
+// version, incident/server/diagnosis IDs, risk, interruption, external
+// monitor IDs, step kind/params/description) so every field in the
+// canonical hash section of the design is actually load-bearing.
+func TestContentHashChangesForRemainingRequiredFields(t *testing.T) {
+	base := completeRunbookFixture()
+	original := base.ContentHash
+	mutations := []func(*Runbook){
+		func(r *Runbook) { r.SchemaVersion = r.SchemaVersion + 1 },
+		func(r *Runbook) { r.IncidentID = "inc-2" },
+		func(r *Runbook) { r.ServerID = "srv-2" },
+		func(r *Runbook) { r.DiagnosisID = "diag-2" },
+		func(r *Runbook) { r.Risk = RiskL2 },
+		func(r *Runbook) { r.Interruption = "extended outage" },
+		func(r *Runbook) { r.AffectedServices = append(r.AffectedServices, "extra.service") },
+		func(r *Runbook) { r.ExternalMonitorIDs = append(r.ExternalMonitorIDs, "mon-3") },
+		func(r *Runbook) { r.Steps[0].Description = "changed description" },
+		func(r *Runbook) { r.Steps[0].Params["name"] = "other.service" },
+		func(r *Runbook) { r.Steps[0].Kind = aiproposal.KindProcessKill },
+		func(r *Runbook) { r.Rollback[0].RunAs = "deploy" },
+		func(r *Runbook) { r.Verification[0].Kind = "socket_listening" },
+		func(r *Runbook) {
+			r.Rollback = append(r.Rollback, Command{Command: "true", RunAs: "root", Description: "extra"})
+		},
+		func(r *Runbook) {
+			r.Verification = append(r.Verification, VerificationCheck{ID: "chk-2", Kind: "socket_listening", Target: "api.socket"})
+		},
+	}
+	for i, mutate := range mutations {
+		candidate := cloneRunbook(base)
+		mutate(&candidate)
+		got, err := ContentHash(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == original {
+			t.Fatalf("mutation #%d did not change the content hash", i)
+		}
+	}
+}
+
+// TestContentHash_LifecycleFieldsExcluded verifies mutable lifecycle
+// fields (ID, timestamps, session, summary/skip bookkeeping, the hash
+// itself, proposal IDs) are NOT part of the canonical hash: recording an
+// execution or a lifecycle transition must never invalidate an
+// already-approved runbook.
+func TestContentHash_LifecycleFieldsExcluded(t *testing.T) {
+	base := completeRunbookFixture()
+	original := base.ContentHash
+	resolved := time.Unix(1700000500, 0)
+	mutations := []func(*Runbook){
+		func(r *Runbook) { r.ID = "rb-2" },
+		func(r *Runbook) { r.CreatedAt = r.CreatedAt.Add(time.Hour) },
+		func(r *Runbook) { r.SessionID = "sess-99" },
+		func(r *Runbook) { r.Summary = "different human summary" },
+		func(r *Runbook) { r.RiskExplanation = "different explanation" },
+		func(r *Runbook) { r.ProviderVersion = "codex-2" },
+		func(r *Runbook) { r.AlertKey = "other:key" },
+		func(r *Runbook) { r.ProposalIDs = []string{"p-1"} },
+		func(r *Runbook) { r.ResolvedAt = &resolved },
+		func(r *Runbook) { r.ContentHash = "stale" },
+	}
+	for i, mutate := range mutations {
+		candidate := cloneRunbook(base)
+		mutate(&candidate)
+		got, err := ContentHash(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != original {
+			t.Fatalf("lifecycle mutation #%d unexpectedly changed the content hash", i)
+		}
+	}
+}
+
+// TestContentHash_AffectedSetsOrderIndependent covers "set sorting":
+// reordering the same set of affected files/services must hash identically.
+func TestContentHash_AffectedSetsOrderIndependent(t *testing.T) {
+	base := completeRunbookFixture()
+	reordered := cloneRunbook(base)
+	reordered.AffectedFiles = []string{"/var/log/api.log", "/etc/api.conf"}
+	reordered.AffectedServices = []string{"log-rotate.service", "api.service"}
+
+	h1, err := ContentHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := ContentHash(reordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Fatalf("reordering affected files/services (same set) changed the hash: %s vs %s", h1, h2)
+	}
+}
+
+// TestContentHash_OrderedListsAreOrderSensitive covers "ordered list
+// sensitivity": unlike affected files/services, steps/rollback/verification
+// execute in order, so reordering them must change the hash.
+func TestContentHash_OrderedListsAreOrderSensitive(t *testing.T) {
+	base := completeRunbookFixture()
+	base.Steps = append(base.Steps, Step{
+		Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "log-rotate.service", "action": "restart"},
+		Command: "systemctl restart log-rotate.service",
+	})
+	base.Rollback = append(base.Rollback, Command{Command: "systemctl stop log-rotate.service", RunAs: "root", Description: "stop the rotate step's target"})
+	base.Verification = append(base.Verification, VerificationCheck{ID: "chk-2", Kind: "service_active", Target: "log-rotate.service"})
+	base.ExternalMonitorIDs = append(base.ExternalMonitorIDs, "mon-3")
+
+	baseHash, err := ContentHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("steps", func(t *testing.T) {
+		reordered := cloneRunbook(base)
+		reordered.Steps[0], reordered.Steps[1] = reordered.Steps[1], reordered.Steps[0]
+		got, err := ContentHash(reordered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == baseHash {
+			t.Fatal("reordering steps did not change the hash")
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		reordered := cloneRunbook(base)
+		reordered.Rollback[0], reordered.Rollback[1] = reordered.Rollback[1], reordered.Rollback[0]
+		got, err := ContentHash(reordered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == baseHash {
+			t.Fatal("reordering rollback steps did not change the hash")
+		}
+	})
+
+	t.Run("verification", func(t *testing.T) {
+		reordered := cloneRunbook(base)
+		reordered.Verification[0], reordered.Verification[1] = reordered.Verification[1], reordered.Verification[0]
+		got, err := ContentHash(reordered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == baseHash {
+			t.Fatal("reordering verification checks did not change the hash")
+		}
+	})
+
+	t.Run("external monitor ids", func(t *testing.T) {
+		reordered := cloneRunbook(base)
+		reordered.ExternalMonitorIDs[0], reordered.ExternalMonitorIDs[1] = reordered.ExternalMonitorIDs[1], reordered.ExternalMonitorIDs[0]
+		got, err := ContentHash(reordered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == baseHash {
+			t.Fatal("reordering external monitor IDs did not change the hash")
+		}
+	})
+}
+
+// TestContentHash_DeterministicAndDoesNotMutateInput covers determinism
+// (same input -> same hash, every call) and the "sort copies ... without
+// mutating the runbook" requirement.
+func TestContentHash_DeterministicAndDoesNotMutateInput(t *testing.T) {
+	base := completeRunbookFixture()
+	filesBefore := append([]string(nil), base.AffectedFiles...)
+	servicesBefore := append([]string(nil), base.AffectedServices...)
+
+	h1, err := ContentHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := ContentHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Fatalf("ContentHash is not deterministic: %s vs %s", h1, h2)
+	}
+	if !reflect.DeepEqual(base.AffectedFiles, filesBefore) {
+		t.Fatalf("ContentHash mutated AffectedFiles order: %v (was %v)", base.AffectedFiles, filesBefore)
+	}
+	if !reflect.DeepEqual(base.AffectedServices, servicesBefore) {
+		t.Fatalf("ContentHash mutated AffectedServices order: %v (was %v)", base.AffectedServices, servicesBefore)
+	}
+}
+
 func TestHandle_CreatesRunbookAndFansOutSteps(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
 		Summary: "rotate journal logs, restart postgres",
-		Risk:    RiskMedium,
+		Risk:    RiskL2,
 		Steps: []Step{
 			{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "postgres.service", "action": "restart"}, Description: "restart postgres"},
 		},
@@ -87,8 +423,17 @@ func TestHandle_CreatesRunbookAndFansOutSteps(t *testing.T) {
 	if rb.Skipped {
 		t.Fatalf("non-empty steps should not be Skipped")
 	}
-	if rb.Risk != RiskMedium {
-		t.Fatalf("risk=%q want medium", rb.Risk)
+	if rb.Risk != RiskL2 {
+		t.Fatalf("risk=%q want L2", rb.Risk)
+	}
+	if rb.Blocked {
+		t.Fatalf("L2 runbook must not be blocked")
+	}
+	if rb.ContentHash == "" {
+		t.Fatalf("expected a non-empty content hash")
+	}
+	if rb.Steps[0].Command != "systemctl restart postgres.service" {
+		t.Fatalf("step command not derived from the typed action: %q", rb.Steps[0].Command)
 	}
 
 	// aiproposal must be queryable with the existing approve path's binding.
@@ -110,11 +455,12 @@ func TestHandle_CreatesRunbookAndFansOutSteps(t *testing.T) {
 func TestHandleManual_UsesSelectedAgentProposerAndBypassesThrottle(t *testing.T) {
 	defaultProp := &stubProposer{result: Proposal{
 		Summary: "default",
+		Risk:    RiskL1,
 		Steps:   []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "default.service", "action": "restart"}}},
 	}}
 	codexProp := &stubProposer{result: Proposal{
 		Summary: "codex fix",
-		Risk:    RiskLow,
+		Risk:    RiskL1,
 		Steps:   []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "deny", "protocol": "tcp", "port": 6379}}},
 	}}
 	apm := aiproposal.New()
@@ -172,7 +518,7 @@ func TestHandleManual_ReturnsProposerError(t *testing.T) {
 func TestHandle_SecurityFixStepFansOutAsProposal(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
 		Summary: "enable auditd",
-		Risk:    RiskLow,
+		Risk:    RiskL1,
 		Steps: []Step{{
 			Kind:        aiproposal.KindSecurityFix,
 			Params:      map[string]any{"kind": "enable_auditd"},
@@ -184,6 +530,9 @@ func TestHandle_SecurityFixStepFansOutAsProposal(t *testing.T) {
 	rb := m.Handle(context.Background(), sampleAlert())
 	if rb.ID == "" || len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] == "" {
 		t.Fatalf("runbook/proposals = %+v", rb)
+	}
+	if rb.Blocked {
+		t.Fatalf("enable_auditd is not raw shell and must not be blocked")
 	}
 	ap, err := apm.Get(rb.ProposalIDs[0])
 	if err != nil {
@@ -197,11 +546,17 @@ func TestHandle_SecurityFixStepFansOutAsProposal(t *testing.T) {
 	}
 }
 
-func TestHandle_RunScriptStepForcesHighRiskAndBindsExactScript(t *testing.T) {
+// TestHandle_RunScriptStepForcesL3BlockedNoProposalFanout covers the L3
+// blocking contract end to end: any AI-authored raw shell step forces L3
+// regardless of the model's self-reported risk, the runbook is fully
+// recorded (steps + exact command display included) for audit, but zero
+// aiproposals are created and BlockedReason recommends a maintenance
+// session instead of an executable proposal.
+func TestHandle_RunScriptStepForcesL3BlockedNoProposalFanout(t *testing.T) {
 	script := "chmod 640 /etc/shadow && chown root:shadow /etc/shadow"
 	prop := &stubProposer{result: Proposal{
 		Summary: "tighten /etc/shadow permissions",
-		Risk:    RiskLow, // model under-reports; manager must not trust this.
+		Risk:    RiskL1, // model under-reports; manager must not trust this.
 		Steps: []Step{{
 			Kind:        aiproposal.KindSecurityFix,
 			Params:      map[string]any{"kind": "run_script", "script": script},
@@ -211,38 +566,55 @@ func TestHandle_RunScriptStepForcesHighRiskAndBindsExactScript(t *testing.T) {
 	m, apm, _ := newTestManager(t, prop)
 
 	rb := m.Handle(context.Background(), sampleAlert())
-	if rb.Risk != RiskHigh {
-		t.Fatalf("risk = %q, want forced high for a run_script step", rb.Risk)
+	if rb.Risk != RiskL3 {
+		t.Fatalf("risk = %q, want forced L3 for a run_script step", rb.Risk)
 	}
-	if len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] == "" {
-		t.Fatalf("step not fanned out: %+v", rb)
+	if !rb.Blocked {
+		t.Fatal("expected Blocked=true for a run_script step")
 	}
-	ap, err := apm.Get(rb.ProposalIDs[0])
-	if err != nil {
-		t.Fatal(err)
+	if rb.BlockedReason != BlockedL3Reason {
+		t.Fatalf("blocked reason = %q, want %q", rb.BlockedReason, BlockedL3Reason)
 	}
-	if ap.TokenAction != "security.fix.run_script" || ap.TokenProjectID != "security" {
-		t.Fatalf("token binding = %s %s", ap.TokenAction, ap.TokenProjectID)
+	if len(rb.ProposalIDs) != 0 {
+		t.Fatalf("blocked L3 runbook must create no executable proposal IDs, got %+v", rb.ProposalIDs)
 	}
-	if len(ap.TokenFiles) != 1 || ap.TokenFiles[0] != script {
-		t.Fatalf("token files = %+v, want exact script text", ap.TokenFiles)
+	if len(apm.List()) != 0 {
+		t.Fatalf("blocked L3 runbook must fan out zero aiproposals, got %d", len(apm.List()))
+	}
+	// Still fully recorded/audited: the exact command is derived from the
+	// same typed action a maintenance session would review.
+	if len(rb.Steps) != 1 || rb.Steps[0].Command != script {
+		t.Fatalf("blocked runbook should still record the exact command for audit: %+v", rb.Steps)
+	}
+	if rb.ContentHash == "" {
+		t.Fatal("blocked runbook must still be content-hashed")
 	}
 }
 
-func TestHandle_RunScriptStepMissingScriptSkipped(t *testing.T) {
+// TestHandle_RunScriptStepMissingScriptStillBlockedNoFanout covers a
+// malformed run_script step: it must still be classified/blocked as L3
+// (it's still an AI-authored raw-shell attempt) even though there is no
+// valid script to derive a command from.
+func TestHandle_RunScriptStepMissingScriptStillBlockedNoFanout(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
 		Summary: "bad step",
-		Risk:    RiskMedium,
+		Risk:    RiskL2,
 		Steps: []Step{{
 			Kind:   aiproposal.KindSecurityFix,
 			Params: map[string]any{"kind": "run_script"},
 		}},
 	}}
-	m, _, _ := newTestManager(t, prop)
+	m, apm, _ := newTestManager(t, prop)
 
 	rb := m.Handle(context.Background(), sampleAlert())
-	if len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] != "" {
-		t.Fatalf("expected invalid step skipped with empty proposal id: %+v", rb.ProposalIDs)
+	if !rb.Blocked || rb.Risk != RiskL3 {
+		t.Fatalf("expected blocked L3, got risk=%q blocked=%v", rb.Risk, rb.Blocked)
+	}
+	if len(rb.ProposalIDs) != 0 {
+		t.Fatalf("expected zero proposal IDs for a blocked runbook, got %+v", rb.ProposalIDs)
+	}
+	if len(apm.List()) != 0 {
+		t.Fatalf("expected zero aiproposals, got %d", len(apm.List()))
 	}
 }
 
@@ -275,7 +647,7 @@ func TestHandle_NoFixRecommendedProducesNoProposalsAndNoPush(t *testing.T) {
 
 func TestHandle_ThrottlePreventsDuplicateWithinWindow(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
-		Summary: "x", Risk: RiskLow,
+		Summary: "x", Risk: RiskL1,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "x.service", "action": "restart"}}},
 	}}
 	m, _, _ := newTestManager(t, prop)
@@ -295,7 +667,7 @@ func TestHandle_ThrottlePreventsDuplicateWithinWindow(t *testing.T) {
 
 func TestHandle_ThrottleAdvancesWithTimeAfterWindow(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
-		Summary: "x", Risk: RiskLow,
+		Summary: "x", Risk: RiskL1,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "x.service", "action": "restart"}}},
 	}}
 	apm := aiproposal.New()
@@ -324,7 +696,7 @@ func TestHandle_ThrottleAdvancesWithTimeAfterWindow(t *testing.T) {
 
 func TestHandle_ThrottleScopedPerAlertKey(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
-		Summary: "x", Risk: RiskLow,
+		Summary: "x", Risk: RiskL1,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "x.service", "action": "restart"}}},
 	}}
 	m, _, _ := newTestManager(t, prop)
@@ -368,6 +740,7 @@ func TestHandle_ProposerErrorStillConsumesThrottleSlot(t *testing.T) {
 func TestHandle_InvalidStepSkippedNotFanout(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
 		Summary: "kill bad process, restart good service",
+		Risk:    RiskL1,
 		Steps: []Step{
 			{Kind: aiproposal.KindProcessKill, Params: map[string]any{"pid": 0}}, // invalid
 			{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "good.service", "action": "restart"}},
@@ -385,6 +758,9 @@ func TestHandle_InvalidStepSkippedNotFanout(t *testing.T) {
 	if rb.ProposalIDs[1] == "" {
 		t.Fatalf("valid step should have a proposal ID")
 	}
+	if rb.Steps[0].Command != "" {
+		t.Fatalf("invalid step should have no derived command, got %q", rb.Steps[0].Command)
+	}
 	if len(apm.List()) != 1 {
 		t.Fatalf("aiproposals=%d, want 1 (only valid step fanned out)", len(apm.List()))
 	}
@@ -392,7 +768,7 @@ func TestHandle_InvalidStepSkippedNotFanout(t *testing.T) {
 
 func TestHandle_PublishesRunbookNotificationWithDeepLink(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
-		Summary: "restart it", Risk: RiskHigh,
+		Summary: "restart it", Risk: RiskL2,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "api.service", "action": "restart"}}},
 	}}
 	m, _, hub := newTestManager(t, prop)
@@ -412,7 +788,7 @@ func TestHandle_PublishesRunbookNotificationWithDeepLink(t *testing.T) {
 	select {
 	case got := <-gotCh:
 		if got.Severity != "critical" {
-			t.Fatalf("high-risk should map to critical severity, got %q", got.Severity)
+			t.Fatalf("L2 should map to critical severity, got %q", got.Severity)
 		}
 		if got.Data["runbook_id"].(string) != rb.ID {
 			t.Fatalf("notification missing runbook_id")
@@ -423,6 +799,59 @@ func TestHandle_PublishesRunbookNotificationWithDeepLink(t *testing.T) {
 		ids, _ := got.Data["proposal_ids"].([]string)
 		if len(ids) != 1 || ids[0] != rb.ProposalIDs[0] {
 			t.Fatalf("proposal_ids missing from notification: %+v", got.Data["proposal_ids"])
+		}
+		if got.Data["blocked"].(bool) {
+			t.Fatalf("non-blocked runbook must publish blocked=false")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no runbook notification within deadline")
+	}
+}
+
+// TestHandle_BlockedL3PublishesCriticalGuidanceNotification covers the
+// blocked-runbook push: it is still critical and still deep-links to the
+// runbook (so the operator can see the guidance), but carries zero
+// proposal IDs and the fixed blocked-reason guidance.
+func TestHandle_BlockedL3PublishesCriticalGuidanceNotification(t *testing.T) {
+	prop := &stubProposer{result: Proposal{
+		Summary: "reformat and reprovision disk",
+		Risk:    RiskL1,
+		Steps: []Step{{
+			Kind:   aiproposal.KindSecurityFix,
+			Params: map[string]any{"kind": "run_script", "script": "mkfs.ext4 /dev/sdb1"},
+		}},
+	}}
+	m, _, hub := newTestManager(t, prop)
+
+	gotCh := make(chan notifications.Notification, 1)
+	unsub := hub.Subscribe(func(n notifications.Notification) {
+		if n.Type == "infra.runbook" {
+			select {
+			case gotCh <- n:
+			default:
+			}
+		}
+	})
+	defer unsub()
+
+	rb := m.Handle(context.Background(), sampleAlert())
+	if !rb.Blocked {
+		t.Fatal("expected blocked runbook")
+	}
+	select {
+	case got := <-gotCh:
+		if got.Severity != "critical" {
+			t.Fatalf("blocked L3 should publish critical severity, got %q", got.Severity)
+		}
+		if got.Data["blocked"].(bool) != true {
+			t.Fatalf("notification must carry blocked=true")
+		}
+		if got.Data["blocked_reason"].(string) != BlockedL3Reason {
+			t.Fatalf("notification blocked_reason = %q", got.Data["blocked_reason"])
+		}
+		ids, _ := got.Data["proposal_ids"].([]string)
+		if len(ids) != 0 {
+			t.Fatalf("blocked runbook notification must carry zero proposal ids, got %+v", ids)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no runbook notification within deadline")
@@ -456,7 +885,7 @@ func TestStart_FiredAlertProducesProposalQuickly(t *testing.T) {
 	// well under one second to keep CI fast while still proving the
 	// alert -> hub -> manager -> aiproposal chain is wired async.
 	prop := &stubProposer{result: Proposal{
-		Summary: "x", Risk: RiskLow,
+		Summary: "x", Risk: RiskL1,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "x.service", "action": "restart"}}},
 	}}
 	m, apm, hub := newTestManager(t, prop)
@@ -512,7 +941,7 @@ func TestStart_AlertClearedDoesNotTrigger(t *testing.T) {
 
 func TestSessionHook_AttributesRunbookAndRecordsTrace(t *testing.T) {
 	prop := &stubProposer{result: Proposal{
-		Summary: "do thing", Risk: RiskLow,
+		Summary: "do thing", Risk: RiskL1,
 		Steps: []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "x.service", "action": "restart"}}},
 	}}
 	apm := aiproposal.New()

@@ -255,6 +255,13 @@ func tryParse(b []byte) (Proposal, bool) {
 	if p.Summary == "" && len(p.Steps) == 0 && p.Risk == "" {
 		return Proposal{}, false
 	}
+	// Strict new contract: a proposal with steps to execute must carry
+	// a valid L0-L3 risk. There are no low/medium/high aliases and no
+	// silent coercion — an invalid or missing risk on a non-empty-steps
+	// proposal is malformed output, not a "no fix recommended" runbook.
+	if len(p.Steps) > 0 && !p.Risk.valid() {
+		return Proposal{}, false
+	}
 	return p, true
 }
 
@@ -392,9 +399,21 @@ func buildPrompt(alert Alert, g Grounding) (string, error) {
 	var b strings.Builder
 	b.WriteString("You are an on-call SRE assistant. An infrastructure alert just fired on a server. ")
 	b.WriteString("Propose a remediation as a JSON object with exactly these keys:\n")
-	b.WriteString("  summary: one-sentence human description of the proposed fix\n")
-	b.WriteString("  risk:    one of \"low\" | \"medium\" | \"high\"\n")
-	b.WriteString("  steps:   array of step objects, each {kind, params, description}\n")
+	b.WriteString("  summary:            one-sentence human description of the proposed fix\n")
+	b.WriteString("  risk:               one of \"L0\" | \"L1\" | \"L2\" | \"L3\" (no other value is accepted)\n")
+	b.WriteString("    L0 = read-only observation/verification, no mutation\n")
+	b.WriteString("    L1 = low-risk, reversible mutation with narrow interruption\n")
+	b.WriteString("    L2 = configuration or broader service change\n")
+	b.WriteString("    L3 = destructive, irreversible, or high-blast-radius (blocked from auto-execution)\n")
+	b.WriteString("  riskExplanation:    one sentence justifying the chosen risk level\n")
+	b.WriteString("  runAs:              effective user the steps execute as (e.g. \"root\")\n")
+	b.WriteString("  affectedFiles:      array of file paths touched by the fix (may be empty)\n")
+	b.WriteString("  affectedServices:   array of service names touched by the fix (may be empty)\n")
+	b.WriteString("  interruption:       one sentence describing expected user-visible interruption (may be empty)\n")
+	b.WriteString("  rollback:           array of {command, runAs, description} steps that undo the fix (may be empty)\n")
+	b.WriteString("  verification:       array of {id, kind, target, description} internal checks to confirm success (may be empty)\n")
+	b.WriteString("  externalMonitorIds: array of external monitor IDs this fix should be verified against (may be empty)\n")
+	b.WriteString("  steps:              array of step objects, each {kind, params, description}\n")
 	b.WriteString("Allowed step kinds and required params:\n")
 	b.WriteString("  - infra.service.action      params={name:string, action:\"start\"|\"stop\"|\"restart\"}\n")
 	b.WriteString("  - infra.process.kill        params={pid:int, start_time_ticks:int, signal:\"TERM\"|\"KILL\"}\n")
@@ -403,9 +422,9 @@ func buildPrompt(alert Alert, g Grounding) (string, error) {
 	b.WriteString("  - security.fix              params={kind:\"close_port\"|\"kill_process\"|\"enable_auditd\"|\"run_script\", port:int, protocol:string, pid:int, start_time_ticks:int, signal:string, script:string}\n")
 	b.WriteString("    run_script is the ONLY way to propose a raw shell command; use it whenever the fix needs something none of the other typed kinds cover ")
 	b.WriteString("(e.g. correcting ownership/permissions on a file such as /etc/shadow). script must be a POSIX sh script that does exactly what the finding ")
-	b.WriteString("requires and nothing else, is idempotent, and contains no destructive side effects beyond the fix itself; it always runs as root and always ")
-	b.WriteString("requires the operator's individual biometric approval, never a batch \"approve all\". Prefer run_script over returning steps=[] whenever a ")
-	b.WriteString("safe, minimal shell fix exists.\n")
+	b.WriteString("requires and nothing else, is idempotent, and contains no destructive side effects beyond the fix itself; it always runs as root, always ")
+	b.WriteString("classifies as L3, and is always blocked from auto-execution — the operator must run it manually in a maintenance session. Prefer a typed ")
+	b.WriteString("kind (L0-L2) over run_script whenever one covers the fix.\n")
 	b.WriteString("If no safe automated remediation is possible even as a script, return steps=[] with a summary explaining why; ")
 	b.WriteString("do NOT invent steps. Output JSON only — no prose, no code fences.\n\n")
 	b.WriteString("ALERT:\n")

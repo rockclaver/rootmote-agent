@@ -1,20 +1,26 @@
-// Package runbook turns a fired infrastructure alert into a proposed,
-// human-approvable remediation: when an alert fires, the manager grounds an AI
-// proposer on the current infra read, asks for a structured
-// {summary, steps[], risk} runbook, and fans each step out as an aiproposal
-// entry. Approval still flows through the existing biometric +
-// confirmation-token path on aiproposal — runbook never bypasses it.
+// Package runbook turns a fired infrastructure alert (or an operator's
+// manual remediation request) into an immutable, human-approvable runbook:
+// when an alert fires, the manager grounds an AI proposer on the current
+// infra read, asks for a structured Proposal, classifies its risk on the
+// L0-L3 scale, computes a canonical content hash over every
+// approval-relevant field, and — unless the runbook is blocked as L3 —
+// fans each step out as an aiproposal entry. Approval still flows through
+// the existing biometric + confirmation-token path on aiproposal — runbook
+// never bypasses it.
 //
-// The package owns only orchestration: alert -> proposer -> aiproposal. The
-// proposer is an interface (see Proposer) so the host process can wire a real
-// CLI-backed proposer (see CLIProposer) in production and a stub in tests
-// without dragging the LLM specifics into this package.
+// The package owns only orchestration: alert -> proposer -> classify ->
+// hash -> aiproposal. The proposer is an interface (see Proposer) so the
+// host process can wire a real CLI-backed proposer (see CLIProposer) in
+// production and a stub in tests without dragging the LLM specifics into
+// this package.
 package runbook
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -31,33 +37,94 @@ import (
 // alert per server per 10 minutes"). Exposed so tests can override.
 const DefaultThrottle = 10 * time.Minute
 
-// Risk classifies the blast radius of executing a runbook end-to-end. The AC
-// mandates that risky multi-step runbooks support per-step approval; the
-// client uses Risk to decide whether to offer the one-tap "approve all".
+// SchemaVersion is the runbook content schema version hashed into
+// ContentHash. Bumping it invalidates every previously computed hash rather
+// than letting an incompatible field change silently compare apples to
+// oranges.
+const SchemaVersion = 1
+
+// BlockedL3Reason is the fixed guidance recorded on every blocked L3
+// runbook. It is deliberately a constant, not a per-runbook free-text
+// field: the operator-facing message for "this cannot be auto-executed"
+// must never vary by proposal content.
+const BlockedL3Reason = "Destructive L3 remediation requires a maintenance session"
+
+// Risk classifies the blast radius of executing a runbook end-to-end on the
+// agent's authoritative L0-L3 scale (see the Watchtower remediation design):
+//
+//	L0 - read-only observation or verification; may run automatically.
+//	L1 - low-risk, reversible mutation with narrow interruption.
+//	L2 - configuration or broader service change.
+//	L3 - destructive, irreversible, or high-blast-radius; blocked by
+//	     default and recommends a full maintenance session instead.
+//
+// There are no low/medium/high aliases: every caller uses RiskL0-RiskL3.
 type Risk string
 
 const (
-	RiskLow    Risk = "low"
-	RiskMedium Risk = "medium"
-	RiskHigh   Risk = "high"
+	RiskL0 Risk = "L0"
+	RiskL1 Risk = "L1"
+	RiskL2 Risk = "L2"
+	RiskL3 Risk = "L3"
 )
+
+// valid reports whether r is one of the four defined risk levels.
+func (r Risk) valid() bool {
+	switch r {
+	case RiskL0, RiskL1, RiskL2, RiskL3:
+		return true
+	}
+	return false
+}
 
 // Step is one concrete remediation action. Kind/Params map 1:1 to an
 // aiproposal kind so the existing guard + token + execute path handles it
-// verbatim; nothing in this file ever touches a host directly.
+// verbatim; nothing in this file ever touches a host directly. Command is
+// the exact command display for the step — it is always derived
+// server-side from Kind+Params by tokenBindingForKind, never taken
+// verbatim from the AI, so what the operator sees is provably what will
+// execute.
 type Step struct {
 	Kind        aiproposal.Kind `json:"kind"`
 	Params      map[string]any  `json:"params"`
 	Description string          `json:"description"`
+	Command     string          `json:"command,omitempty"`
 }
 
-// Proposal is the AI's structured response. An empty Steps slice with a
-// non-empty Summary is the "no automated fix recommended" path: the manager
-// records it but produces no approval card and emits no push.
+// Command is one exact, typed command display: used both for a Step's
+// rendered command and for a Runbook's ordered rollback steps.
+type Command struct {
+	Command     string `json:"command"`
+	RunAs       string `json:"runAs"`
+	Description string `json:"description"`
+}
+
+// VerificationCheck is one typed, bounded internal verification the agent
+// runs after execution to confirm the remediation actually worked.
+type VerificationCheck struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Target      string `json:"target"`
+	Description string `json:"description"`
+}
+
+// Proposal is the AI's structured response: the full immutable runbook
+// shape minus the orchestration fields (ID, hash, timestamps) the manager
+// fills in. An empty Steps slice with a non-empty Summary is the "no
+// automated fix recommended" path: the manager records it but produces no
+// approval card and emits no push.
 type Proposal struct {
-	Summary string `json:"summary"`
-	Steps   []Step `json:"steps"`
-	Risk    Risk   `json:"risk"`
+	Summary            string              `json:"summary"`
+	RiskExplanation    string              `json:"riskExplanation,omitempty"`
+	Risk               Risk                `json:"risk"`
+	Steps              []Step              `json:"steps"`
+	RunAs              string              `json:"runAs,omitempty"`
+	AffectedFiles      []string            `json:"affectedFiles,omitempty"`
+	AffectedServices   []string            `json:"affectedServices,omitempty"`
+	Interruption       string              `json:"interruption,omitempty"`
+	Rollback           []Command           `json:"rollback,omitempty"`
+	Verification       []VerificationCheck `json:"verification,omitempty"`
+	ExternalMonitorIDs []string            `json:"externalMonitorIds,omitempty"`
 }
 
 // Alert is the trigger payload the manager hands to the proposer. It mirrors
@@ -106,20 +173,43 @@ type Proposer interface {
 	Propose(ctx context.Context, alert Alert, grounding Grounding) (Proposal, error)
 }
 
-// Runbook is one stored entry: the AI's structured proposal plus the IDs of
-// the aiproposals fanned out from its steps. The client uses RunbookID to
-// open the approval-card screen; ProposalIDs lets it render the steps with
-// their per-step lifecycle (pending / executing / executed / declined).
+// Runbook is one stored, immutable entry: the AI's structured proposal —
+// classified onto the L0-L3 scale and content-hashed — plus the IDs of the
+// aiproposals fanned out from its steps. The client uses RunbookID to open
+// the approval-card screen; ProposalIDs lets it render the steps with their
+// per-step lifecycle (pending / executing / executed / declined). A blocked
+// L3 runbook is still recorded and audited but carries no proposal IDs at
+// all — see BlockedL3Reason.
 type Runbook struct {
-	ID          string     `json:"id"`
-	AlertKey    string     `json:"alert_key"`
-	ServerID    string     `json:"server_id"`
-	Rule        string     `json:"rule"`
-	Target      string     `json:"target"`
-	SessionID   string     `json:"session_id,omitempty"`
-	Summary     string     `json:"summary"`
-	Risk        Risk       `json:"risk"`
-	Steps       []Step     `json:"steps"`
+	ID              string `json:"id"`
+	SchemaVersion   int    `json:"schemaVersion"`
+	IncidentID      string `json:"incidentId,omitempty"`
+	DiagnosisID     string `json:"diagnosisId,omitempty"`
+	ProviderVersion string `json:"providerVersion,omitempty"`
+
+	AlertKey  string `json:"alert_key"`
+	ServerID  string `json:"server_id"`
+	Rule      string `json:"rule"`
+	Target    string `json:"target"`
+	SessionID string `json:"session_id,omitempty"`
+
+	Summary         string `json:"summary"`
+	RiskExplanation string `json:"riskExplanation,omitempty"`
+	Risk            Risk   `json:"risk"`
+	RunAs           string `json:"runAs,omitempty"`
+
+	Steps              []Step              `json:"steps"`
+	AffectedFiles      []string            `json:"affectedFiles,omitempty"`
+	AffectedServices   []string            `json:"affectedServices,omitempty"`
+	Interruption       string              `json:"interruption,omitempty"`
+	Rollback           []Command           `json:"rollback,omitempty"`
+	Verification       []VerificationCheck `json:"verification,omitempty"`
+	ExternalMonitorIDs []string            `json:"externalMonitorIds,omitempty"`
+
+	Blocked       bool   `json:"blocked,omitempty"`
+	BlockedReason string `json:"blockedReason,omitempty"`
+	ContentHash   string `json:"contentHash,omitempty"`
+
 	ProposalIDs []string   `json:"proposal_ids"`
 	CreatedAt   time.Time  `json:"created_at"`
 	Skipped     bool       `json:"skipped,omitempty"` // true when AI returned "no fix"
@@ -274,36 +364,114 @@ func throttleKey(a Alert) string {
 	return a.ServerID + "|" + a.Rule + "|" + a.Target
 }
 
-// materialise records the runbook, fans steps out as aiproposals, and emits
-// one "infra.runbook" notification with the deep-link payload.
+// classifyProposal determines the authoritative Risk for p and whether it
+// must be blocked from execution. Classification only ever raises risk:
+// the model's self-reported Risk is honoured as a floor, never trusted to
+// lower a step the manager independently judges more dangerous. An invalid
+// or missing self-reported Risk defaults to RiskL2 (the manager does not
+// trust an absent classification to mean "safe"). Raw AI-authored shell
+// (security.fix/run_script) and a firewall change that risks locking out
+// management access always classify as L3 and are blocked — an L3 verdict,
+// regardless of source, is always blocked: the destructive/irreversible/
+// high-blast-radius definition of L3 admits no auto-executable exception.
+func classifyProposal(p Proposal) (Risk, bool) {
+	risk := p.Risk
+	if !risk.valid() {
+		risk = RiskL2
+	}
+	if forcesL3(p.Steps) {
+		return RiskL3, true
+	}
+	if risk == RiskL3 {
+		return RiskL3, true
+	}
+	return risk, false
+}
+
+// forcesL3 reports whether any step in steps must classify the whole
+// runbook as L3 regardless of the model's self-reported risk.
+func forcesL3(steps []Step) bool {
+	for _, step := range steps {
+		if isRunScriptStep(step) || isFirewallLockoutStep(step) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRunScriptStep reports whether step is an AI-authored raw-shell
+// remediation (aiproposal.KindSecurityFix, params.kind=="run_script"). Raw
+// shell has no typed guard rails, so it always forces L3.
+func isRunScriptStep(step Step) bool {
+	if step.Kind != aiproposal.KindSecurityFix {
+		return false
+	}
+	kind, _ := step.Params["kind"].(string)
+	return kind == "run_script"
+}
+
+// isFirewallLockoutStep reports whether step removes the firewall rule
+// for port 22 (SSH) — the canonical "firewall lockout risk" the design
+// calls out as L3 even though infra.firewall.rule_remove is otherwise a
+// narrow, reversible mutation.
+func isFirewallLockoutStep(step Step) bool {
+	if step.Kind != aiproposal.KindFirewallRemove {
+		return false
+	}
+	return intFrom(step.Params["port"]) == 22
+}
+
+// materialise records the runbook, fans steps out as aiproposals (unless
+// blocked as L3), and emits one "infra.runbook" notification with the
+// deep-link payload.
 func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook {
 	now := m.cfg.Now()
 	id := randomID()
 
-	rb := Runbook{
-		ID:        id,
-		AlertKey:  a.Rule + ":" + a.Target,
-		ServerID:  a.ServerID,
-		Rule:      a.Rule,
-		Target:    a.Target,
-		Summary:   p.Summary,
-		Risk:      p.Risk,
-		Steps:     append([]Step(nil), p.Steps...),
-		CreatedAt: now,
-	}
-	if rb.Risk == "" {
-		rb.Risk = RiskMedium
-	}
-	// A run_script step executes an AI-authored shell script as root with no
-	// typed guard rails; the model's self-reported Risk is not trusted for
-	// this — force high so the mobile client (see _canOfferApproveAll)
-	// always requires a fresh per-step biometric instead of one-tap
-	// "approve all".
-	for _, step := range rb.Steps {
-		if isRunScriptStep(step) {
-			rb.Risk = RiskHigh
-			break
+	// Render each step's exact command display server-side from its typed
+	// Kind+Params — never taken verbatim from the AI — so what the
+	// operator sees in the approval sheet is provably what will execute.
+	// tokenBindingForKind is the single source of truth for both the
+	// confirmation-token binding and this display; a step that fails
+	// validation here is left with an empty Command and is skipped from
+	// the aiproposal fan-out below.
+	steps := make([]Step, len(p.Steps))
+	for i, step := range p.Steps {
+		params := step.Params
+		if params == nil {
+			params = map[string]any{}
 		}
+		steps[i] = Step{Kind: step.Kind, Params: params, Description: step.Description}
+		if _, _, command, _, err := tokenBindingForKind(step.Kind, params); err == nil {
+			steps[i].Command = command
+		}
+	}
+
+	risk, blocked := classifyProposal(p)
+
+	rb := Runbook{
+		ID:                 id,
+		SchemaVersion:      SchemaVersion,
+		AlertKey:           a.Rule + ":" + a.Target,
+		ServerID:           a.ServerID,
+		Rule:               a.Rule,
+		Target:             a.Target,
+		Summary:            p.Summary,
+		RiskExplanation:    p.RiskExplanation,
+		Risk:               risk,
+		RunAs:              p.RunAs,
+		Steps:              steps,
+		AffectedFiles:      append([]string(nil), p.AffectedFiles...),
+		AffectedServices:   append([]string(nil), p.AffectedServices...),
+		Interruption:       p.Interruption,
+		Rollback:           append([]Command(nil), p.Rollback...),
+		Verification:       append([]VerificationCheck(nil), p.Verification...),
+		ExternalMonitorIDs: append([]string(nil), p.ExternalMonitorIDs...),
+		CreatedAt:          now,
+	}
+	if blocked {
+		rb.Blocked = true
+		rb.BlockedReason = BlockedL3Reason
 	}
 
 	// Run the optional Session hook so the AC's "agent automatically opens
@@ -328,20 +496,30 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		} else {
 			rb.SkippedMsg = "no automated fix recommended"
 		}
+		rb.ContentHash = mustContentHash(rb)
 		m.store(rb)
 		return rb
 	}
 
-	for _, step := range p.Steps {
-		params := step.Params
-		if params == nil {
-			params = map[string]any{}
-		}
+	// Blocked L3 path: the runbook is fully recorded and audited (steps,
+	// exact commands, rollback, verification — everything an operator
+	// needs to see why it was blocked and what a maintenance session would
+	// do) but produces zero executable proposal IDs. incident.runbook.execute
+	// (Task 3) rejects an L3 runbook outright even if one somehow reached
+	// it; this package additionally never gives it anything to execute.
+	if rb.Blocked {
+		rb.ContentHash = mustContentHash(rb)
+		m.store(rb)
+		m.publish(ctx, rb)
+		return rb
+	}
+
+	for _, step := range rb.Steps {
 		rationale := step.Description
 		if rationale == "" {
 			rationale = p.Summary
 		}
-		action, projectID, files, err := tokenBindingForKind(step.Kind, params)
+		action, projectID, _, files, err := tokenBindingForKind(step.Kind, step.Params)
 		if err != nil {
 			// Skip invalid steps but keep the runbook so the operator
 			// sees what the AI proposed and why it was malformed. The
@@ -351,7 +529,7 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		}
 		ap, err := m.cfg.AIProposals.Create(aiproposal.Proposal{
 			Kind:           step.Kind,
-			Params:         params,
+			Params:         step.Params,
 			Rationale:      rationale,
 			SessionID:      rb.SessionID,
 			TokenAction:    action,
@@ -365,41 +543,154 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 		rb.ProposalIDs = append(rb.ProposalIDs, ap.ID)
 	}
 
+	rb.ContentHash = mustContentHash(rb)
 	m.store(rb)
 	m.publish(ctx, rb)
 	return rb
+}
+
+// mustContentHash computes rb's content hash, treating a hash failure as a
+// programmer error: Params originates from json.Unmarshal (string, float64,
+// bool, nil, []any, map[string]any only) and is therefore always
+// marshalable, so ContentHash cannot fail on any runbook this package
+// constructs.
+func mustContentHash(rb Runbook) string {
+	hash, err := ContentHash(rb)
+	if err != nil {
+		panic(fmt.Sprintf("runbook: content hash: %v", err))
+	}
+	return hash
+}
+
+// canonicalRunbook is the canonical, hashable shape of a Runbook: every
+// execution-relevant field the design's canonical-hash section lists, and
+// nothing else. Lifecycle/mutable fields (ID, timestamps, ContentHash
+// itself, Skipped*, ProposalIDs, SessionID, ...) are deliberately absent —
+// recording an execution or a lifecycle transition must never change an
+// already-approved runbook's hash.
+type canonicalRunbook struct {
+	SchemaVersion      int                 `json:"schemaVersion"`
+	IncidentID         string              `json:"incidentId"`
+	ServerID           string              `json:"serverId"`
+	DiagnosisID        string              `json:"diagnosisId"`
+	Risk               Risk                `json:"risk"`
+	Steps              []canonicalStep     `json:"steps"`
+	RunAs              string              `json:"runAs"`
+	AffectedFiles      []string            `json:"affectedFiles"`
+	AffectedServices   []string            `json:"affectedServices"`
+	Interruption       string              `json:"interruption"`
+	Rollback           []Command           `json:"rollback"`
+	Verification       []VerificationCheck `json:"verification"`
+	ExternalMonitorIDs []string            `json:"externalMonitorIds"`
+}
+
+type canonicalStep struct {
+	Kind        string         `json:"kind"`
+	Params      map[string]any `json:"params"`
+	Command     string         `json:"command"`
+	Description string         `json:"description"`
+}
+
+// ContentHash computes the canonical SHA-256 content hash of rb: the
+// integrity fingerprint the phone binds its confirmation token to and the
+// agent recomputes before ever mutating a host (see the approval/integrity
+// section of the remediation design). Ordered fields (steps, rollback,
+// verification, external monitor IDs) stay in their given order; the
+// affected-file/service sets are hashed after sorting a *copy* so two
+// operationally-identical runbooks that merely enumerate the same set in a
+// different order hash identically — rb is never mutated by this call.
+func ContentHash(rb Runbook) (string, error) {
+	canonical := canonicalRunbook{
+		SchemaVersion:      rb.SchemaVersion,
+		IncidentID:         rb.IncidentID,
+		ServerID:           rb.ServerID,
+		DiagnosisID:        rb.DiagnosisID,
+		Risk:               rb.Risk,
+		Steps:              canonicalSteps(rb.Steps),
+		RunAs:              rb.RunAs,
+		AffectedFiles:      sortedCopy(rb.AffectedFiles),
+		AffectedServices:   sortedCopy(rb.AffectedServices),
+		Interruption:       rb.Interruption,
+		Rollback:           append([]Command(nil), rb.Rollback...),
+		Verification:       append([]VerificationCheck(nil), rb.Verification...),
+		ExternalMonitorIDs: append([]string(nil), rb.ExternalMonitorIDs...),
+	}
+	raw, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("runbook: marshal canonical content: %w", err)
+	}
+	// Round-trip through a generic map so every nesting level's object
+	// keys end up lexicographically sorted — encoding/json sorts
+	// map[string]any keys on Marshal — independent of the Go struct
+	// field declaration order above. This is what makes the hash
+	// reproducible across processes/versions without hand-sorting every
+	// struct's fields.
+	var generic any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return "", fmt.Errorf("runbook: canonicalize content: %w", err)
+	}
+	sorted, err := json.Marshal(generic)
+	if err != nil {
+		return "", fmt.Errorf("runbook: marshal sorted content: %w", err)
+	}
+	sum := sha256.Sum256(sorted)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalSteps(steps []Step) []canonicalStep {
+	out := make([]canonicalStep, len(steps))
+	for i, s := range steps {
+		out[i] = canonicalStep{
+			Kind:        string(s.Kind),
+			Params:      s.Params,
+			Command:     s.Command,
+			Description: s.Description,
+		}
+	}
+	return out
+}
+
+// sortedCopy returns a lexicographically sorted copy of ss; ss itself is
+// never mutated.
+func sortedCopy(ss []string) []string {
+	out := append([]string(nil), ss...)
+	sort.Strings(out)
+	return out
 }
 
 // tokenBindingForKind mirrors the binding helpers the server uses for
 // human-initiated infra mutations so the aiproposal's confirmation token
 // hashes the same way regardless of source. Kept here (rather than imported
 // from server) because importing server would close an architectural cycle:
-// server already imports runbook.
-func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, projectID string, files []string, err error) {
+// server already imports runbook. It is also the single source of truth for
+// each step's exact command display (see Step.Command): the display is
+// derived from the same validated typed action that executes, never a
+// friendly-only substitute.
+func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, projectID, command string, files []string, err error) {
 	switch kind {
 	case aiproposal.KindServiceAction:
 		name, _ := params["name"].(string)
 		act, _ := params["action"].(string)
 		if name == "" || act == "" {
-			return "", "", nil, errors.New("service step missing name/action")
+			return "", "", "", nil, errors.New("service step missing name/action")
 		}
 		// Binding shape matches serviceLifecycleTokenBinding in server.
-		return "infra.service." + act, "infra", []string{name}, nil
+		return "infra.service." + act, "infra", fmt.Sprintf("systemctl %s %s", act, name), []string{name}, nil
 	case aiproposal.KindProcessKill:
 		pid := intFrom(params["pid"])
 		startTicks := uint64From(params["start_time_ticks"])
 		sig, _ := params["signal"].(string)
 		if pid <= 0 || startTicks == 0 {
-			return "", "", nil, errors.New("process_kill step missing pid/start_time_ticks")
+			return "", "", "", nil, errors.New("process_kill step missing pid/start_time_ticks")
 		}
 		if sig == "" {
 			sig = "TERM"
 		}
-		return "infra.process.kill", "infra", []string{fmt.Sprintf("pid:%d:%d:%s", pid, startTicks, sig)}, nil
+		return "infra.process.kill", "infra", fmt.Sprintf("kill -%s %d", sig, pid), []string{fmt.Sprintf("pid:%d:%d:%s", pid, startTicks, sig)}, nil
 	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
 		port := intFrom(params["port"])
 		if port <= 0 {
-			return "", "", nil, errors.New("firewall step missing port")
+			return "", "", "", nil, errors.New("firewall step missing port")
 		}
 		proto, _ := params["protocol"].(string)
 		if proto == "" {
@@ -408,28 +699,40 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 		actStr, _ := params["action"].(string)
 		source, _ := params["source"].(string)
 		verb := "rule_add"
+		cmdVerb := "insert"
 		if kind == aiproposal.KindFirewallRemove {
 			verb = "rule_remove"
+			cmdVerb = "delete"
 		}
-		return "infra.firewall." + verb, "infra", []string{fmt.Sprintf("%s:%s:%d:%s:%s", actStr, proto, port, source, "")}, nil
+		policy := actStr
+		if policy == "" {
+			policy = "deny"
+		}
+		cmd := fmt.Sprintf("ufw %s %s %d/%s", cmdVerb, policy, port, proto)
+		return "infra.firewall." + verb, "infra", cmd, []string{fmt.Sprintf("%s:%s:%d:%s:%s", actStr, proto, port, source, "")}, nil
 	case aiproposal.KindSecurityFix:
 		fixKind, _ := params["kind"].(string)
 		if fixKind == "" {
-			return "", "", nil, errors.New("security fix step missing kind")
+			return "", "", "", nil, errors.New("security fix step missing kind")
 		}
 		if fixKind == "run_script" {
 			script, _ := params["script"].(string)
 			if strings.TrimSpace(script) == "" {
-				return "", "", nil, errors.New("security fix step missing script")
+				return "", "", "", nil, errors.New("security fix step missing script")
 			}
 			// Bind to the exact script text (not a short label) so the
-			// confirmation token's action hash pins approval to precisely
-			// what will execute as root.
-			return "security.fix.run_script", "security", []string{script}, nil
+			// confirmation token's action hash — and the displayed
+			// command — pin approval to precisely what will execute as
+			// root.
+			return "security.fix.run_script", "security", script, []string{script}, nil
 		}
-		return "security.fix." + fixKind, "security", []string{securityFixTarget(fixKind, params)}, nil
+		cmd, err := securityFixCommand(fixKind, params)
+		if err != nil {
+			return "", "", "", nil, err
+		}
+		return "security.fix." + fixKind, "security", cmd, []string{securityFixTarget(fixKind, params)}, nil
 	}
-	return "", "", nil, fmt.Errorf("runbook: unsupported step kind %q", kind)
+	return "", "", "", nil, fmt.Errorf("runbook: unsupported step kind %q", kind)
 }
 
 func securityFixTarget(kind string, params map[string]any) string {
@@ -449,17 +752,35 @@ func securityFixTarget(kind string, params map[string]any) string {
 	}
 }
 
-// isRunScriptStep reports whether step is an AI-authored raw-shell
-// remediation (aiproposal.KindSecurityFix, params.kind=="run_script"). Used
-// by materialise to force the runbook's overall Risk to high regardless of
-// what the model self-reported.
-func isRunScriptStep(step Step) bool {
-	if step.Kind != aiproposal.KindSecurityFix {
-		return false
+func securityFixCommand(kind string, params map[string]any) (string, error) {
+	switch kind {
+	case "close_port":
+		proto, _ := params["protocol"].(string)
+		if proto == "" {
+			proto = "tcp"
+		}
+		port := intFrom(params["port"])
+		if port <= 0 {
+			return "", errors.New("close_port step missing port")
+		}
+		return fmt.Sprintf("iptables -A INPUT -p %s --dport %d -j DROP", proto, port), nil
+	case "kill_process":
+		pid := intFrom(params["pid"])
+		if pid <= 0 {
+			return "", errors.New("kill_process step missing pid")
+		}
+		sig, _ := params["signal"].(string)
+		if sig == "" {
+			sig = "TERM"
+		}
+		return fmt.Sprintf("kill -%s %d", sig, pid), nil
+	case "enable_auditd":
+		return "systemctl enable --now auditd", nil
+	default:
+		return "", fmt.Errorf("runbook: unsupported security fix kind %q", kind)
 	}
-	kind, _ := step.Params["kind"].(string)
-	return kind == "run_script"
 }
+
 func intFrom(v any) int {
 	switch n := v.(type) {
 	case float64:
@@ -497,16 +818,24 @@ func (m *Manager) store(rb Runbook) {
 // publish broadcasts a single "infra.runbook" notification whose payload
 // gives the mobile client everything it needs to deep-link into the
 // approval-card screen (RunbookID) and to render the row in inbox (Summary,
-// Risk, ProposalIDs count).
+// Risk, ProposalIDs count, Blocked/BlockedReason for the L3 case).
 func (m *Manager) publish(ctx context.Context, rb Runbook) {
 	if m.cfg.Notifications == nil {
 		return
 	}
 	severity := "warning"
-	if rb.Risk == RiskHigh {
+	if rb.Blocked || rb.Risk == RiskL2 || rb.Risk == RiskL3 {
 		severity = "critical"
 	}
 	body := rb.Summary
+	if rb.Blocked {
+		switch {
+		case rb.Summary != "":
+			body = rb.Summary + " — " + rb.BlockedReason
+		default:
+			body = rb.BlockedReason
+		}
+	}
 	if body == "" {
 		body = fmt.Sprintf("%d-step runbook for %s", len(rb.ProposalIDs), rb.AlertKey)
 	}
@@ -518,17 +847,20 @@ func (m *Manager) publish(ctx context.Context, rb Runbook) {
 		Severity:  severity,
 		CreatedAt: rb.CreatedAt,
 		Data: map[string]any{
-			"runbook_id":   rb.ID,
-			"alert_key":    rb.AlertKey,
-			"server_id":    rb.ServerID,
-			"rule":         rb.Rule,
-			"target":       rb.Target,
-			"summary":      rb.Summary,
-			"risk":         string(rb.Risk),
-			"session_id":   rb.SessionID,
-			"proposal_ids": rb.ProposalIDs,
-			"step_count":   len(rb.Steps),
-			"deep_link":    "runbook/" + rb.ID,
+			"runbook_id":     rb.ID,
+			"alert_key":      rb.AlertKey,
+			"server_id":      rb.ServerID,
+			"rule":           rb.Rule,
+			"target":         rb.Target,
+			"summary":        rb.Summary,
+			"risk":           string(rb.Risk),
+			"session_id":     rb.SessionID,
+			"proposal_ids":   rb.ProposalIDs,
+			"step_count":     len(rb.Steps),
+			"deep_link":      "runbook/" + rb.ID,
+			"blocked":        rb.Blocked,
+			"blocked_reason": rb.BlockedReason,
+			"content_hash":   rb.ContentHash,
 		},
 	})
 }
