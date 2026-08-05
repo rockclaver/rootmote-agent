@@ -483,6 +483,7 @@ func TestContentHash_OrderedListsAreOrderSensitive(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got == baseHash {
+			t.Fatal("reordering external monitor IDs did not change the hash")
 		}
 	})
 }
