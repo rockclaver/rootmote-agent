@@ -410,8 +410,13 @@ func (s *Server) approveAndAckExecute(ctx context.Context, c *websocket.Conn, wr
 			s.writeRemediationErr(ctx, c, writeMu, f.ID, err)
 			return
 		}
+	case store.RemediationExecuting, store.RemediationVerifying, store.RemediationResolved, store.RemediationRemediationFailed:
+		// Exact retries are acknowledged and Execute remains idempotent.
 	case store.RemediationBlockedL3:
 		s.writeRemediationErr(ctx, c, writeMu, f.ID, remediation.ErrBlockedL3)
+		return
+	default:
+		s.writeRemediationErr(ctx, c, writeMu, f.ID, remediation.ErrInvalidState)
 		return
 	}
 	s.writeOK(ctx, c, writeMu, f.ID, ackKind, map[string]any{"execution": exec})

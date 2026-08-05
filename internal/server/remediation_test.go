@@ -279,6 +279,25 @@ func TestIncidentRunbookExecute_RejectsBeforeAnyMutation(t *testing.T) {
 	})
 }
 
+// A declined execution is terminal: execute must not turn it into an OK
+// acknowledgement or consume/perform any mutation.
+func TestIncidentRunbookExecute_DeclinedIsInvalidState(t *testing.T) {
+	env := newRemediationTestEnv(t)
+	exec := env.propose(t, "exec1", "inc1", firewallDenyRunbook("rb1", "inc1"))
+	if _, err := env.remed.Decline(context.Background(), exec.ID, "declined"); err != nil {
+		t.Fatal(err)
+	}
+	tok := env.mintToken(t, testRemediationExecuteAction, "inc1", []string{exec.RunbookHash})
+	payload, _ := json.Marshal(map[string]any{"execution_id": exec.ID, "content_hash": exec.RunbookHash, "confirmation_token": tok})
+	resp := remediationRoundTrip(t, env.cfg, "incident.runbook.execute", payload)
+	if resp.Kind != "error.invalid_state" {
+		t.Fatalf("kind = %q payload=%s", resp.Kind, resp.Payload)
+	}
+	if len(env.firewall.added) != 0 {
+		t.Fatalf("declined execution mutated firewall: %+v", env.firewall.added)
+	}
+}
+
 // AC: a valid execute call acks immediately, mutates the host exactly once
 // through the typed firewall manager, reaches "verifying", and an exact
 // duplicate call (same execution id + hash) is idempotent -- no second
