@@ -691,7 +691,7 @@ func (m *Manager) DeriveRollback(ctx context.Context, parentExecutionID string) 
 		return store.RemediationExecution{}, err
 	}
 	switch parent.Status {
-	case store.RemediationExecuting, store.RemediationVerifying, store.RemediationResolved, store.RemediationRemediationFailed:
+	case store.RemediationVerifying, store.RemediationResolved, store.RemediationRemediationFailed:
 	default:
 		return store.RemediationExecution{}, fmt.Errorf("remediation: derive rollback from %s: %w", parent.Status, ErrInvalidState)
 	}

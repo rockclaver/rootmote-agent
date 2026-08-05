@@ -571,3 +571,24 @@ func TestManager_Execute_BoundsPersistedStepOutput(t *testing.T) {
 		t.Fatalf("persisted output lacks truncation marker")
 	}
 }
+
+func TestManager_DeriveRollback_RejectsExecutingParent(t *testing.T) {
+	exec := &fakeExecutor{}
+	val := &fakeValidator{tokenID: "tok"}
+	m, s := newTestManager(t, exec, val, &fakeVerifier{}, nil)
+	rb := twoStepRunbook("rb", false)
+	rb.Rollback = []runbook.Command{{Command: "display"}}
+	e, err := m.Propose(context.Background(), "parent", "inc-1", rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionExecution(e.ID, store.RemediationProposed, store.RemediationApproved, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionExecution(e.ID, store.RemediationApproved, store.RemediationExecuting, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DeriveRollback(context.Background(), e.ID); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("DeriveRollback error = %v, want ErrInvalidState", err)
+	}
+}
