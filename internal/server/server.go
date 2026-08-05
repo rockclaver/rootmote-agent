@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,8 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 	"github.com/rockclaver/rootmote-agent/internal/alerts"
 	"github.com/rockclaver/rootmote-agent/internal/cliauth"
+	"github.com/rockclaver/rootmote-agent/internal/diagnose"
+	"github.com/rockclaver/rootmote-agent/internal/diagnose/redact"
 	"github.com/rockclaver/rootmote-agent/internal/docker"
 	"github.com/rockclaver/rootmote-agent/internal/firewall"
 	gh "github.com/rockclaver/rootmote-agent/internal/github"
@@ -125,6 +129,20 @@ type Config struct {
 	// any) whether or not the agent is enrolled yet -- enrollment happens
 	// here, driven by the mobile app.
 	Watchtower *watchtower.Client
+	// DiagnoseRedactor, when non-nil, enables incident.diagnose /
+	// incident.evidence (Watchtower Phase 5: bounded, redacted local
+	// diagnosis, issue #73). A diagnose.Collector is built per request from
+	// whichever of Docker/Systemd/Infra/Webservers below are configured --
+	// any subset (including none) is nil-safe, exactly like
+	// discoverHostInventory.
+	DiagnoseRedactor *redact.Redactor
+	// DiagnoseProposer, when non-nil, enables the AI diagnosis step on top
+	// of the deterministic signatures. Nil means deterministic-only
+	// diagnosis (AC6) without disabling incident.diagnose/incident.evidence.
+	DiagnoseProposer diagnose.Proposer
+	// DiagnoseConfidenceThreshold overrides diagnose.DefaultConfidenceThreshold
+	// when > 0.
+	DiagnoseConfidenceThreshold float64
 	// OnWatchtowerEnabled starts Phase 2 monitor evaluation/sync after a
 	// successful first-time enrollment. It must be idempotent because both
 	// boot-time resume and repeated enable calls may invoke it.
@@ -160,6 +178,14 @@ type Server struct {
 	infraMetricsMu      sync.Mutex
 	infraMetricsNextGen int64
 	infraMetricsCancels map[string]dockerLogCancel
+
+	// diagnoseMu guards diagnoseBundles: the last collected Bundle per
+	// incident id in this process, so incident.evidence after
+	// incident.diagnose returns the exact bundle the assessment was built
+	// from instead of re-collecting (and potentially observing different
+	// host state).
+	diagnoseMu      sync.Mutex
+	diagnoseBundles map[string]diagnose.Bundle
 }
 
 type dockerLogCancel struct {
@@ -184,6 +210,7 @@ func New(cfg Config) *Server {
 		dockerLogCancels:    make(map[string]dockerLogCancel),
 		dockerStatsCancels:  make(map[string]dockerLogCancel),
 		infraMetricsCancels: make(map[string]dockerLogCancel),
+		diagnoseBundles:     make(map[string]diagnose.Bundle),
 	}
 }
 
@@ -560,6 +587,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchPush(ctx, c, writeMu, f)
 	case "watchtower.enable", "watchtower.status":
 		s.dispatchWatchtower(ctx, c, writeMu, f)
+	case "incident.diagnose", "incident.evidence":
+		s.dispatchDiagnose(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -4014,6 +4043,103 @@ func (s *Server) dispatchWatchtower(ctx context.Context, c *websocket.Conn, writ
 			"agentId":  creds.AgentID,
 			"status":   "protected",
 		})
+	}
+}
+
+// systemdDiagnoseSource adapts *systemd.Manager to diagnose.SystemdSource:
+// Get and List already match the manager's real signatures, so embedding it
+// satisfies both directly. The manager has no unit-log-reading method at
+// all, so Logs shells out to journalctl for a bounded, per-unit tail.
+type systemdDiagnoseSource struct {
+	*systemd.Manager
+}
+
+func (s systemdDiagnoseSource) Logs(ctx context.Context, unit string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = diagnose.DefaultMaxLogLines
+	}
+	out, err := exec.CommandContext(ctx, "journalctl", "-u", unit, "-n", strconv.Itoa(tail), "--no-pager").CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("journalctl -u %s: %w", unit, err)
+	}
+	return string(out), nil
+}
+
+// buildDiagnosePipeline wires a diagnose.Pipeline from whichever of
+// Docker/Systemd/Infra/Webservers are configured, nil-safe for any subset
+// (including none) exactly like discoverHostInventory: a missing source
+// just means that section of the evidence bundle stays empty with a
+// Warning, per diagnose.Collector.Collect's documented behavior.
+func (s *Server) buildDiagnosePipeline() *diagnose.Pipeline {
+	cfg := diagnose.CollectorConfig{
+		Redactor: s.cfg.DiagnoseRedactor,
+		Now:      s.cfg.Now,
+	}
+	if s.cfg.Docker != nil {
+		cfg.Docker = s.cfg.Docker
+	}
+	if s.cfg.Systemd != nil {
+		cfg.Systemd = systemdDiagnoseSource{s.cfg.Systemd}
+	}
+	if s.cfg.Infra != nil {
+		cfg.Infra = s.cfg.Infra
+	}
+	if s.cfg.Webservers != nil {
+		cfg.Webserver = s.cfg.Webservers
+	}
+	return diagnose.NewPipeline(diagnose.PipelineConfig{
+		Collector:           diagnose.NewCollector(cfg),
+		Proposer:            s.cfg.DiagnoseProposer,
+		ConfidenceThreshold: s.cfg.DiagnoseConfidenceThreshold,
+		Now:                 s.cfg.Now,
+	})
+}
+
+func (s *Server) setDiagnoseBundle(incidentID string, b diagnose.Bundle) {
+	s.diagnoseMu.Lock()
+	s.diagnoseBundles[incidentID] = b
+	s.diagnoseMu.Unlock()
+}
+
+func (s *Server) getDiagnoseBundle(incidentID string) (diagnose.Bundle, bool) {
+	s.diagnoseMu.Lock()
+	defer s.diagnoseMu.Unlock()
+	b, ok := s.diagnoseBundles[incidentID]
+	return b, ok
+}
+
+// dispatchDiagnose owns incident.diagnose and incident.evidence (Watchtower
+// Phase 5, issue #73): running the bounded, redacted local diagnostic
+// pipeline and serving its evidence bundle. Raw evidence never leaves this
+// handler's response -- the relay only ever receives Assessment.Summary()
+// via watchtower.Client.SendDiagnosticSummary, posted elsewhere.
+func (s *Server) dispatchDiagnose(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.DiagnoseRedactor == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "diagnose subsystem not configured")
+		return
+	}
+	var in struct {
+		IncidentID  string `json:"incidentId"`
+		MonitorKind string `json:"monitorKind"`
+		Target      string `json:"target"`
+	}
+	if err := json.Unmarshal(f.Payload, &in); err != nil || in.IncidentID == "" {
+		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "incidentId required")
+		return
+	}
+	target := diagnose.Target{IncidentID: in.IncidentID, MonitorKind: in.MonitorKind, Target: in.Target}
+	switch f.Kind {
+	case "incident.diagnose":
+		assessment, bundle := s.buildDiagnosePipeline().Run(ctx, target)
+		s.setDiagnoseBundle(in.IncidentID, bundle)
+		s.writeOK(ctx, c, writeMu, f.ID, "incident.diagnose", assessment)
+	case "incident.evidence":
+		bundle, ok := s.getDiagnoseBundle(in.IncidentID)
+		if !ok {
+			bundle = s.buildDiagnosePipeline().Collect(ctx, target)
+			s.setDiagnoseBundle(in.IncidentID, bundle)
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "incident.evidence", bundle)
 	}
 }
 
