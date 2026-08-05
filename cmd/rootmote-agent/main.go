@@ -29,6 +29,7 @@ import (
 	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 	"github.com/rockclaver/rootmote-agent/internal/projects"
 	"github.com/rockclaver/rootmote-agent/internal/push"
+	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
 	"github.com/rockclaver/rootmote-agent/internal/security"
@@ -43,6 +44,14 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/watchtower"
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
+
+// noopRemediationProjector is the Task 3 placeholder Projector: every
+// remediation event is already durable in the local store before this is
+// called (see remediation.Manager.appendEvent), so a no-op here only means
+// no relay projection yet -- Task 4 wires the real HTTP client.
+type noopRemediationProjector struct{}
+
+func (noopRemediationProjector) Project(context.Context, store.RemediationEvent) error { return nil }
 
 // defaultNotifyRelayURL is the org-operated rootmote-notify deployment (see
 // github.com/rockclaver/rootmote-notify). Override with --notify-relay-url or
@@ -199,6 +208,24 @@ func main() {
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init security audit: %v", err)
+	}
+
+	// Remediation owns the durable "approve, execute, verify" lifecycle for
+	// one approved runbook (issue #74). The typed StepExecutor/
+	// InternalVerifier adapters reuse exactly the same systemd/process/
+	// firewall/security managers infra.service.action / infra.process.kill
+	// / infra.firewall.rule_* / security.fix mutate through -- no second,
+	// unguarded execution path. The Projector is a no-op until the relay
+	// HTTP projection client (Task 4) is wired.
+	remediationMgr, err := remediation.New(remediation.Config{
+		Store:     st,
+		Executor:  server.NewRemediationStepExecutor(systemdMgr, processMgr, firewallMgr, securityMgr),
+		Validator: server.NewRemediationApprovalValidator(reviewMgr, st),
+		Verifier:  server.NewRemediationInternalVerifier(systemdMgr, firewallMgr),
+		Projector: noopRemediationProjector{},
+	})
+	if err != nil {
+		log.Fatalf("rootmote-agent: init remediation: %v", err)
 	}
 	notificationHub := notifications.NewHub()
 	alertMgr, err := alerts.New(alerts.Config{
@@ -359,6 +386,7 @@ func main() {
 		AIProposals:         aiProposalMgr,
 		Notifications:       notificationHub,
 		Runbook:             runbookMgr,
+		Remediation:         remediationMgr,
 		Actions:             actionsMgr,
 		Inventory:           inventoryMgr,
 		PushDevices:         st,
@@ -377,6 +405,15 @@ func main() {
 	defer cancel()
 	if err := sessionMgr.Rehydrate(ctx); err != nil {
 		log.Printf("rootmote-agent: rehydrate sessions: %v", err)
+	}
+	// A host command may have been mid-flight when the agent last stopped;
+	// RecoverInterrupted fails those executions closed (remediation_failed)
+	// rather than guessing whether the last step actually completed on the
+	// host -- see remediation.Manager.RecoverInterrupted. Never replayed.
+	if recovered, rerr := remediationMgr.RecoverInterrupted(ctx); rerr != nil {
+		log.Printf("rootmote-agent: recover interrupted remediations: %v", rerr)
+	} else if len(recovered) > 0 {
+		log.Printf("rootmote-agent: recovered %d interrupted remediation(s) as failed", len(recovered))
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)

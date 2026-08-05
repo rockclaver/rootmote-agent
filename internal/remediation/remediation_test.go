@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -528,5 +529,45 @@ func TestManager_Execute_TransitionStoreErrorDoesNotExecute(t *testing.T) {
 	}
 	if got.Status != store.RemediationApproved {
 		t.Fatalf("transition error changed status to %q", got.Status)
+	}
+}
+
+// AC Task 3: a single step's output is bounded before it reaches the
+// durable event log (and therefore before it can be replayed/broadcast).
+func TestManager_Execute_BoundsPersistedStepOutput(t *testing.T) {
+	oversized := strings.Repeat("x", maxStepOutputBytes+1)
+	exec := &fakeExecutor{results: map[int]StepResult{0: {ExitCode: 1, Output: oversized}}}
+	val := &fakeValidator{tokenID: "tok-1"}
+	ver := &fakeVerifier{}
+	m, s := newTestManager(t, exec, val, ver, nil)
+	ctx := context.Background()
+
+	rb := twoStepRunbook("rb-1", false)
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	e, err = m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token")
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, "ex-1", e.RunbookHash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	events, err := s.RemediationEventsAfter("ex-1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	var data struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(events[0].Data), &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Output) > maxStepOutputBytes+len("...[truncated]") {
+		t.Fatalf("persisted output length = %d, bound = %d", len(data.Output), maxStepOutputBytes+len("...[truncated]"))
+	}
+	if !strings.HasSuffix(data.Output, "...[truncated]") {
+		t.Fatalf("persisted output lacks truncation marker")
 	}
 }

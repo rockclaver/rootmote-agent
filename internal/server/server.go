@@ -36,6 +36,7 @@ import (
 	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 	"github.com/rockclaver/rootmote-agent/internal/projects"
 	"github.com/rockclaver/rootmote-agent/internal/push"
+	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
 	"github.com/rockclaver/rootmote-agent/internal/security"
@@ -113,6 +114,11 @@ type Config struct {
 	// Runbook, when non-nil, enables infra.runbook.* kinds and surfaces
 	// the AI-proposed remediation queue (Stickiness #4).
 	Runbook *runbook.Manager
+	// Remediation, when non-nil, enables the incident.runbook.*,
+	// incident.execution.subscribe, incident.verify, and incident.rollback
+	// kinds -- the durable approve/execute/verify lifecycle for one
+	// specific approved runbook (issue #74 Task 3).
+	Remediation *remediation.Manager
 	// Actions, when non-nil, enables action.* kinds (AI Action Plane:
 	// top-level command jobs). Phase 1 is read-only — no mutation.
 	Actions *actions.Manager
@@ -186,6 +192,14 @@ type Server struct {
 	// host state).
 	diagnoseMu      sync.Mutex
 	diagnoseBundles map[string]diagnose.Bundle
+
+	// lifeCtx is the outer context passed to Serve -- the agent process's
+	// own lifecycle, cancelled on shutdown. incident.runbook.execute /
+	// incident.rollback run their StepExecutor pass on this context (via
+	// runRemediationExecute), never on the per-request context (which dies
+	// the instant the requesting WebSocket disconnects) and never on
+	// context.Background() (which would never observe shutdown).
+	lifeCtx context.Context
 }
 
 type dockerLogCancel struct {
@@ -245,6 +259,7 @@ func (s *Server) Listen() (net.Listener, error) {
 
 // Serve accepts connections on ln until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	s.lifeCtx = ctx
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWS)
 
@@ -589,6 +604,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchWatchtower(ctx, c, writeMu, f)
 	case "incident.diagnose", "incident.evidence":
 		s.dispatchDiagnose(ctx, c, writeMu, f)
+	case "incident.runbook.get", "incident.runbook.decline", "incident.runbook.execute",
+		"incident.execution.subscribe", "incident.verify", "incident.rollback":
+		s.dispatchRemediation(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
