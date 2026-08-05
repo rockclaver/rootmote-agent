@@ -414,6 +414,66 @@ func TestStore_ExecutionConflictingReuseErrors(t *testing.T) {
 	}
 }
 
+// AC (#74 Task 3 follow-up): CreateExecution persists an explicit
+// execute|rollback Kind (defaulting empty to "execute" for every existing
+// caller that predates this classification) and ParentExecutionID, and
+// GetExecution round-trips both -- the server must be able to determine
+// whether an execution is a primary or a derived rollback from the durable
+// row itself, never by inspecting the client-minted execution ID's shape.
+func TestStore_ExecutionKindDefaultsAndPersists(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	primary, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-1", IncidentID: "inc-1", RunbookID: "rb-1", RunbookHash: "hash-1", Status: RemediationProposed,
+	})
+	if err != nil {
+		t.Fatalf("create primary: %v", err)
+	}
+	if primary.Kind != RemediationKindExecute {
+		t.Fatalf("primary Kind = %q, want default %q", primary.Kind, RemediationKindExecute)
+	}
+	if primary.ParentExecutionID != "" {
+		t.Fatalf("primary ParentExecutionID = %q, want empty", primary.ParentExecutionID)
+	}
+
+	rollback, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-1-rollback", IncidentID: "inc-1", RunbookID: "rb-2", RunbookHash: "hash-2",
+		Status: RemediationProposed, Kind: RemediationKindRollback, ParentExecutionID: "ex-1",
+	})
+	if err != nil {
+		t.Fatalf("create rollback: %v", err)
+	}
+	if rollback.Kind != RemediationKindRollback || rollback.ParentExecutionID != "ex-1" {
+		t.Fatalf("rollback row = %+v, want Kind=rollback ParentExecutionID=ex-1", rollback)
+	}
+
+	gotPrimary, err := s.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get primary: %v", err)
+	}
+	if gotPrimary.Kind != RemediationKindExecute || gotPrimary.ParentExecutionID != "" {
+		t.Fatalf("get primary round-trip = %+v", gotPrimary)
+	}
+	gotRollback, err := s.GetExecution("ex-1-rollback")
+	if err != nil {
+		t.Fatalf("get rollback: %v", err)
+	}
+	if gotRollback.Kind != RemediationKindRollback || gotRollback.ParentExecutionID != "ex-1" {
+		t.Fatalf("get rollback round-trip = %+v", gotRollback)
+	}
+
+	if _, _, err := s.CreateExecution(RemediationExecution{
+		ID: "ex-bad", IncidentID: "inc-1", RunbookID: "rb-3", RunbookHash: "hash-3",
+		Status: RemediationProposed, Kind: "not_a_kind",
+	}); err == nil {
+		t.Fatalf("expected error for unrecognized execution kind")
+	}
+}
+
 // AC (#74 Task 2): TransitionExecution is a compare-and-swap on status -- a
 // transition whose `from` matches the current row succeeds; one that
 // doesn't (an invalid jump, or a stale/duplicate caller) fails with

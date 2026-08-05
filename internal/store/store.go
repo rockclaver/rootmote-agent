@@ -306,7 +306,7 @@ type Runbook struct {
 // declined/blocked_l3 short-circuiting before execution and
 // remediation_failed reachable from executing or verifying. This package
 // never sets RemediationResolved itself -- that requires the external
-// stability window (issue #74 Task 3) -- but it is a defined status so
+// stability window (issue #74 Task 4) -- but it is a defined status so
 // TransitionExecution recognizes it as a valid target once that logic
 // lands.
 const (
@@ -331,18 +331,43 @@ var remediationStatuses = map[string]bool{
 	RemediationBlockedL3:         true,
 }
 
+// Remediation execution kinds classify a persisted execution row as either
+// a primary execution (proposed directly, e.g. from the diagnosis/runbook
+// pipeline) or a derived rollback (proposed by
+// remediation.Manager.DeriveRollback to reverse an already-executed
+// primary). The server uses this durable classification -- never the
+// client-minted execution ID's shape -- to pick the confirmation-token
+// action an execution binds to and to route incident.rollback phase B, so a
+// client cannot influence either by choosing an ID that merely looks like a
+// rollback ID.
+const (
+	RemediationKindExecute  = "execute"
+	RemediationKindRollback = "rollback"
+)
+
+var remediationKinds = map[string]bool{
+	RemediationKindExecute:  true,
+	RemediationKindRollback: true,
+}
+
 // RemediationExecution is one durable attempt to run an approved runbook end
 // to end. ID is client-minted so a retried "execute" call for the same
 // (IncidentID, RunbookID, RunbookHash) is idempotent instead of replaying a
-// command against the host -- see CreateExecution.
+// command against the host -- see CreateExecution. Kind classifies the row
+// as a primary execution or a derived rollback (see the remediation
+// execution kinds doc above); ParentExecutionID is the primary execution a
+// rollback (Kind == RemediationKindRollback) reverses, and is empty for a
+// primary execution.
 type RemediationExecution struct {
-	ID          string
-	IncidentID  string
-	RunbookID   string
-	RunbookHash string
-	Status      string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID                string
+	IncidentID        string
+	RunbookID         string
+	RunbookHash       string
+	Status            string
+	Kind              string
+	ParentExecutionID string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // RemediationEvent is one append-only entry in an execution's trail --
@@ -685,8 +710,19 @@ CREATE TABLE IF NOT EXISTS remediation_events (
 	// per-device so Hub.Forward can stamp the right value into deep_link
 	// payloads instead of the agent's internal "local" rule-bucket id, which
 	// the client can never match against its own server list.
-	return s.addColumns("push_devices",
+	if err := s.addColumns("push_devices",
 		columnDef{"client_server_id", "TEXT NOT NULL DEFAULT ''"},
+	); err != nil {
+		return err
+	}
+	// Stores created before explicit execution-kind persistence (issue #74
+	// Task 3 follow-up) need these columns added idempotently. kind
+	// defaults to "execute" so every pre-existing row -- all of which were
+	// primary executions before DeriveRollback started persisting
+	// "rollback" rows -- is classified correctly with no data backfill.
+	return s.addColumns("remediation_executions",
+		columnDef{"kind", "TEXT NOT NULL DEFAULT 'execute'"},
+		columnDef{"parent_execution_id", "TEXT NOT NULL DEFAULT ''"},
 	)
 }
 
@@ -2350,13 +2386,19 @@ func (s *Store) CreateExecution(e RemediationExecution) (RemediationExecution, b
 	if e.UpdatedAt.IsZero() {
 		e.UpdatedAt = e.CreatedAt
 	}
+	if e.Kind == "" {
+		e.Kind = RemediationKindExecute
+	}
 	if !remediationStatuses[e.Status] {
 		return RemediationExecution{}, false, fmt.Errorf("remediation execution %s: invalid status %q", e.ID, e.Status)
 	}
+	if !remediationKinds[e.Kind] {
+		return RemediationExecution{}, false, fmt.Errorf("remediation execution %s: invalid kind %q", e.ID, e.Kind)
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO remediation_executions (id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.IncidentID, e.RunbookID, e.RunbookHash, e.Status, e.CreatedAt.Unix(), e.UpdatedAt.Unix(),
+		`INSERT INTO remediation_executions (id, incident_id, runbook_id, runbook_hash, status, kind, parent_execution_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.IncidentID, e.RunbookID, e.RunbookHash, e.Status, e.Kind, e.ParentExecutionID, e.CreatedAt.Unix(), e.UpdatedAt.Unix(),
 	)
 	if err == nil {
 		return e, true, nil
@@ -2377,12 +2419,12 @@ func (s *Store) CreateExecution(e RemediationExecution) (RemediationExecution, b
 // GetExecution loads one remediation execution by ID.
 func (s *Store) GetExecution(id string) (RemediationExecution, error) {
 	row := s.db.QueryRow(
-		`SELECT id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at
+		`SELECT id, incident_id, runbook_id, runbook_hash, status, kind, parent_execution_id, created_at, updated_at
 		 FROM remediation_executions WHERE id = ?`, id,
 	)
 	var e RemediationExecution
 	var created, updated int64
-	if err := row.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &created, &updated); err != nil {
+	if err := row.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &e.Kind, &e.ParentExecutionID, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return RemediationExecution{}, fmt.Errorf("remediation execution %s: %w", id, ErrNotFound)
 		}
@@ -2426,7 +2468,7 @@ func (s *Store) TransitionExecution(id, from, to string, at time.Time) error {
 // no way to tell whether the last command actually completed on the host.
 func (s *Store) InFlightExecutions() ([]RemediationExecution, error) {
 	rows, err := s.db.Query(
-		`SELECT id, incident_id, runbook_id, runbook_hash, status, created_at, updated_at
+		`SELECT id, incident_id, runbook_id, runbook_hash, status, kind, parent_execution_id, created_at, updated_at
 		 FROM remediation_executions WHERE status IN (?, ?) ORDER BY created_at ASC`,
 		RemediationExecuting, RemediationVerifying,
 	)
@@ -2438,7 +2480,7 @@ func (s *Store) InFlightExecutions() ([]RemediationExecution, error) {
 	for rows.Next() {
 		var e RemediationExecution
 		var created, updated int64
-		if err := rows.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &created, &updated); err != nil {
+		if err := rows.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &e.Kind, &e.ParentExecutionID, &created, &updated); err != nil {
 			return nil, err
 		}
 		e.CreatedAt = time.Unix(created, 0)

@@ -72,7 +72,7 @@ type VerificationResult struct {
 // InternalVerifier runs the agent's own bounded checks once execution
 // completes exit-zero. Its initial result is persisted, but it does not by
 // itself resolve the incident -- resolution also requires the external
-// stability window (issue #74 Task 3).
+// stability window (issue #74 Task 4).
 type InternalVerifier interface {
 	Verify(ctx context.Context, rb runbook.Runbook) (VerificationResult, error)
 }
@@ -104,7 +104,9 @@ var (
 	// apply to the execution's current status.
 	ErrInvalidState = errors.New("remediation: invalid execution state")
 	// ErrNoRollbackPlan is returned by DeriveRollback when the parent
-	// runbook was authored with no Rollback plan at all.
+	// runbook was authored with no Rollback plan at all, or when it was
+	// but no step_result event durably recorded a successful step to
+	// invert (e.g. the parent failed on its very first step).
 	ErrNoRollbackPlan = errors.New("remediation: runbook has no rollback plan")
 	// ErrRollbackUnsupported is returned by DeriveRollback when the parent
 	// runbook's typed steps cannot be safely, structurally reversed (see
@@ -179,8 +181,18 @@ func New(cfg Config) (*Manager, error) {
 // approve/decline step. Propose is idempotent: retrying with the same
 // executionID against identical (incidentID, rb.ID, hash) returns the
 // existing execution; reusing the ID against different content returns
-// store.ErrConflict (from CreateExecution).
+// store.ErrConflict (from CreateExecution). The created execution is
+// always store.RemediationKindExecute -- a store.RemediationKindRollback
+// row can only be created by DeriveRollback, never through this public
+// entry point, regardless of what executionID's shape looks like.
 func (m *Manager) Propose(ctx context.Context, executionID, incidentID string, rb runbook.Runbook) (store.RemediationExecution, error) {
+	return m.propose(ctx, executionID, incidentID, rb, store.RemediationKindExecute, "")
+}
+
+// propose is Propose's implementation, parameterised over the persisted
+// Kind and ParentExecutionID -- DeriveRollback is the only other caller,
+// and it always passes store.RemediationKindRollback with the parent's ID.
+func (m *Manager) propose(ctx context.Context, executionID, incidentID string, rb runbook.Runbook, kind, parentExecutionID string) (store.RemediationExecution, error) {
 	hash, err := runbook.ContentHash(rb)
 	if err != nil {
 		return store.RemediationExecution{}, fmt.Errorf("remediation: compute content hash: %w", err)
@@ -208,7 +220,7 @@ func (m *Manager) Propose(ctx context.Context, executionID, incidentID string, r
 	}
 	exec, created, err := m.store.CreateExecution(store.RemediationExecution{
 		ID: executionID, IncidentID: incidentID, RunbookID: rb.ID, RunbookHash: hash,
-		Status: status, CreatedAt: now, UpdatedAt: now,
+		Status: status, Kind: kind, ParentExecutionID: parentExecutionID, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
 		return store.RemediationExecution{}, err
@@ -296,7 +308,7 @@ func (m *Manager) Decline(ctx context.Context, executionID, reason string) (stor
 // it transitions executing -> verifying and runs one internal verification
 // pass, persisting its initial result -- Execute never transitions to
 // resolved itself; that requires the external stability window (issue #74
-// Task 3). A retried call with the same executionID and a matching
+// Task 4). A retried call with the same executionID and a matching
 // requestedHash for an execution that has already left "approved" returns
 // the existing execution unchanged and runs no step.
 func (m *Manager) Execute(ctx context.Context, executionID, requestedHash string) (store.RemediationExecution, error) {
@@ -654,37 +666,42 @@ const rollbackIDSuffix = "-rollback"
 
 // RollbackExecutionID deterministically derives the rollback execution ID
 // for parentExecutionID, so a repeated DeriveRollback call (phase A of
-// incident.rollback) is naturally idempotent and the server can recognise a
-// client-supplied execution id as "this is a rollback" without a store
-// round trip.
+// incident.rollback) is naturally idempotent -- retrying it always resolves
+// to the same client-visible execution ID instead of minting a new one.
+// This ID's shape is a display/idempotency convenience only: the server
+// classifies an execution as a primary or a derived rollback from the
+// row's own persisted Kind (see store.RemediationKindRollback), never by
+// inspecting an execution ID's suffix.
 func RollbackExecutionID(parentExecutionID string) string {
 	return parentExecutionID + rollbackIDSuffix
 }
 
-// IsRollbackExecutionID reports whether id was derived by
-// RollbackExecutionID.
-func IsRollbackExecutionID(id string) bool {
-	return len(id) > len(rollbackIDSuffix) && id[len(id)-len(rollbackIDSuffix):] == rollbackIDSuffix
-}
-
-// DeriveRollback builds and persists (via Propose, so it is fully
-// idempotent and immutable) a companion runbook that structurally reverses
-// parentExecutionID's approved runbook -- never the parent's opaque
-// Rollback display commands, which have no typed executor binding and
-// would be a raw-shell bypass to run directly. It never approves or
-// executes the result: the caller must separately Approve/Execute the
-// returned execution's ID with a token freshly minted for it, exactly like
-// any other proposal.
+// DeriveRollback builds and persists (via propose, so it is fully
+// idempotent and immutable, and durably marked store.RemediationKindRollback
+// with ParentExecutionID set to parentExecutionID) a companion runbook
+// that structurally reverses parentExecutionID's approved runbook -- never
+// the parent's opaque Rollback display commands, which have no typed
+// executor binding and would be a raw-shell bypass to run directly. It
+// never approves or executes the result: the caller must separately
+// Approve/Execute the returned execution's ID with a token freshly minted
+// for it, exactly like any other proposal.
 //
 // The parent must have reached at least "executing" (Execute must have run
 // at least one step) -- rolling back an execution that never mutated
-// anything makes no sense. The parent runbook must also declare a non-empty
-// Rollback plan (ErrNoRollbackPlan otherwise): that field is the runbook
-// author's signal that this remediation is meant to be reversible, even
-// though the actual reversal here is computed structurally rather than by
-// running the author's display commands. A step kind this package cannot
-// safely invert (see invertStep) fails the whole derivation with
-// ErrRollbackUnsupported rather than silently omitting it.
+// anything makes no sense. The parent runbook must also declare a
+// non-empty Rollback plan (ErrNoRollbackPlan otherwise): that field is the
+// runbook author's signal that this remediation is meant to be reversible,
+// even though the actual reversal here is computed structurally rather
+// than by running the author's display commands. The steps inverted are
+// never the parent runbook's full Steps slice: DeriveRollback replays the
+// parent's durable step_result events and inverts only the steps a
+// persisted event actually recorded as successful (exit code 0, no
+// executor error), in the order they ran -- a step that failed or never
+// ran (because an earlier step already stopped the run) is never inverted,
+// and ErrNoRollbackPlan is returned if none were successful. A successful
+// step kind this package cannot safely invert (see invertStep) fails the
+// whole derivation with ErrRollbackUnsupported rather than silently
+// omitting it.
 func (m *Manager) DeriveRollback(ctx context.Context, parentExecutionID string) (store.RemediationExecution, error) {
 	parent, err := m.store.GetExecution(parentExecutionID)
 	if err != nil {
@@ -702,7 +719,14 @@ func (m *Manager) DeriveRollback(ctx context.Context, parentExecutionID string) 
 	if len(parentRb.Rollback) == 0 {
 		return store.RemediationExecution{}, ErrNoRollbackPlan
 	}
-	inverted, err := invertSteps(parentRb.Steps)
+	successful, err := m.successfulSteps(parentExecutionID, parentRb.Steps)
+	if err != nil {
+		return store.RemediationExecution{}, err
+	}
+	if len(successful) == 0 {
+		return store.RemediationExecution{}, ErrNoRollbackPlan
+	}
+	inverted, err := invertSteps(successful)
 	if err != nil {
 		return store.RemediationExecution{}, fmt.Errorf("%w: %v", ErrRollbackUnsupported, err)
 	}
@@ -719,7 +743,51 @@ func (m *Manager) DeriveRollback(ctx context.Context, parentExecutionID string) 
 		rollbackRb.Blocked = true
 		rollbackRb.BlockedReason = runbook.BlockedL3Reason
 	}
-	return m.Propose(ctx, RollbackExecutionID(parentExecutionID), parent.IncidentID, rollbackRb)
+	return m.propose(ctx, RollbackExecutionID(parentExecutionID), parent.IncidentID, rollbackRb, store.RemediationKindRollback, parentExecutionID)
+}
+
+// stepResultData is the subset of a persisted "step_result" event's JSON
+// data this package needs to tell which of a parent runbook's steps a
+// durable event actually recorded as having succeeded -- see
+// successfulSteps. It mirrors the fields Execute writes in its
+// step_result data map (index, exit_code, and error only when the
+// executor itself failed).
+type stepResultData struct {
+	Index    int    `json:"index"`
+	ExitCode int    `json:"exit_code"`
+	Error    string `json:"error,omitempty"`
+}
+
+// successfulSteps replays executionID's persisted step_result events, in
+// the order Execute appended them, and returns the subset of steps whose
+// event recorded a clean success (exit code 0, no executor error) --
+// never a step whose event recorded a failure, and never a step with no
+// event at all (one Execute's first-failure stop never reached). This is
+// the durable source of truth DeriveRollback inverts from, rather than the
+// parent runbook's full, static Steps slice.
+func (m *Manager) successfulSteps(executionID string, steps []runbook.Step) ([]runbook.Step, error) {
+	events, err := m.store.RemediationEventsAfter(executionID, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runbook.Step, 0, len(steps))
+	for _, ev := range events {
+		if ev.Type != "step_result" {
+			continue
+		}
+		var d stepResultData
+		if err := json.Unmarshal([]byte(ev.Data), &d); err != nil {
+			return nil, fmt.Errorf("remediation: decode step_result event: %w", err)
+		}
+		if d.Error != "" || d.ExitCode != 0 {
+			continue
+		}
+		if d.Index < 0 || d.Index >= len(steps) {
+			continue
+		}
+		out = append(out, steps[d.Index])
+	}
+	return out, nil
 }
 
 // invertSteps structurally reverses steps in reverse order (undo the last

@@ -35,12 +35,17 @@ const (
 
 // remediationTokenBinding computes the (action, project, files) tuple an
 // incident.runbook.execute / incident.rollback confirmation token must be
-// bound to for executionID + contentHash. It is the single source of truth
-// shared by reviewApprovalValidator (which enforces the binding) and
-// callers that need to mint a token for one of these actions.
-func remediationTokenBinding(executionID, incidentID, contentHash string) (action, project string, files []string) {
+// bound to for an execution's persisted Kind + contentHash. The token
+// itself is only ever bound to (action, incident, contentHash) -- the
+// execution ID is not part of what review.ConsumeToken checks; it is used
+// only to look up the execution (its incident and Kind) that computes this
+// tuple, and separately for this package's own idempotency handling. This
+// function is the single source of truth shared by reviewApprovalValidator
+// (which enforces the binding) and callers that need to mint a token for
+// one of these actions.
+func remediationTokenBinding(kind, incidentID, contentHash string) (action, project string, files []string) {
 	action = remediationExecuteAction
-	if remediation.IsRollbackExecutionID(executionID) {
+	if kind == store.RemediationKindRollback {
 		action = remediationRollbackAction
 	}
 	return action, "watchtower:" + incidentID, []string{contentHash}
@@ -68,7 +73,7 @@ func (v *reviewApprovalValidator) Validate(_ context.Context, token, executionID
 	if err != nil {
 		return "", err
 	}
-	action, project, files := remediationTokenBinding(executionID, exec.IncidentID, contentHash)
+	action, project, files := remediationTokenBinding(exec.Kind, exec.IncidentID, contentHash)
 	if err := v.review.ConsumeToken(token, action, project, files, ""); err != nil {
 		return "", err
 	}
@@ -517,10 +522,12 @@ func (s *Server) handleRemediationVerify(ctx context.Context, c *websocket.Conn,
 // reuses Propose -- an immutable rollback runbook from the already-executed
 // parent's Rollback plan, and return its own id/hash for review. No host
 // mutation happens in phase A. Phase B (content_hash + confirmation_token):
-// execution_id must be the rollback execution id phase A returned; the
-// token must be freshly minted for "incident.runbook.rollback" against
-// that id's own separate content hash (see remediationTokenBinding) --
-// approve and execute it exactly like incident.runbook.execute, and never
+// execution_id must be the rollback execution id phase A returned -- this
+// is enforced by loading the execution and checking its persisted Kind
+// (store.RemediationKindRollback), never the ID's shape; the token must be
+// freshly minted for "incident.runbook.rollback" against that id's own
+// separate content hash (see remediationTokenBinding) -- approve and
+// execute it exactly like incident.runbook.execute, and never
 // automatically: only this explicit, separately-authorised call can ever
 // run it.
 func (s *Server) handleRemediationRollback(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
@@ -553,7 +560,12 @@ func (s *Server) handleRemediationRollback(ctx context.Context, c *websocket.Con
 		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "content_hash required")
 		return
 	}
-	if !remediation.IsRollbackExecutionID(in.ExecutionID) {
+	targetExec, err := s.cfg.Remediation.GetExecution(in.ExecutionID)
+	if err != nil {
+		s.writeRemediationErr(ctx, c, writeMu, f.ID, err)
+		return
+	}
+	if targetExec.Kind != store.RemediationKindRollback {
 		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "execution_id must be a rollback execution id from phase A")
 		return
 	}

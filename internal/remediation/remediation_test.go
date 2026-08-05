@@ -122,7 +122,7 @@ func twoStepRunbook(id string, blocked bool) runbook.Runbook {
 
 // AC: sequential success -- every step runs in order, the execution reaches
 // "verifying" (never "resolved", which requires the external stability
-// window from issue #74 Task 3), and the internal verifier's initial result
+// window from issue #74 Task 4), and the internal verifier's initial result
 // is persisted as an event.
 func TestManager_Execute_SequentialSuccessReachesVerifyingWithInitialVerification(t *testing.T) {
 	exec := &fakeExecutor{}
@@ -591,4 +591,244 @@ func TestManager_DeriveRollback_RejectsExecutingParent(t *testing.T) {
 	if _, err := m.DeriveRollback(context.Background(), e.ID); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("DeriveRollback error = %v, want ErrInvalidState", err)
 	}
+}
+
+// threeStepFirewallRunbook is a three-step L1 runbook, each step a distinct
+// firewall add identified by port (so a test can tell exactly which of the
+// original steps a derived rollback inverted), with a non-empty Rollback
+// plan so DeriveRollback has something to reverse.
+func threeStepFirewallRunbook(id string) runbook.Runbook {
+	mkStep := func(port float64, desc string) runbook.Step {
+		return runbook.Step{
+			Kind:        aiproposal.KindFirewallAdd,
+			Params:      map[string]any{"action": "deny", "protocol": "tcp", "port": port, "backend": "ufw", "zone": "public"},
+			Description: desc,
+		}
+	}
+	return runbook.Runbook{
+		ID:            id,
+		SchemaVersion: runbook.SchemaVersion,
+		IncidentID:    "inc-1",
+		ServerID:      "srv-1",
+		Summary:       "block three ports",
+		Risk:          runbook.RiskL1,
+		Steps: []runbook.Step{
+			mkStep(1000, "Deny port 1000"),
+			mkStep(2000, "Deny port 2000"),
+			mkStep(3000, "Deny port 3000"),
+		},
+		Rollback: []runbook.Command{{Command: "ufw delete deny 1000/tcp", RunAs: "root", Description: "Re-allow port 1000"}},
+	}
+}
+
+// AC (#74 Task 3 follow-up): DeriveRollback must invert only the steps a
+// durable step_result event actually recorded as successful (exit code 0,
+// no executor error) -- never a step that failed or never ran, even though
+// the parent runbook's own Steps slice still lists them. Step 1 succeeds,
+// step 2 fails, step 3 is never attempted; the derived rollback must
+// contain the inverse of step 1 alone.
+func TestManager_DeriveRollback_OnlyInvertsDurableSuccessfulSteps(t *testing.T) {
+	exec := &fakeExecutor{errs: map[int]error{1: errors.New("deny 2000 failed")}}
+	val := &fakeValidator{tokenID: "tok"}
+	m, _ := newTestManager(t, exec, val, &fakeVerifier{}, nil)
+	ctx := context.Background()
+
+	rb := threeStepFirewallRunbook("rb-3")
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	e, err = m.Execute(ctx, "ex-1", e.RunbookHash)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if e.Status != store.RemediationRemediationFailed {
+		t.Fatalf("status = %s, want remediation_failed", e.Status)
+	}
+	if len(exec.calls) != 2 {
+		t.Fatalf("executor calls = %d, want 2 (step 3 must never run)", len(exec.calls))
+	}
+
+	rollback, err := m.DeriveRollback(ctx, "ex-1")
+	if err != nil {
+		t.Fatalf("derive rollback: %v", err)
+	}
+	rollbackRb, err := m.Runbook(rollback.RunbookID)
+	if err != nil {
+		t.Fatalf("load rollback runbook: %v", err)
+	}
+	if len(rollbackRb.Steps) != 1 {
+		t.Fatalf("rollback steps = %+v, want exactly 1 (inverse of step 1 only)", rollbackRb.Steps)
+	}
+	if rollbackRb.Steps[0].Kind != aiproposal.KindFirewallRemove {
+		t.Fatalf("rollback step kind = %s, want firewall_remove", rollbackRb.Steps[0].Kind)
+	}
+	if port, _ := rollbackRb.Steps[0].Params["port"].(float64); port != 1000 {
+		t.Fatalf("rollback step port = %v, want 1000 (inverse of the only successful step)", rollbackRb.Steps[0].Params["port"])
+	}
+}
+
+// AC (#74 Task 3 follow-up): once every step exits zero, DeriveRollback
+// (run from "verifying" -- the state Execute leaves an all-success run in,
+// even when internal verification itself fails, since a verification
+// failure never removes the already-durable successful step results)
+// recovers and inverts every one of them, undoing the last change first.
+func TestManager_DeriveRollback_VerifyingInvertsAllSuccessfulSteps(t *testing.T) {
+	exec := &fakeExecutor{}
+	val := &fakeValidator{tokenID: "tok"}
+	m, _ := newTestManager(t, exec, val, &fakeVerifier{err: errors.New("verification unavailable")}, nil)
+	ctx := context.Background()
+
+	rb := threeStepFirewallRunbook("rb-3")
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	e, err = m.Execute(ctx, "ex-1", e.RunbookHash)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if e.Status != store.RemediationVerifying {
+		t.Fatalf("status = %s, want verifying", e.Status)
+	}
+
+	rollback, err := m.DeriveRollback(ctx, "ex-1")
+	if err != nil {
+		t.Fatalf("derive rollback: %v", err)
+	}
+	rollbackRb, err := m.Runbook(rollback.RunbookID)
+	if err != nil {
+		t.Fatalf("load rollback runbook: %v", err)
+	}
+	if len(rollbackRb.Steps) != 3 {
+		t.Fatalf("rollback steps = %+v, want all 3 inverted", rollbackRb.Steps)
+	}
+	wantPorts := []float64{3000, 2000, 1000} // undo last change first
+	for i, want := range wantPorts {
+		got, _ := rollbackRb.Steps[i].Params["port"].(float64)
+		if got != want || rollbackRb.Steps[i].Kind != aiproposal.KindFirewallRemove {
+			t.Fatalf("rollback step %d = %+v, want firewall_remove port %v", i, rollbackRb.Steps[i], want)
+		}
+	}
+}
+
+// AC (#74 Task 3): DeriveRollback must persist a "rollback" Kind and the
+// parent execution ID so the server can classify a derived execution
+// durably (see remediationTokenBinding), never by inspecting the
+// client-visible execution ID's shape.
+func TestManager_DeriveRollback_PersistsRollbackKindAndParent(t *testing.T) {
+	exec := &fakeExecutor{}
+	val := &fakeValidator{tokenID: "tok"}
+	m, _ := newTestManager(t, exec, val, &fakeVerifier{}, nil)
+	ctx := context.Background()
+
+	rb := threeStepFirewallRunbook("rb-3")
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, "ex-1", e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, "ex-1", e.RunbookHash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	rollback, err := m.DeriveRollback(ctx, "ex-1")
+	if err != nil {
+		t.Fatalf("derive rollback: %v", err)
+	}
+	if rollback.Kind != store.RemediationKindRollback {
+		t.Fatalf("rollback Kind = %q, want %q", rollback.Kind, store.RemediationKindRollback)
+	}
+	if rollback.ParentExecutionID != "ex-1" {
+		t.Fatalf("rollback ParentExecutionID = %q, want ex-1", rollback.ParentExecutionID)
+	}
+
+	primary, err := m.GetExecution("ex-1")
+	if err != nil {
+		t.Fatalf("get primary: %v", err)
+	}
+	if primary.Kind != store.RemediationKindExecute {
+		t.Fatalf("primary Kind = %q, want %q", primary.Kind, store.RemediationKindExecute)
+	}
+}
+
+// AC (#74 Task 3): Subscribe's replay-then-live handoff must never deliver
+// the same persisted event twice, even when a live fanout races the replay
+// snapshot and re-delivers an event already returned by the replay. This
+// injects that exact race deterministically through the manager's own
+// (unexported) fanout method -- the identical call Execute uses to publish
+// a live event -- rather than relying on real timing or exposing any
+// public test-only API.
+func TestManager_Subscribe_ReplayLiveBoundaryExactlyOnce(t *testing.T) {
+	m, s := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, nil)
+	ctx := context.Background()
+	rb := twoStepRunbook("rb-1", false)
+	e, err := m.Propose(ctx, "ex-1", "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+
+	// A step_result event already durably persisted before Subscribe is
+	// ever called -- Subscribe's replay snapshot will include it.
+	persisted, err := s.AppendRemediationEvent(store.RemediationEvent{ExecutionID: e.ID, Type: "step_result", Data: `{"index":0}`})
+	if err != nil {
+		t.Fatalf("append persisted event: %v", err)
+	}
+
+	ch, cancel, err := m.Subscribe(ctx, e.ID, 0)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer cancel()
+
+	// Simulate the exact race Subscribe's doc comment describes: a live
+	// fanout for the same already-replayed seq, delivered through the
+	// identical path Execute uses (appendEvent -> fanout).
+	m.fanout(e.ID, persisted)
+
+	// A genuine new live event, published the normal way, must still be
+	// delivered -- the dedup must never swallow anything past the
+	// high-water mark.
+	live, err := m.appendEvent(ctx, e.ID, "step_result", map[string]any{"index": 1})
+	if err != nil {
+		t.Fatalf("append live event: %v", err)
+	}
+
+	first := recvRemediationEvent(t, ch)
+	if first.Seq != persisted.Seq || first.Type != "step_result" {
+		t.Fatalf("first event = %+v, want replayed seq %d", first, persisted.Seq)
+	}
+	second := recvRemediationEvent(t, ch)
+	if second.Seq != live.Seq {
+		t.Fatalf("second event = %+v, want live seq %d", second, live.Seq)
+	}
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected third delivery (duplicate not deduped): %+v", ev)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func recvRemediationEvent(t *testing.T, ch <-chan store.RemediationEvent) store.RemediationEvent {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		if !ok {
+			t.Fatalf("channel closed before expected event")
+		}
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for event")
+	}
+	return store.RemediationEvent{}
 }

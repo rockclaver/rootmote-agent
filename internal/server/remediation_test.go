@@ -546,3 +546,38 @@ func TestIncidentRollback_DerivesFreshRunbookAndExecutesWithFreshToken(t *testin
 		t.Fatalf("rollback did not run exactly once: removed=%+v", env.firewall.removed)
 	}
 }
+
+// AC (#74 Task 3 follow-up): a confirmation token's required action must
+// come from the execution's persisted Kind, never from the client-minted
+// execution ID's shape -- a *primary* execution whose ID happens to end in
+// "-rollback" (Propose always persists Kind == store.RemediationKindExecute,
+// regardless of ID) still binds and authorises with
+// incident.runbook.execute, and a token minted for incident.runbook.rollback
+// against the same execution/hash must NOT authorise it.
+func TestIncidentRunbookExecute_PrimaryIDLookingLikeRollbackBindsExecuteAction(t *testing.T) {
+	env := newRemediationTestEnv(t)
+	rb := firewallDenyRunbook("rb1", "inc1")
+	exec := env.propose(t, "exec1-rollback", "inc1", rb)
+	hash := exec.RunbookHash
+
+	wrongTok := env.mintToken(t, testRemediationRollbackAction, "inc1", []string{hash})
+	wrongPayload, _ := json.Marshal(map[string]any{"execution_id": "exec1-rollback", "content_hash": hash, "confirmation_token": wrongTok})
+	wrongResp := remediationRoundTrip(t, env.cfg, "incident.runbook.execute", wrongPayload)
+	if wrongResp.Kind == "incident.runbook.execute" {
+		t.Fatalf("a rollback-action token authorised a primary execution: %s", wrongResp.Payload)
+	}
+	if len(env.firewall.added) != 0 {
+		t.Fatalf("rejected token attempt mutated the host: %+v", env.firewall.added)
+	}
+
+	tok := env.mintToken(t, testRemediationExecuteAction, "inc1", []string{hash})
+	payload, _ := json.Marshal(map[string]any{"execution_id": "exec1-rollback", "content_hash": hash, "confirmation_token": tok})
+	resp := remediationRoundTrip(t, env.cfg, "incident.runbook.execute", payload)
+	if resp.Kind != "incident.runbook.execute" {
+		t.Fatalf("execute kind = %q payload = %s, want incident.runbook.execute despite ID suffix", resp.Kind, resp.Payload)
+	}
+	waitForStatus(t, env.cfg, "exec1-rollback", store.RemediationVerifying, store.RemediationRemediationFailed)
+	if len(env.firewall.added) != 1 {
+		t.Fatalf("firewall Add called %d times, want 1", len(env.firewall.added))
+	}
+}
