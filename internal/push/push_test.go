@@ -276,34 +276,6 @@ func TestHub_ForwardAlertFireVsClear(t *testing.T) {
 	}
 }
 
-// TestHub_ForwardActionCompletedPushes covers the explicit requirement that
-// action.completed always pushes -- success or failure, the operator is
-// actively waiting on it.
-func TestHub_ForwardActionCompletedPushes(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	if err := st.PutPushDevice(store.PushDevice{Token: "d1"}); err != nil {
-		t.Fatal(err)
-	}
-	sender := &stubSender{}
-	hub := &Hub{Sender: sender, Store: st}
-
-	hub.Forward(context.Background(), notifications.Notification{
-		Type: "action.completed", Title: "Action succeeded",
-		Data: map[string]any{"status": "succeeded"},
-	})
-	hub.Forward(context.Background(), notifications.Notification{
-		Type: "action.completed", Title: "Action failed",
-		Data: map[string]any{"status": "failed"},
-	})
-	if len(sender.sent) != 2 {
-		t.Fatalf("action.completed should always push regardless of outcome, got: %+v", sender.sent)
-	}
-}
-
 // TestHub_ForwardOverrideWinsOverDefault covers both directions of a
 // persisted notification_prefs override: forcing a normally-silent kind on,
 // and forcing a normally-loud one off.
@@ -333,6 +305,17 @@ func TestHub_ForwardOverrideWinsOverDefault(t *testing.T) {
 	})
 	if len(sender.sent) != 1 || sender.sent[0].Title != "cleared" {
 		t.Fatalf("overrides did not flip eligibility as configured: %+v", sender.sent)
+	}
+}
+
+func TestPushEligibleRetiredOverrideCannotReenableRemovedProducer(t *testing.T) {
+	retired := notifications.Notification{Type: "session_finished"}
+	if pushEligible(retired, map[Kind]bool{Kind("session_finished"): true}) {
+		t.Fatal("retired preference re-enabled a removed producer")
+	}
+	known := notifications.Notification{Type: "infra.runbook"}
+	if !pushEligible(known, map[Kind]bool{KindRunbook: true}) {
+		t.Fatal("known preference did not enable an active producer")
 	}
 }
 

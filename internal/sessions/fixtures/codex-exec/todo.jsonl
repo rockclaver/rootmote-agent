@@ -1,3 +1,0 @@
-{"type":"item.started","item":{"id":"item_3","type":"todo_list","items":[{"text":"Read code","completed":false},{"text":"Write fix","completed":false}]}}
-{"type":"item.updated","item":{"id":"item_3","type":"todo_list","items":[{"text":"Read code","completed":true},{"text":"Write fix","completed":false}]}}
-{"type":"item.completed","item":{"id":"item_3","type":"todo_list","items":[{"text":"Read code","completed":true},{"text":"Write fix","completed":true}]}}

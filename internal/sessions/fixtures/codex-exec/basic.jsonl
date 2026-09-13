@@ -1,4 +1,0 @@
-{"type":"thread.started","thread_id":"019f1799-7ad4-76e0-b415-4b3dc9368502"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello from exec"}}
-{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":100,"output_tokens":15,"reasoning_output_tokens":0}}

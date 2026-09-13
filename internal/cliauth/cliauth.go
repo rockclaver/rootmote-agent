@@ -245,6 +245,7 @@ func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
 		return m.githubStatus(ctx)
 	}
 
+	var claudeCLIStatus *Status
 	if row, err := m.cfg.Store.GetCliToken(kind); err == nil {
 		if m.fileBackedCredentialMissing(kind, row.Method) {
 			// A user can run /logout inside the CLI itself. For file-backed
@@ -255,12 +256,40 @@ func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
 			out.LoggedIn = true
 			out.Method = row.Method
 			out.Account = row.Account
+			if kind == KindClaude && row.Method == MethodSubscription {
+				// A vault row plus an existing credential file only proves the
+				// browser login once succeeded, not that it still works: an
+				// expired refresh token leaves the file in place, invisible to
+				// fileBackedCredentialMissing's existence check. Ask the CLI
+				// and let an authoritative "logged out" veto the vault-derived
+				// LoggedIn so the pre-session gate can't wave through a dead
+				// credential. Restricted to MethodSubscription: token/api_key
+				// credentials are injected as env vars (see Secrets) that
+				// envForCaptive() doesn't necessarily carry, so `claude auth
+				// status` can misreport those as logged out.
+				if st, ok := m.claudeStatusFromCLI(ctx); ok {
+					claudeCLIStatus = &st
+					if !st.LoggedIn {
+						out.LoggedIn = false
+						out.Method = MethodNone
+						out.Account = ""
+						_ = m.cfg.Store.DeleteCliToken(kind)
+					}
+				}
+			}
 		}
 	}
 
 	if !out.LoggedIn {
 		if kind == KindClaude {
-			if st, ok := m.claudeStatusFromCLI(ctx); ok {
+			st := claudeCLIStatus
+			ok := st != nil
+			if !ok {
+				var s Status
+				s, ok = m.claudeStatusFromCLI(ctx)
+				st = &s
+			}
+			if ok {
 				out.LoggedIn = st.LoggedIn
 				out.Method = st.Method
 				out.Account = st.Account

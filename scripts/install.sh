@@ -23,9 +23,6 @@ RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/rootmo
 BIN_DST="/usr/local/bin/rootmote-agent"
 UNIT_DST="/etc/systemd/system/rootmote-agent.service"
 STATE_DIR="/var/lib/rootmote"
-CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_FRAGMENTS_DIR="/etc/caddy/rootmote"
-CADDY_IMPORT_LINE="import ${CADDY_FRAGMENTS_DIR}/*.caddy"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -70,44 +67,6 @@ install -d -o rootmote -g rootmote -m 0700 \
   "$STATE_DIR/.claude/skills" \
   "$STATE_DIR/.codex" \
   "$STATE_DIR/.codex/skills"
-
-if ! command -v bwrap >/dev/null 2>&1; then
-  echo "installing bubblewrap" >&2
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y bubblewrap
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y bubblewrap
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache bubblewrap
-  else
-    echo "warning: no supported package manager found; install bubblewrap manually" >&2
-  fi
-fi
-
-if ! command -v gh >/dev/null 2>&1; then
-  echo "installing GitHub CLI" >&2
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    if ! apt-get install -y gh; then
-      apt-get install -y curl gpg
-      install -d -m 0755 /etc/apt/keyrings
-      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
-      chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list
-      apt-get update
-      apt-get install -y gh
-    fi
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y 'dnf-command(config-manager)' || true
-    dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo || true
-    dnf install -y gh
-  else
-    echo "warning: no supported package manager found; install GitHub CLI manually" >&2
-  fi
-fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -184,12 +143,6 @@ if [[ -f "$TMPFILES_DST" ]] && command -v systemd-tmpfiles >/dev/null 2>&1; then
   systemd-tmpfiles --create "$TMPFILES_DST"
 fi
 
-# ProtectSystem=strict + ReadWritePaths in the unit require every listed path
-# to exist when the service starts, or systemd fails with 226/NAMESPACE. The
-# Caddy phase below also creates this dir, but it runs after the first start;
-# create it now (Phase 7 tightens ownership to rootmote:caddy + setgid).
-install -d -o rootmote -g rootmote -m 0750 "$CADDY_FRAGMENTS_DIR"
-
 # --- Legacy cutover ---------------------------------------------------------
 # Old installs ran `claver-agent` on the same loopback port; any process still
 # holding it leaves the new unit crash-looping on bind (the exact "Agent not
@@ -259,57 +212,6 @@ if [[ -z "$agent_up" ]]; then
   echo "error: rootmote-agent did not reach active+listening within 20s" >&2
   journalctl -u rootmote-agent -n 10 --no-pager >&2 || true
   exit 1
-fi
-
-# --- Phase 7: Caddy for live previews -------------------------------------
-# Install Caddy if absent. The agent writes per-preview fragments into
-# /etc/caddy/rootmote/*.caddy; the main Caddyfile must `import` that glob.
-if ! command -v caddy >/dev/null 2>&1; then
-  echo "installing caddy" >&2
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
-    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-      > /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update
-    apt-get install -y caddy
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y 'dnf-command(copr)'
-    dnf copr enable -y @caddy/caddy
-    dnf install -y caddy
-  else
-    echo "warning: no supported package manager found; install caddy manually" >&2
-  fi
-fi
-
-# Owned by the agent user so the agent can write per-preview fragments, with
-# the caddy group + setgid bit so new files inherit group=caddy and the caddy
-# daemon can read them. Falls back gracefully if either user is missing.
-if id rootmote >/dev/null 2>&1 && getent group caddy >/dev/null 2>&1; then
-  install -d -o rootmote -g caddy -m 2750 "$CADDY_FRAGMENTS_DIR"
-elif id rootmote >/dev/null 2>&1; then
-  install -d -o rootmote -g rootmote -m 0755 "$CADDY_FRAGMENTS_DIR"
-else
-  install -d -m 0755 "$CADDY_FRAGMENTS_DIR"
-fi
-
-# Ensure the main Caddyfile exists and imports our fragments glob. The check
-# is intentionally a literal grep so re-runs of the installer are idempotent.
-if [[ ! -f "$CADDYFILE" ]]; then
-  mkdir -p "$(dirname "$CADDYFILE")"
-  cat > "$CADDYFILE" <<EOF
-# Managed by rootmote-agent installer.
-# Per-preview reverse-proxy site blocks live in $CADDY_FRAGMENTS_DIR.
-$CADDY_IMPORT_LINE
-EOF
-elif ! grep -Fq "$CADDY_IMPORT_LINE" "$CADDYFILE"; then
-  printf '\n# Added by rootmote-agent installer.\n%s\n' "$CADDY_IMPORT_LINE" >> "$CADDYFILE"
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl enable --now caddy 2>/dev/null || true
-  systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
 fi
 
 # Phase 1 AC: print installed version to stdout.

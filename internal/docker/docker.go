@@ -1459,15 +1459,22 @@ func portsSummary(ports []PortSummary) string {
 
 func healthFromStatus(status string) string {
 	start := strings.Index(status, "(health: ")
-	if start < 0 {
-		return ""
+	if start >= 0 {
+		rest := status[start+len("(health: "):]
+		end := strings.Index(rest, ")")
+		if end >= 0 {
+			return rest[:end]
+		}
 	}
-	rest := status[start+len("(health: "):]
-	end := strings.Index(rest, ")")
-	if end < 0 {
-		return ""
+
+	// Docker's container summary uses the shorter markers for the steady
+	// states, e.g. "Up 2 minutes (healthy)" and "Up 2 minutes (unhealthy)".
+	for _, health := range []string{"healthy", "unhealthy"} {
+		if strings.Contains(status, "("+health+")") {
+			return health
+		}
 	}
-	return rest[:end]
+	return ""
 }
 
 func parsePortKey(key string) (int, string) {

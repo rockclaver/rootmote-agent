@@ -1,1 +1,0 @@
-{"id":"req-cmd-7","method":"item/commandExecution/requestApproval","params":{"itemId":"it-cmd-2","threadId":"th-1","turnId":"tn-1","command":"rm -rf build","commandActions":[],"cwd":"/work","reason":"Destructive command","startedAtMs":1782806968400}}

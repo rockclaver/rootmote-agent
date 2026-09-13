@@ -4,22 +4,14 @@ The VPS-side companion for [Rootmote](https://github.com/rockclaver/rootmote). A
 `systemd`, that binds only to `127.0.0.1` and speaks a JSON-over-WebSocket
 protocol to the mobile app over an SSH-forwarded port.
 
-## Sessions
+## Incident operations
 
-Structured agent sessions are the default transport. Claude Code and Codex are
-driven over their native machine protocols — `claude` stream-json over stdio and
-`codex app-server` JSON-RPC — translated into one normalized event/command schema
-(messages, tool calls, diffs, plans, approvals, usage, turn boundaries) that the
-mobile app renders as a typed transcript. Each session is a per-session child
-process; start/interrupt/stop/resume/fork and replay are owned by the session
-Manager, and approvals/plan-mode are answered by a single protocol message rather
-than by scraping a TUI.
-
-A **raw-terminal transport** remains as an explicit fallback for flows the
-structured protocols do not cover (CLI auth / device-code prompts, experimental
-modes): the CLI runs in a tmux pane and its bytes stream to the app's terminal
-view. Each session selects its transport at start
-(`session.start { transport: "structured" | "terminal" }`, default `structured`).
+Rootmote monitors the host, diagnoses incidents from bounded local evidence,
+proposes runbooks through an authenticated Claude or Codex CLI, and performs
+only reviewed, typed remediation with durable audit records. Watchtower, alerts,
+push notifications, and recovery remain available. Developer workspaces, coding
+sessions, repositories, pull requests, previews, skill catalogs, and generic
+action jobs are not part of the agent.
 
 ## Build
 
@@ -34,21 +26,15 @@ go run ./cmd/rootmote-agent --addr 127.0.0.1:7676
 ```
 
 The agent refuses to start if `--addr` is anything other than a loopback IP.
-Interactive Claude and Codex sessions run with a stable agent HOME. On the
-systemd install that HOME is `/var/lib/rootmote`, so CLI auth, transcripts, and
-skills installed by the agents live under `/var/lib/rootmote/.claude` and
-`/var/lib/rootmote/.codex` instead of the project workspace. The agent also adds
-the relevant `skills` directory to each CLI's writable roots, so skill installs
-persist across sessions, logins, and binary upgrades.
+The agent keeps a stable HOME for Claude and Codex authentication. Those CLI
+credentials are used only by diagnosis and runbook planning.
 
 ### Startup options
 
 | Flag | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--addr` | | `127.0.0.1:7676` | Loopback bind address for the WebSocket control plane. |
-| `--data-dir` | | `$HOME/rootmote` | Directory for `state.db`, project workspaces, tool installs, and token vault files. |
-| `--caddy-fragments-dir` | `ROOTMOTE_CADDY_FRAGMENTS_DIR` | `/etc/caddy/rootmote` | Directory where preview site-block fragments are written. |
-| `--preview-expected-ip` | `ROOTMOTE_PREVIEW_EXPECTED_IP` | unset | Optional DNS guard; preview setup requires wildcard DNS to resolve to this IP. |
+| `--data-dir` | | `$HOME/rootmote` | Directory for `state.db`, tool installs, and encrypted CLI credentials. |
 | `--version` | | `false` | Print the installed agent version and exit. |
 
 Examples:
@@ -114,37 +100,12 @@ For a systemd install, prefer an override instead of editing the packaged unit:
 sudo systemctl edit rootmote-agent
 ```
 
-```ini
-[Service]
-Environment=ROOTMOTE_PREVIEW_EXPECTED_IP=203.0.113.10
-```
-
-Then reload and restart:
+ Then reload and restart:
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl restart rootmote-agent
 ```
-
-### GitHub setup
-
-GitHub imports use GitHub CLI authentication. No custom OAuth app, callback URL,
-or Client ID is required.
-
-Install `gh` on the VPS, then sign in as the same user that runs
-`rootmote-agent`:
-
-```sh
-sudo -u rootmote -H gh auth login \
-  --hostname github.com \
-  --git-protocol https \
-  --scopes repo,read:org,workflow \
-  --web
-```
-
-The mobile app can also start the same browser sign-in flow from **Import from
-GitHub**. Repository listing, imports, pushes, and PR creation read the active
-token with `gh auth token --hostname github.com`.
 
 ## Test
 
@@ -169,9 +130,7 @@ curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scri
 
 The installer creates a `rootmote` system user, drops the binary at
 `/usr/local/bin/rootmote-agent`, installs the systemd unit, enables and starts
-the service, and prints the installed version on stdout. It also installs the
-OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH, and creates
-the persistent Claude/Codex skill roots under `/var/lib/rootmote`.
+the service, and prints the installed version on stdout.
 
 ## Install on macOS
 
@@ -196,11 +155,11 @@ The macOS installer creates a per-user LaunchAgent at
 under `~/Library/Application Support/RootmoteAgent/bin`, stores agent data under
 `~/Library/Application Support/RootmoteAgent`, and writes logs to
 `~/Library/Logs/RootmoteAgent`. Do not run it with `sudo`; the agent should use
-the same user-level Claude, Codex, GitHub CLI, and SSH state as the account
-Rootmote connects to.
+the same user-level Claude, Codex, and SSH state as the account Rootmote
+connects to.
 
-macOS support is for running coding sessions, project operations, and the
-read-only Infrastructure views on the MacBook. The Overview tab uses native
+macOS support provides monitoring, diagnosis, and reviewed recovery on the
+MacBook. The Overview tab uses native
 macOS metrics, Services lists `launchd` jobs, Processes uses `ps`, Firewall
 falls back to read-only listening sockets through `netstat`, and Webservers checks
 common Homebrew Caddy/Nginx/Apache config paths. Linux-only controls such as

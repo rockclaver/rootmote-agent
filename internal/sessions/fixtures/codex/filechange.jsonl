@@ -1,2 +1,0 @@
-{"method":"item/started","params":{"item":{"type":"fileChange","id":"it-fc-1","status":"inProgress","changes":[{"path":"server.go","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-port := 8080\n+port := envPort()\n"}]},"threadId":"th-1","turnId":"tn-1","startedAtMs":1782806968300}}
-{"method":"item/completed","params":{"item":{"type":"fileChange","id":"it-fc-1","status":"completed","changes":[{"path":"server.go","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-port := 8080\n+port := envPort()\n"}]},"threadId":"th-1","turnId":"tn-1","completedAtMs":1782806969300}}

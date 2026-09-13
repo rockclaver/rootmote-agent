@@ -1,2 +1,0 @@
-{"type":"control_request","request_id":"req-bash-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"},"permission_suggestions":[],"title":"Run a shell command","description":"rm -rf build"}}
-{"type":"control_request","request_id":"req-edit-1","request":{"subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"/work/main.go","old_string":"a","new_string":"b"},"title":"Edit file"}}

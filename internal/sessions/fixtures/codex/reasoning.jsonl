@@ -1,2 +1,0 @@
-{"method":"item/started","params":{"item":{"type":"reasoning","id":"it-rsn-1","content":[],"summary":[]},"threadId":"th-1","turnId":"tn-1","startedAtMs":1782806968100}}
-{"method":"item/completed","params":{"item":{"type":"reasoning","id":"it-rsn-1","content":["Let me reason about this."],"summary":["Plan the edit."]},"threadId":"th-1","turnId":"tn-1","completedAtMs":1782806968500}}

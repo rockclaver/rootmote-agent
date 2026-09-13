@@ -1,3 +1,0 @@
-{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}},"session_id":"sess-3","parent_tool_use_id":null,"uuid":"u-se-1"}
-{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}},"session_id":"sess-3","parent_tool_use_id":null,"uuid":"u-se-2"}
-{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"Read","input":{}}},"session_id":"sess-3","parent_tool_use_id":null,"uuid":"u-se-3"}

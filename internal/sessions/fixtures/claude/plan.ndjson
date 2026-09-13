@@ -1,1 +1,0 @@
-{"type":"control_request","request_id":"req-plan-1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"## Steps\n- Read the code\n- Write the fix\n- Run tests"},"title":"Ready to code?"}}

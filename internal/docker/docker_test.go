@@ -249,6 +249,40 @@ func TestSocketClientContainer_SurfacesRestartCount(t *testing.T) {
 	}
 }
 
+func TestSocketClientContainers_MapsDockerHealthStatusVariants(t *testing.T) {
+	socket := startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/containers/json" || r.URL.Query().Get("all") != "1" {
+			t.Fatalf("unexpected containers request: %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"Id":"healthy-id","Names":["/api-1"],"Image":"api:latest","State":"running","Status":"Up 2 minutes (healthy)"},
+			{"Id":"unhealthy-id","Names":["/worker-1"],"Image":"worker:latest","State":"running","Status":"Up 2 minutes (unhealthy)"},
+			{"Id":"starting-id","Names":["/db-1"],"Image":"postgres:16","State":"running","Status":"Up Less than a second (health: starting)"},
+			{"Id":"stopped-id","Names":["/old-1"],"Image":"old:latest","State":"exited","Status":"Exited (0)"}
+		]`))
+	})
+
+	got, err := NewSocketClient(socket).Containers(context.Background())
+	if err != nil {
+		t.Fatalf("Containers: %v", err)
+	}
+	wantHealth := map[string]string{
+		"healthy-id":   "healthy",
+		"unhealthy-id": "unhealthy",
+		"starting-id":  "starting",
+		"stopped-id":   "",
+	}
+	if len(got) != len(wantHealth) {
+		t.Fatalf("containers len = %d, want %d", len(got), len(wantHealth))
+	}
+	for _, container := range got {
+		if health := container.Health; health != wantHealth[container.ID] {
+			t.Errorf("container %s health = %q, want %q", container.ID, health, wantHealth[container.ID])
+		}
+	}
+}
+
 // AC: missing Docker is distinguishable from a down daemon.
 func TestStatusMissingDocker(t *testing.T) {
 	m := newManager(t, fakeClient{err: errors.New("wrap: " + ErrNotInstalled.Error())})

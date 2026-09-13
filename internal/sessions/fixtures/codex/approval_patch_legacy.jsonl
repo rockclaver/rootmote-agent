@@ -1,1 +1,0 @@
-{"id":"req-patch-9","method":"applyPatchApproval","params":{"callId":"call-1","conversationId":"th-1","fileChanges":{"main.go":{"kind":"update","diff":"@@ -1 +1 @@\n-old\n+new\n"}},"reason":"Apply patch"}}

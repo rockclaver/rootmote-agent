@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -13,6 +14,30 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/github"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 )
+
+// TestMain pins PATH to an empty directory so resolveBin can only find the
+// stub CLIs a test explicitly installs in BinDir. Without it, whichever real
+// claude/codex/gh happens to be installed on the machine running the tests
+// leaks into Status() — making results depend on the developer's own login
+// state and paying seconds of Node startup per probe, which under a loaded
+// `go test ./...` blows the probes' internal timeouts.
+func TestMain(m *testing.M) {
+	empty, err := os.MkdirTemp("", "cliauth-empty-path")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("PATH", empty); err != nil {
+		panic(err)
+	}
+	// Pay the process's one-time fork/exec warm-up cost here rather than
+	// inside a test: the CLI probes in Status bound themselves with a few
+	// seconds, and under a loaded `go test ./...` the very first subprocess a
+	// test binary spawns can take longer than that to come up.
+	_ = exec.Command("/bin/sh", "-c", "exit 0").Run()
+	code := m.Run()
+	_ = os.RemoveAll(empty)
+	os.Exit(code)
+}
 
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
@@ -54,25 +79,18 @@ func TestStatusUnauthenticated(t *testing.T) {
 
 func TestStatusClaudeUsesCLIAuthStatusWithConfiguredHome(t *testing.T) {
 	m := newTestManager(t)
-	if err := os.MkdirAll(m.cfg.BinDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	claudeBin := filepath.Join(m.cfg.BinDir, "claude")
-	marker := filepath.Join(m.cfg.HomeDir, "home-marker")
-	if err := os.WriteFile(claudeBin, []byte(`#!/bin/sh
-if [ "$1" = "--version" ]; then
+	installStub(t, m, "claude", `if [ "$1" = "--version" ]; then
   echo "claude-stub 1.0.0"
   exit 0
 fi
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  touch "$HOME/home-marker"
+  : > "$HOME/home-marker"
   printf '{"loggedIn":true,"authMethod":"claude.ai","email":"dev@example.com","subscriptionType":"pro"}'
   exit 0
 fi
 exit 1
-`), 0o755); err != nil {
-		t.Fatal(err)
-	}
+`)
+	marker := filepath.Join(m.cfg.HomeDir, "home-marker")
 	st, err := m.Status(context.Background(), KindClaude)
 	if err != nil {
 		t.Fatal(err)
@@ -352,12 +370,7 @@ func TestSetTokenRejectsBadKind(t *testing.T) {
 
 func TestStatusGitHubFromCLI(t *testing.T) {
 	m := newTestManager(t)
-	if err := os.MkdirAll(m.cfg.BinDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	ghBin := filepath.Join(m.cfg.BinDir, "gh")
-	if err := os.WriteFile(ghBin, []byte(`#!/bin/sh
-if [ "$1" = "--version" ]; then
+	installStub(t, m, "gh", `if [ "$1" = "--version" ]; then
   echo "gh version 2.0.0"
   exit 0
 fi
@@ -370,9 +383,7 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   exit 0
 fi
 exit 1
-`), 0o755); err != nil {
-		t.Fatal(err)
-	}
+`)
 	st, err := m.Status(context.Background(), KindGitHub)
 	if err != nil {
 		t.Fatal(err)
@@ -591,5 +602,132 @@ func TestAuthCodeFromLineRecognizesCodexDeviceCode(t *testing.T) {
 		if got := authCodeFromLine(line, codeRE, deviceCodeRE); got != want {
 			t.Errorf("authCodeFromLine(%q) = %q want %q", line, got, want)
 		}
+	}
+}
+
+// installStub writes an executable `#!/bin/sh` stub named after a CLI into the
+// Manager's BinDir, where resolveBin finds it ahead of anything on PATH, and
+// then runs it once with no arguments.
+//
+// That warm-up run is load-bearing on macOS: the first exec of a newly created
+// executable pays a code-signing/quarantine scan that costs hundreds of
+// milliseconds idle and seconds on a saturated machine. The probes in Status
+// bound themselves to a few seconds, so paying that cost here — untimed —
+// keeps the tests measuring the auth logic instead of the host's spawn latency.
+func installStub(t *testing.T, m *Manager, name, script string) {
+	t.Helper()
+	if err := os.MkdirAll(m.cfg.BinDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(m.cfg.BinDir, name)
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(bin).Run(); err == nil {
+		t.Fatalf("%s stub should exit non-zero when called with no arguments", name)
+	}
+}
+
+func seedClaudeSubscription(t *testing.T, m *Manager) {
+	t.Helper()
+	credPath := filepath.Join(m.cfg.HomeDir, ".claude", ".credentials.json")
+	if err := os.MkdirAll(filepath.Dir(credPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credPath, []byte(`{"oauth":{"access_token":"stale"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := m.cfg.Vault.Seal(KindClaude, "stale")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := m.cfg.Store.PutCliToken(store.CliToken{
+		Kind: KindClaude, Method: MethodSubscription, CiphertextPath: sealed,
+	}); err != nil {
+		t.Fatalf("put cli token: %v", err)
+	}
+}
+
+// TestStatusClaudeSubscriptionVetoedByExpiredCLIStatus proves that a stale
+// vault pointer plus an on-disk credential file (which alone would report
+// LoggedIn=true) is overridden by an authoritative "loggedIn:false" from
+// `claude auth status --json`: a refresh token can expire without the
+// credential file disappearing, so the file-existence check alone is not
+// enough to catch it.
+func TestStatusClaudeSubscriptionVetoedByExpiredCLIStatus(t *testing.T) {
+	m := newTestManager(t)
+	seedClaudeSubscription(t, m)
+	installStub(t, m, "claude", `if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '{"loggedIn":false}'
+  exit 0
+fi
+exit 1
+`)
+	st, err := m.Status(context.Background(), KindClaude)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.LoggedIn {
+		t.Fatalf("status = %+v, want LoggedIn=false when CLI reports expired credential", st)
+	}
+	if _, err := m.cfg.Store.GetCliToken(KindClaude); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale cli token still exists: %v", err)
+	}
+}
+
+// TestStatusClaudeSubscriptionSurvivesUnanswerableCLI proves the same setup
+// keeps LoggedIn=true when the `claude` binary is unavailable or errors: no
+// answer from the CLI must not be treated as logged out, or a box without the
+// CLI on PATH would force a pointless re-login.
+func TestStatusClaudeSubscriptionSurvivesUnanswerableCLI(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stub string // empty ⇒ install no binary at all
+	}{
+		{name: "binary absent"},
+		{name: "binary errors", stub: "exit 1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t)
+			seedClaudeSubscription(t, m)
+			if tc.stub != "" {
+				installStub(t, m, "claude", tc.stub)
+			}
+			st, err := m.Status(context.Background(), KindClaude)
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			if !st.LoggedIn || st.Method != MethodSubscription {
+				t.Fatalf("status = %+v, want LoggedIn=true (CLI gave no answer)", st)
+			}
+			if _, err := m.cfg.Store.GetCliToken(KindClaude); err != nil {
+				t.Fatalf("vault pointer was dropped without an authoritative answer: %v", err)
+			}
+		})
+	}
+}
+
+// TestStatusClaudeTokenNeverVetoedByCLI proves a MethodToken credential is
+// never re-checked against the CLI: token/api_key credentials are injected as
+// env vars that envForCaptive() doesn't necessarily carry, so `claude auth
+// status` could otherwise misreport a perfectly good token credential as
+// logged out.
+func TestStatusClaudeTokenNeverVetoedByCLI(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.SetToken(context.Background(), KindClaude, ModeToken, "sk-ant-secret-XYZ"); err != nil {
+		t.Fatalf("set_token: %v", err)
+	}
+	installStub(t, m, "claude", `if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '{"loggedIn":false}'
+  exit 0
+fi
+exit 1
+`)
+	st, err := m.Status(context.Background(), KindClaude)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !st.LoggedIn || st.Method != MethodToken {
+		t.Fatalf("status = %+v, want LoggedIn=true (token credential never vetoed by CLI)", st)
 	}
 }

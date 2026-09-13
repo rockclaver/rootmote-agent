@@ -1,5 +1,4 @@
-// Package github implements GitHub repository, commit, push, and pull request
-// operations for the agent.
+// Package github retains the encrypted credential vault used by CLI auth.
 package github
 
 import (

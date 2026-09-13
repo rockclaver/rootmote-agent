@@ -43,7 +43,6 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$DATA_DIR/bin"
 BIN_DST="$BIN_DIR/rootmote-agent"
-FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
 LOG_DIR="$HOME/Library/Logs/RootmoteAgent"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_DST="$PLIST_DIR/$LABEL.plist"
@@ -70,7 +69,7 @@ version="dev-${short_sha}${dirty}"
   -o "$tmp/rootmote-agent" ./cmd/rootmote-agent)
 
 echo "[deploy] installing binary to $BIN_DST"
-install -d -m 0700 "$DATA_DIR" "$BIN_DIR" "$FRAGMENTS_DIR" "$LOG_DIR" "$PLIST_DIR"
+install -d -m 0700 "$DATA_DIR" "$BIN_DIR" "$LOG_DIR" "$PLIST_DIR"
 install -m 0755 "$tmp/rootmote-agent" "$BIN_DST"
 
 xml_escape() {
@@ -84,7 +83,6 @@ xml_escape() {
 bin_xml="$(xml_escape "$BIN_DST")"
 addr_xml="$(xml_escape "$ADDR")"
 data_xml="$(xml_escape "$DATA_DIR")"
-fragments_xml="$(xml_escape "$FRAGMENTS_DIR")"
 home_xml="$(xml_escape "$HOME")"
 path_xml="$(xml_escape "$BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
 stdout_xml="$(xml_escape "$LOG_DIR/agent.log")"
@@ -105,8 +103,6 @@ cat > "$PLIST_DST" <<EOF
     <string>$addr_xml</string>
     <string>--data-dir</string>
     <string>$data_xml</string>
-    <string>--caddy-fragments-dir</string>
-    <string>$fragments_xml</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/rootmote-agent/internal/actions"
 	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 	"github.com/rockclaver/rootmote-agent/internal/alerts"
 	"github.com/rockclaver/rootmote-agent/internal/cliauth"
@@ -27,15 +26,12 @@ import (
 	"github.com/rockclaver/rootmote-agent/internal/monitor"
 	"github.com/rockclaver/rootmote-agent/internal/notifications"
 	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
-	"github.com/rockclaver/rootmote-agent/internal/projects"
 	"github.com/rockclaver/rootmote-agent/internal/push"
 	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
 	"github.com/rockclaver/rootmote-agent/internal/security"
 	"github.com/rockclaver/rootmote-agent/internal/server"
-	"github.com/rockclaver/rootmote-agent/internal/sessions"
-	"github.com/rockclaver/rootmote-agent/internal/skills"
 	"github.com/rockclaver/rootmote-agent/internal/storage"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
@@ -57,15 +53,14 @@ func main() {
 		return
 	}
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
-	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
+	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state, encrypted CLI credentials, and managed tooling")
 	requirePairing := flag.Bool("require-pairing", true, "require the mobile app to present the control-plane pairing key on the WebSocket; disable only for local development")
 	notifyRelayURL := flag.String("notify-relay-url", envOr("ROOTMOTE_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central rootmote-notify relay; set to empty to disable push")
 	notifyToken := flag.String("notify-token", envOr("ROOTMOTE_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
 	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("ROOTMOTE_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
 	watchtowerRelayURL := flag.String("watchtower-relay-url", envOr("ROOTMOTE_WATCHTOWER_RELAY_URL", ""), "base URL of the Watchtower relay (github.com/rockclaver/rootmote-watchtower); starts the outbound heartbeat loop at boot. Leave empty to stay opt-out until enrolled via the watchtower.enable control-plane kind (also auto-resumes at boot if a prior enrollment's cred file exists)")
 	runbookAgent := flag.String("runbook-agent", envOr("ROOTMOTE_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
-	codexRuntimeKind := flag.String("codex-runtime", envOr("ROOTMOTE_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
-	serverID := flag.String("server-id", envOr("ROOTMOTE_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
+	serverID := flag.String("server-id", envOr("ROOTMOTE_SERVER_ID", "local"), "stable identifier attached to this host's operational telemetry")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -88,10 +83,6 @@ func main() {
 	}
 	defer st.Close()
 
-	mgr, err := projects.New(filepath.Join(*dataDir, "projects"), st)
-	if err != nil {
-		log.Fatalf("rootmote-agent: init workspaces: %v", err)
-	}
 	toolingMgr, err := tooling.New(tooling.Config{
 		BinDir:    filepath.Join(*dataDir, "bin"),
 		NpmPrefix: filepath.Join(*dataDir, "npm-prefix"),
@@ -99,9 +90,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("rootmote-agent: init tooling: %v", err)
 	}
-	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
+	reviewMgr := review.New(st)
+	// Keep the established vault paths so upgrades can still decrypt existing
+	// AI provider credentials, even though repository operations are retired.
 	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
-	githubMgr := gh.New(st, mgr, reviewMgr, vault)
 
 	// cliauth reuses the same vault for CLI credentials. SQLite keeps the
 	// two namespaces separate (cli_tokens vs github_tokens).
@@ -114,41 +106,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("rootmote-agent: init cliauth: %v", err)
 	}
-	terminalRuntime := sessions.TmuxRuntime{
-		ExtraPath: toolingMgr.BinDir(),
-		HomeDir:   homeDirOr(*dataDir),
-		Secrets:   authMgr.Secrets,
-	}
-	claudeRuntime := sessions.NewClaudeStructuredRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
-	// Codex defaults to the richer app-server protocol; the exec --json fallback
-	// is selectable for hosts where app-server is unavailable.
-	var codexRuntime sessions.Runtime = sessions.NewCodexStructuredRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
-	if *codexRuntimeKind == "exec" {
-		codexRuntime = sessions.NewCodexExecRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
-	}
-	sessionRuntime := sessions.NewRoutingRuntime(
-		terminalRuntime,
-		map[string]sessions.Runtime{"claude": claudeRuntime, "codex": codexRuntime},
-		func(sessionID string) (string, string) {
-			s, err := st.GetSession(sessionID)
-			if err != nil {
-				return "", ""
-			}
-			return s.Agent, s.Transport
-		},
-	)
-	sessionMgr := sessions.New(st, mgr, sessionRuntime)
-	// Real token usage is read from the claude CLI transcript root, which lives
-	// under the same HOME the runtime gives the CLI.
-	sessionMgr.ClaudeProjectsDir = filepath.Join(homeDirOr(*dataDir), ".claude", "projects")
-	sessionMgr.AuthOK = func(ctx context.Context, agent string) bool {
-		st, err := authMgr.Status(ctx, agent)
-		return err == nil && st.LoggedIn
-	}
-
 	dockerMgr, err := docker.New(docker.Config{
-		Client:      docker.NewSocketClient(""),
-		ProjectRoot: filepath.Join(*dataDir, "projects"),
+		Client: docker.NewSocketClient(""),
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init docker: %v", err)
@@ -158,10 +117,9 @@ func main() {
 		log.Fatalf("rootmote-agent: init infra: %v", err)
 	}
 	storageMgr, err := storage.New(storage.Config{
-		HomeDir:      homeDirOr(*dataDir),
-		DataDir:      *dataDir,
-		ProjectsRoot: filepath.Join(*dataDir, "projects"),
-		Docker:       dockerMgr,
+		HomeDir: homeDirOr(*dataDir),
+		DataDir: *dataDir,
+		Docker:  dockerMgr,
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init storage: %v", err)
@@ -299,24 +257,7 @@ func main() {
 		log.Fatalf("rootmote-agent: init runbook: %v", err)
 	}
 
-	// AI Action Plane orchestrator (Phase 1, read-only tracer). The host-query
-	// planner answers server-scoped resource questions (memory, swap, disk, CPU,
-	// load) from live host metrics — the agent is itself the host, so these need
-	// no target resolution. Requests outside that scope still return "needs
-	// target" honestly, until the full target resolver is wired on the agent. No
-	// mutation happens in this phase.
 	hostname, _ := os.Hostname()
-	actionsMgr, err := actions.New(actions.Config{
-		Store: st,
-		Planner: actions.HostQueryPlanner{
-			Metrics:  infraMgr,
-			Hostname: hostname,
-		},
-		Notifications: notificationHub,
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init actions: %v", err)
-	}
 	pushDeliveryConfigured := false
 	inventoryMgr := inventory.New(inventory.Config{
 		Docker:         dockerMgr,
@@ -363,11 +304,7 @@ func main() {
 	}
 	srv := server.New(server.Config{
 		Addr:                *addr,
-		Projects:            mgr,
-		Sessions:            sessionMgr,
-		Skills:              skills.New(homeDirOr(*dataDir)),
 		Review:              reviewMgr,
-		GitHub:              githubMgr,
 		Tooling:             toolingMgr,
 		Auth:                authMgr,
 		Docker:              dockerMgr,
@@ -383,7 +320,6 @@ func main() {
 		Notifications:       notificationHub,
 		Runbook:             runbookMgr,
 		Remediation:         remediationMgr,
-		Actions:             actionsMgr,
 		Inventory:           inventoryMgr,
 		PushDevices:         st,
 		Watchtower:          wtClient,
@@ -399,9 +335,6 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	if err := sessionMgr.Rehydrate(ctx); err != nil {
-		log.Printf("rootmote-agent: rehydrate sessions: %v", err)
-	}
 	// A host command may have been mid-flight when the agent last stopped;
 	// RecoverInterrupted fails those executions closed (remediation_failed)
 	// rather than guessing whether the last step actually completed on the
@@ -411,7 +344,6 @@ func main() {
 	} else if len(recovered) > 0 {
 		log.Printf("rootmote-agent: recovered %d interrupted remediation(s) as failed", len(recovered))
 	}
-	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
 	runbookCleanup := runbookMgr.Start(ctx)
 	defer runbookCleanup()

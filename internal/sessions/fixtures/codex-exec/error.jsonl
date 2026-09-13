@@ -1,3 +1,0 @@
-{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Skill descriptions were shortened to fit the context budget."}}
-{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}
-{"type":"error","message":"unrecoverable stream error"}

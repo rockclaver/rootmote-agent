@@ -1,7 +1,0 @@
-{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tn-1","items":[],"itemsView":"notLoaded","status":"inProgress"}}}
-{"method":"item/started","params":{"item":{"type":"agentMessage","id":"it-msg-1","text":""},"threadId":"th-1","turnId":"tn-1","startedAtMs":1782806968087}}
-{"method":"item/agentMessage/delta","params":{"delta":"Hello, ","itemId":"it-msg-1","threadId":"th-1","turnId":"tn-1"}}
-{"method":"item/agentMessage/delta","params":{"delta":"world","itemId":"it-msg-1","threadId":"th-1","turnId":"tn-1"}}
-{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"it-msg-1","text":"Hello, world"},"threadId":"th-1","turnId":"tn-1","completedAtMs":1782806970000}}
-{"method":"thread/tokenUsage/updated","params":{"threadId":"th-1","turnId":"tn-1","tokenUsage":{"last":{"cachedInputTokens":100,"inputTokens":1200,"outputTokens":15,"reasoningOutputTokens":0,"totalTokens":1315},"total":{"cachedInputTokens":100,"inputTokens":1200,"outputTokens":15,"reasoningOutputTokens":0,"totalTokens":1315},"modelContextWindow":272000}}}
-{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tn-1","items":[],"itemsView":"notLoaded","status":"completed"}}}

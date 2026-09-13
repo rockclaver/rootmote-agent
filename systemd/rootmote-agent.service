@@ -8,6 +8,9 @@ Wants=network-online.target
 Type=simple
 User=rootmote
 Group=rootmote
+# Incident evidence reads service journals; memory monitoring reads kernel OOM events.
+SupplementaryGroups=systemd-journal
+AmbientCapabilities=CAP_SYSLOG
 ExecStart=/usr/local/bin/rootmote-agent --addr 127.0.0.1:7676
 Restart=on-failure
 RestartSec=2s
@@ -43,9 +46,9 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 # The agent's *listener* is locked to loopback by an in-process self-check
-# (assertLoopback). It still needs outbound network to clone repos, talk to
-# GitHub CLI auth, previews, etc., so we leave egress open here.
-ReadWritePaths=/var/lib/rootmote /etc/caddy/rootmote /run/sudo
+# (assertLoopback). Outbound access supports monitoring, push delivery, and
+# optional AI provider authentication and diagnosis.
+ReadWritePaths=/var/lib/rootmote /run/sudo
 
 [Install]
 WantedBy=multi-user.target
