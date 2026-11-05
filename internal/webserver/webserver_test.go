@@ -162,7 +162,8 @@ func TestListMatchesHomebrewLaunchdWebserverUnits(t *testing.T) {
 		Systemd: &fakeSystemd{units: []systemd.Unit{
 			{Name: "homebrew.mxcl.caddy", Description: "Caddy", ActiveState: "active", EnabledOnBoot: "loaded"},
 		}},
-		Paths: map[Kind][]string{KindCaddy: {caddy}},
+		// Empty nginx/apache paths keep the host's real configs out of the test.
+		Paths: map[Kind][]string{KindCaddy: {caddy}, KindNginx: {}, KindApache: {}},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -114,6 +114,11 @@ exit 0
 	} else {
 		shim("visudo", "exit 1\n")
 	}
+	// The runner may have a real, root-owned /etc/sudoers.d; the staged rule
+	// file never exists there in this fixture, so removing it is a no-op.
+	shim("rm", `for a in "$@"; do case "$a" in /etc/sudoers.d/*) exit 0 ;; esac; done
+exec /bin/rm "$@"
+`)
 	for _, n := range []string{"install", "useradd", "usermod", "systemctl", "systemd-tmpfiles", "getent", "mv", "journalctl", "gpasswd", "rmdir"} {
 		shim(n, record+"exit 0\n")
 	}
