@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 	"github.com/rockclaver/rootmote-agent/internal/firewall"
@@ -26,9 +25,6 @@ func securityFixTokenBinding(req security.FixRequest) (string, string, []string)
 	file := string(req.Kind)
 	if req.Kind == security.FixEnableAuditd {
 		file = "auditd"
-	}
-	if req.Kind == security.FixRunScript {
-		file = req.Script
 	}
 	return "security.fix." + string(req.Kind), "security", []string{file}
 }
@@ -87,7 +83,6 @@ func securityFixRequestFromParams(params map[string]any) (security.FixRequest, e
 	}
 	req.Protocol, _ = params["protocol"].(string)
 	req.Signal, _ = params["signal"].(string)
-	req.Script, _ = params["script"].(string)
 	switch req.Kind {
 	case security.FixClosePort:
 		if req.Port <= 0 {
@@ -98,13 +93,8 @@ func securityFixRequestFromParams(params map[string]any) (security.FixRequest, e
 			return security.FixRequest{}, fmt.Errorf("pid and start_time_ticks required")
 		}
 	case security.FixEnableAuditd:
-	case security.FixRunScript:
-		if strings.TrimSpace(req.Script) == "" {
-			return security.FixRequest{}, fmt.Errorf("script required")
-		}
-		if len(req.Script) > security.MaxScriptBytes {
-			return security.FixRequest{}, fmt.Errorf("script exceeds %d bytes", security.MaxScriptBytes)
-		}
+	case "run_script":
+		return security.FixRequest{}, fmt.Errorf("run_script is advice for the operator to run manually; the agent does not execute raw scripts")
 	default:
 		return security.FixRequest{}, fmt.Errorf("unsupported security fix %q", req.Kind)
 	}

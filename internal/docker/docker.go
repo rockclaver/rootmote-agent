@@ -194,17 +194,21 @@ type ContainerSummary struct {
 
 // ContainerDetail is the safe inspect subset returned by Manager.Container.
 type ContainerDetail struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Image           string            `json:"image"`
-	Command         string            `json:"command,omitempty"`
-	Status          string            `json:"status"`
-	State           string            `json:"state"`
-	Health          string            `json:"health,omitempty"`
-	Ports           []PortSummary     `json:"ports,omitempty"`
-	Mounts          []MountSummary    `json:"mounts,omitempty"`
-	RestartPolicy   string            `json:"restart_policy,omitempty"`
-	RestartCount    int               `json:"restart_count,omitempty"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Image         string         `json:"image"`
+	Command       string         `json:"command,omitempty"`
+	Status        string         `json:"status"`
+	State         string         `json:"state"`
+	Health        string         `json:"health,omitempty"`
+	Ports         []PortSummary  `json:"ports,omitempty"`
+	Mounts        []MountSummary `json:"mounts,omitempty"`
+	RestartPolicy string         `json:"restart_policy,omitempty"`
+	RestartCount  int            `json:"restart_count,omitempty"`
+	// ExitCode and OOMKilled describe the last exit; meaningful only when
+	// State is "exited" or "dead".
+	ExitCode        int               `json:"exit_code,omitempty"`
+	OOMKilled       bool              `json:"oom_killed,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
 	ComposeProject  string            `json:"compose_project,omitempty"`
 	ComposeService  string            `json:"compose_service,omitempty"`
@@ -782,8 +786,10 @@ func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetai
 			Labels map[string]string `json:"Labels"`
 		} `json:"Config"`
 		State struct {
-			Status string `json:"Status"`
-			Health *struct {
+			ExitCode  int    `json:"ExitCode"`
+			OOMKilled bool   `json:"OOMKilled"`
+			Status    string `json:"Status"`
+			Health    *struct {
 				Status string `json:"Status"`
 			} `json:"Health"`
 		} `json:"State"`
@@ -844,6 +850,8 @@ func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetai
 		Command:         strings.Join(raw.Config.Cmd, " "),
 		Status:          raw.State.Status,
 		State:           raw.State.Status,
+		ExitCode:        raw.State.ExitCode,
+		OOMKilled:       raw.State.OOMKilled,
 		Health:          health,
 		Ports:           ports,
 		Mounts:          mounts,

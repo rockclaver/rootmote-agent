@@ -33,14 +33,18 @@ const DefaultCadence = 30 * time.Second
 
 // Config configures a Manager.
 type Config struct {
-	Infra   InfraSampler
-	Docker  DockerSource  // optional: nil disables the docker_container evaluator
-	Systemd SystemdSource // optional: nil disables the systemd_unit evaluator
-	Store   StateStore
-	Client  EventSender
-	Now     func() time.Time
-	Cadence time.Duration
-	Logf    func(format string, args ...any)
+	Infra     InfraSampler
+	Docker    DockerSource  // optional: nil disables the docker_container evaluator
+	Systemd   SystemdSource // optional: nil disables the systemd_unit and systemd_timer_failed evaluators
+	Host      Host          // optional: defaults to the real machine (OSHost)
+	Sockets   SocketSource  // optional: defaults to ss/netstat
+	Processes ProcessSource // optional: defaults to the agent process manager
+	Cores     func() int    // optional: logical CPU count for load_per_core; defaults to runtime.NumCPU
+	Store     StateStore
+	Client    EventSender
+	Now       func() time.Time
+	Cadence   time.Duration
+	Logf      func(format string, args ...any)
 }
 
 // Manager is the Phase 2 local monitor engine: it ticks on Cadence,
@@ -109,8 +113,36 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Docker != nil {
 		m.evaluators = append(m.evaluators, &DockerEvaluator{Docker: cfg.Docker, Defs: m.defs, Now: m.now})
 	}
+	if cfg.Host == nil {
+		cfg.Host = OSHost{}
+	}
+	if cfg.Sockets == nil {
+		cfg.Sockets = defaultSocketSource()
+	}
+	if cfg.Processes == nil {
+		cfg.Processes = defaultProcessSource()
+	}
 	if cfg.Systemd != nil {
 		m.evaluators = append(m.evaluators, &SystemdEvaluator{Systemd: cfg.Systemd, Defs: m.defs})
+		m.evaluators = append(m.evaluators, &TimerEvaluator{Systemd: cfg.Systemd, Host: cfg.Host, Defs: m.defs})
+	}
+
+	m.evaluators = append(m.evaluators,
+		&CPUEvaluator{Infra: cfg.Infra, Defs: m.defs, Held: m},
+		&LoadEvaluator{Infra: cfg.Infra, Defs: m.defs, Held: m, Cores: cfg.Cores},
+		&DiskFillEvaluator{Infra: cfg.Infra, Defs: m.defs, Held: m, Now: m.now},
+		&CertEvaluator{Host: cfg.Host, Defs: m.defs, Held: m, Now: m.now},
+		&JobFreshnessEvaluator{Host: cfg.Host, Defs: m.defs, Now: m.now},
+		&PortEvaluator{Sockets: cfg.Sockets, Defs: m.defs},
+		&LogSpikeEvaluator{Host: cfg.Host, Defs: m.defs, Held: m, Now: m.now},
+	)
+	if cfg.Processes != nil {
+		m.evaluators = append(m.evaluators, &ProcessEvaluator{Procs: cfg.Processes, Defs: m.defs})
+	}
+	// Without a persistent boot-ID store a reboot cannot be told apart from
+	// an agent restart, so the evaluator is only registered with one.
+	if boot, ok := cfg.Store.(BootStore); ok {
+		m.evaluators = append(m.evaluators, &RebootEvaluator{Host: cfg.Host, Defs: m.defs, Boot: boot})
 	}
 
 	return m, nil
@@ -274,7 +306,7 @@ func (m *Manager) process(ctx context.Context, kind Kind, obs Observation) {
 			Target:         obs.Target,
 			FromState:      string(tr.from),
 			ToState:        string(tr.to),
-			Severity:       def.Severity,
+			Severity:       firstNonEmptyStr(obs.Severity, def.Severity),
 			FirstFailureAt: newRt.FirstFailureAt,
 			OccurredAt:     now,
 			Summary:        obs.Summary,

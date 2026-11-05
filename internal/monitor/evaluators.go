@@ -86,9 +86,11 @@ func (e *DiskEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 			Failing:  failing,
 			Severity: def.Severity,
 			Summary:  fmt.Sprintf("%s %s at %.0f%% (fires >=%.0f%%)", label, target, value, def.FiringThreshold),
-			Attributes: map[string]string{
-				"percent": strconv.FormatFloat(value, 'f', 1, 64),
-			},
+			Attributes: func() map[string]string {
+				a := valueAttrs(value, def.FiringThreshold, "%")
+				a["percent"] = strconv.FormatFloat(value, 'f', 1, 64)
+				return a
+			}(),
 		})
 	}
 	return out, nil
@@ -123,6 +125,13 @@ func (e *MemoryEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		return nil, nil
 	}
 	sample := e.Infra.Sample(ctx)
+	if !sample.Memory.Available {
+		// A failed collector is not a healthy reading (Percent would be 0
+		// and would resolve a firing episode). No observation holds the
+		// current state. Swap is optional: hosts without swap report it
+		// unavailable and it simply contributes 0.
+		return nil, nil
+	}
 	memoryPercent := sample.Memory.Percent
 	swapPercent := sample.Swap.Percent
 	// Memory.Percent is derived from MemAvailable (not free pages), and swap
@@ -130,11 +139,10 @@ func (e *MemoryEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	// hysteresis thresholds; both values remain attached as evidence.
 	value := max(memoryPercent, swapPercent)
 	failing := evalThreshold(value, def.FiringThreshold, def.RecoveryValue, e.Held.WasFailing(KindMemoryPressure, ""))
-	attrs := map[string]string{
-		"percent":        strconv.FormatFloat(value, 'f', 1, 64),
-		"memory_percent": strconv.FormatFloat(memoryPercent, 'f', 1, 64),
-		"swap_percent":   strconv.FormatFloat(swapPercent, 'f', 1, 64),
-	}
+	attrs := valueAttrs(value, def.FiringThreshold, "%")
+	attrs["percent"] = strconv.FormatFloat(value, 'f', 1, 64)
+	attrs["memory_percent"] = strconv.FormatFloat(memoryPercent, 'f', 1, 64)
+	attrs["swap_percent"] = strconv.FormatFloat(swapPercent, 'f', 1, 64)
 	summary := fmt.Sprintf("memory %.0f%%, swap %.0f%% (fires >=%.0f%%)", memoryPercent, swapPercent, def.FiringThreshold)
 	events, err := e.Infra.OOMEvents(ctx, e.now().Add(-oomWindow))
 	if err != nil {
@@ -187,6 +195,7 @@ type DockerEvaluator struct {
 	Now    func() time.Time
 
 	restarts map[string]*restartTrack
+	ran      map[string]bool
 }
 
 func (e *DockerEvaluator) Kind() Kind { return KindDockerContainer }
@@ -206,6 +215,9 @@ func (e *DockerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	if e.restarts == nil {
 		e.restarts = map[string]*restartTrack{}
 	}
+	if e.ran == nil {
+		e.ran = map[string]bool{}
+	}
 	now := e.now()
 	seen := make(map[string]bool, len(summaries))
 	var out []Observation
@@ -216,20 +228,31 @@ func (e *DockerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 			continue
 		}
 		seen[s.ID] = true
-		restartCount := 0
-		if detail, derr := e.Docker.Container(ctx, s.ID); derr == nil {
-			restartCount = detail.RestartCount
+		running := strings.EqualFold(s.State, "running")
+		if running {
+			e.ran[s.ID] = true
 		}
-		crashLoop := e.trackCrashLoop(s.ID, restartCount, now)
-		stopped := !strings.EqualFold(s.State, "running")
+		detail, derr := e.Docker.Container(ctx, s.ID)
+		if derr != nil && !running && !strings.EqualFold(s.State, "restarting") {
+			// Without the exit code a stopped container cannot be told
+			// apart from a clean stop. Emit nothing so the state machine
+			// holds its current state instead of guessing either way.
+			continue
+		}
+		crashLoop := e.trackCrashLoop(s.ID, detail.RestartCount, now)
 		unhealthy := strings.EqualFold(s.Health, "unhealthy")
-		failing := stopped || unhealthy || crashLoop
+		down := containerDown(s.State, detail, e.ran[s.ID])
+		failing := down || unhealthy || crashLoop
 		summary := fmt.Sprintf("%s is %s", target, s.State)
 		switch {
 		case crashLoop:
 			summary = fmt.Sprintf("%s is crash-looping (%d restarts/%s)", target, crashLoopRestarts, crashLoopWindow)
 		case unhealthy:
 			summary = fmt.Sprintf("%s is unhealthy", target)
+		case down && detail.OOMKilled:
+			summary = fmt.Sprintf("%s was OOM-killed (%s)", target, s.State)
+		case down && !running && !strings.EqualFold(s.State, "restarting"):
+			summary = fmt.Sprintf("%s exited with code %d", target, detail.ExitCode)
 		}
 		out = append(out, Observation{
 			Target:   target,
@@ -237,9 +260,11 @@ func (e *DockerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 			Severity: def.Severity,
 			Summary:  summary,
 			Attributes: map[string]string{
-				"state":         s.State,
-				"health":        s.Health,
-				"restart_count": strconv.Itoa(restartCount),
+				"state":          s.State,
+				"health":         s.Health,
+				"restart_count":  strconv.Itoa(detail.RestartCount),
+				"exit_code":      strconv.Itoa(detail.ExitCode),
+				"restart_policy": detail.RestartPolicy,
 			},
 		})
 	}
@@ -248,7 +273,46 @@ func (e *DockerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 			delete(e.restarts, id)
 		}
 	}
+	for id := range e.ran {
+		if !seen[id] {
+			delete(e.ran, id)
+		}
+	}
 	return out, nil
+}
+
+// Exit codes Docker reports for a container stopped by a signal: 143 is
+// SIGTERM (what `docker stop` sends first) and 137 is SIGKILL (what it sends
+// after the grace period). Docker records no "stopped by operator" flag, so
+// a signal exit without OOMKilled is the best available evidence of one.
+const (
+	exitSigterm = 143
+	exitSigkill = 137
+)
+
+// containerDown reports whether a container that is not running should page.
+//
+// It must not page for: a clean exit (code 0), an operator stop (SIGTERM or
+// SIGKILL exit, not OOM), a container that was never created/started, a
+// paused container, or a stale crash from before the agent first saw the
+// container run when its restart policy is "no". It pages for: restarting
+// (Docker is looping it), an OOM kill, and any other non-zero exit that was
+// either observed running first or belongs to a container with a restart
+// policy that should have kept it up.
+func containerDown(state string, d docker.ContainerDetail, ranBefore bool) bool {
+	switch strings.ToLower(state) {
+	case "running", "created", "paused":
+		return false
+	case "restarting":
+		return true
+	}
+	if d.OOMKilled {
+		return true
+	}
+	if d.ExitCode == 0 || d.ExitCode == exitSigterm || d.ExitCode == exitSigkill {
+		return false
+	}
+	return ranBefore || d.RestartPolicy == "always" || d.RestartPolicy == "unless-stopped" || d.RestartPolicy == "on-failure"
 }
 
 // trackCrashLoop records an increase in restartCount (one timestamp per
@@ -308,6 +372,11 @@ func (e *SystemdEvaluator) Evaluate(ctx context.Context) ([]Observation, error) 
 	for _, u := range units {
 		def, enabled := e.Defs.Resolve(KindSystemdUnit, u.Name)
 		if !enabled {
+			continue
+		}
+		if systemd.IgnoredForFailureAlerts(u) {
+			// Oneshot jobs and transient run-*/scope units end in "failed"
+			// as a normal outcome of a single command, not an outage.
 			continue
 		}
 		failing := strings.EqualFold(u.ActiveState, "failed")

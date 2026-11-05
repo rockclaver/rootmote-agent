@@ -28,7 +28,7 @@ func KnownKinds() []KindInfo {
 	return []KindInfo{
 		{Key: string(KindAlertFired), Label: "Infrastructure alert fired", DefaultPush: true},
 		{Key: string(KindAlertCleared), Label: "Infrastructure alert recovered", DefaultPush: false},
-		{Key: string(KindRunbook), Label: "AI runbook proposed", DefaultPush: true},
+		{Key: string(KindRunbook), Label: "AI runbook proposed", DefaultPush: false},
 	}
 }
 
@@ -38,7 +38,7 @@ func KnownKinds() []KindInfo {
 var defaultPush = map[Kind]bool{
 	KindAlertFired:   true,
 	KindAlertCleared: false,
-	KindRunbook:      true,
+	KindRunbook:      false,
 }
 
 // classify maps a notification to its pref key.

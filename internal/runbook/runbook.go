@@ -461,7 +461,13 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) (Runbook
 			params = map[string]any{}
 		}
 		steps[i] = Step{Kind: step.Kind, Params: params, Description: step.Description}
-		if _, _, command, _, err := tokenBindingForKind(step.Kind, params); err == nil {
+		if isRunScriptStep(step) {
+			// Advice only: show the proposed script text verbatim so the
+			// operator can review and run it themselves. It is never bound
+			// to a confirmation token and never executed by the agent.
+			script, _ := params["script"].(string)
+			steps[i].Command = strings.TrimSpace(script)
+		} else if _, _, command, _, err := tokenBindingForKind(step.Kind, params); err == nil {
 			steps[i].Command = command
 		}
 	}
@@ -716,11 +722,9 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 			return "", "", "", nil, errors.New("security fix step missing kind")
 		}
 		if fixKind == "run_script" {
-			script, _ := params["script"].(string)
-			if strings.TrimSpace(script) == "" {
-				return "", "", "", nil, errors.New("security fix step missing script")
-			}
-			return "security.fix.run_script", "security", script, []string{script}, nil
+			// Raw AI-authored shell is advice for the operator to run
+			// themselves; it has no token binding and can never execute.
+			return "", "", "", nil, errors.New("security fix run_script is advisory only and cannot be executed")
 		}
 		command, err := securityFixCommand(fixKind, params)
 		if err != nil {

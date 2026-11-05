@@ -794,8 +794,9 @@ func TestDefaultRemoverNeedsEscalation(t *testing.T) {
 }
 
 // AC: when a real, unprivileged os.Remove hits a genuine permission error,
-// defaultRemover.Remove escalates by shelling to
-// `sudo -n nsenter --mount=/proc/1/ns/mnt -- rm -f <path>` — the technique
+// defaultRemover.Remove escalates by running the agent's own validating
+// `storage-rm` helper via
+// `sudo -n nsenter --mount=/proc/1/ns/mnt -- <agent> storage-rm -f <path>` — the technique
 // that reaches past rootmote-agent.service's ProtectSystem=strict mount
 // namespace even for a sudo-escalated root child. Skips if the test
 // process itself is root, since root can't produce a real EACCES to prove
@@ -830,7 +831,7 @@ func TestDefaultRemover_EscalatesOnRealPermissionError(t *testing.T) {
 	if gotName != "sudo" {
 		t.Fatalf("escalated command = %q, want sudo", gotName)
 	}
-	want := []string{"-n", "/usr/bin/nsenter", "--mount=/proc/1/ns/mnt", "--", "/bin/rm", "-f", path}
+	want := []string{"-n", "/usr/bin/nsenter", "--mount=/proc/1/ns/mnt", "--", "/usr/local/bin/rootmote-agent", "storage-rm", "-f", path}
 	if !reflect.DeepEqual(gotArgs, want) {
 		t.Fatalf("escalated args = %v, want %v", gotArgs, want)
 	}

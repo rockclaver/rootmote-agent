@@ -186,7 +186,7 @@ func (r defaultRemover) Remove(ctx context.Context, path string) error {
 	if err == nil || !r.needsEscalation(err) {
 		return err
 	}
-	if _, escErr := r.escalate(ctx, "rm", "-f", path); escErr != nil {
+	if escErr := r.escalateRemove(ctx, "-f", path); escErr != nil {
 		return fmt.Errorf("storage: privileged delete of %q: %w", path, escErr)
 	}
 	return nil
@@ -197,7 +197,7 @@ func (r defaultRemover) RemoveAll(ctx context.Context, path string) error {
 	if err == nil || !r.needsEscalation(err) {
 		return err
 	}
-	if _, escErr := r.escalate(ctx, "rm", "-rf", path); escErr != nil {
+	if escErr := r.escalateRemove(ctx, "-rf", path); escErr != nil {
 		return fmt.Errorf("storage: privileged delete of %q: %w", path, escErr)
 	}
 	return nil
@@ -223,6 +223,23 @@ func (r defaultRemover) needsEscalation(err error) bool {
 		return false
 	}
 	return errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS)
+}
+
+// escalateRemove deletes path as root by running the agent binary's own
+// validating `storage-rm` helper (fixed argv, fixed binary path) in PID 1's
+// mount namespace; the sudoers fragment never grants a generic rm.
+func (r defaultRemover) escalateRemove(ctx context.Context, flag, path string) error {
+	_ = ctx
+	nsenterPath, err := r.lookPath("nsenter")
+	if err != nil {
+		nsenterPath = "/usr/bin/nsenter"
+	}
+	sudoArgs := []string{"-n", nsenterPath, "--mount=/proc/1/ns/mnt", "--", PrivilegedHelperPath, PrivilegedRemoveSubcommand, flag, path}
+	out, err := r.execCommand("sudo", sudoArgs...).CombinedOutput()
+	if err != nil {
+		return wrapCmdErr("storage-rm", out, err)
+	}
+	return nil
 }
 
 // escalate runs name with args as root inside PID 1's real mount

@@ -755,7 +755,9 @@ func DefaultInfraAlertRule(serverID, kind string) InfraAlertRule {
 	case "disk_usage":
 		r.Threshold = 90
 	case "load_sustained":
-		r.Threshold = 4
+		// 5-minute load average per CPU core; 2 means twice the work the
+		// CPUs can run, held for several minutes.
+		r.Threshold = 2
 	case "unit_failed":
 		r.Threshold = 0
 	}

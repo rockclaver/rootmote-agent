@@ -268,3 +268,28 @@ func TestLaunchctlClientActionsUseGuiDomain(t *testing.T) {
 		t.Fatal("disable should be unsupported on macOS")
 	}
 }
+
+func TestIgnoredForFailureAlerts(t *testing.T) {
+	for _, tt := range []struct {
+		u    Unit
+		want bool
+	}{
+		{Unit{Name: "backup.service", Type: "oneshot"}, true},
+		{Unit{Name: "run-u123.service"}, true},
+		{Unit{Name: "session-1.scope"}, true},
+		{Unit{Name: "nginx.service", Type: "simple"}, false},
+		{Unit{Name: "systemd-journald.service", Type: "notify"}, false},
+		{Unit{Name: "legacy.service"}, false},
+	} {
+		if got := IgnoredForFailureAlerts(tt.u); got != tt.want {
+			t.Errorf("IgnoredForFailureAlerts(%+v) = %v, want %v", tt.u, got, tt.want)
+		}
+	}
+}
+
+func TestParseUnitTypes(t *testing.T) {
+	got := parseUnitTypes("Id=a.service\nType=oneshot\n\nId=b.service\nType=simple\n")
+	if got["a.service"] != "oneshot" || got["b.service"] != "simple" || len(got) != 2 {
+		t.Fatalf("parseUnitTypes = %v", got)
+	}
+}

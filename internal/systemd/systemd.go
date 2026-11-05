@@ -71,6 +71,9 @@ type Unit struct {
 	LoadState   string `json:"load_state,omitempty"`
 	ActiveState string `json:"active_state,omitempty"`
 	SubState    string `json:"sub_state,omitempty"`
+	// Type is the service Type= ("simple", "forking", "oneshot", ...), or ""
+	// when the client could not determine it.
+	Type string `json:"type,omitempty"`
 	// EnabledOnBoot reflects systemd's UnitFileState: "enabled",
 	// "disabled", "static", "masked", or "" when unknown.
 	EnabledOnBoot string `json:"enabled_on_boot,omitempty"`
@@ -124,14 +127,14 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("systemd: Client is required")
 	}
 	protected := map[string]string{
-		"sshd.service":                "SSH daemon is the transport into the agent",
-		"ssh.service":                 "SSH daemon is the transport into the agent",
-		"com.openssh.sshd":            "SSH daemon is the transport into the agent",
+		"sshd.service":                  "SSH daemon is the transport into the agent",
+		"ssh.service":                   "SSH daemon is the transport into the agent",
+		"com.openssh.sshd":              "SSH daemon is the transport into the agent",
 		"rootmote-agent.service":        "Rootmote agent supervises itself; refuse self-shutdown",
 		"com.rockclaver.rootmote-agent": "Rootmote agent supervises itself; refuse self-shutdown",
-		"caddy.service":               "Caddy terminates TLS for preview tunnels",
-		"homebrew.mxcl.caddy":         "Caddy terminates TLS for preview tunnels",
-		"init.scope":                  "pid-1/init must never be stopped",
+		"caddy.service":                 "Caddy terminates TLS for preview tunnels",
+		"homebrew.mxcl.caddy":           "Caddy terminates TLS for preview tunnels",
+		"init.scope":                    "pid-1/init must never be stopped",
 	}
 	for _, name := range cfg.ExtraProtected {
 		name = strings.TrimSpace(name)
@@ -253,4 +256,18 @@ func classify(err error) string {
 		}
 		return ReasonUnknown
 	}
+}
+
+// IgnoredForFailureAlerts reports whether a failed state on u should never
+// page: Type=oneshot services (run-to-completion jobs such as backups, fsck
+// or migrations legitimately end in "failed" once and are not outages) and
+// transient units created by systemd-run/login sessions (run-*.service,
+// *.scope), which exist only for one command and are never restarted.
+// Long-running services are never ignored.
+func IgnoredForFailureAlerts(u Unit) bool {
+	if strings.EqualFold(u.Type, "oneshot") {
+		return true
+	}
+	name := strings.ToLower(u.Name)
+	return strings.HasSuffix(name, ".scope") || strings.HasPrefix(name, "run-")
 }

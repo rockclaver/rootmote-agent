@@ -107,6 +107,21 @@ sudo systemctl daemon-reload
 sudo systemctl restart rootmote-agent
 ```
 
+## Privilege model
+
+The agent runs as the unprivileged `rootmote` user. `systemd/rootmote-agent-firewall.sudoers`
+grants passwordless root only for fixed commands (firewall, reboot, webserver
+config tests, kill, auditd install, journal vacuum to `200M`) and for one helper:
+`rootmote-agent storage-rm <-f|-rf> <path>`, used by storage cleanup. The helper
+re-validates its input as root (absolute path, no `..`, never a system directory
+or an ancestor of one) and deletes with Go's `os` package, so there is no
+`rm` or shell grant.
+
+The agent never executes AI-authored raw shell. A `security.fix` runbook step with
+`params.kind = "run_script"` is advice only: the runbook is classified L3 and
+blocked, the script text is shown to the operator, and the operator runs it
+themselves in a maintenance session.
+
 ## Test
 
 ```sh

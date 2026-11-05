@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,11 @@ const (
 	RuleDiskUsage     = "disk_usage"
 	RuleLoadSustained = "load_sustained"
 	RuleUnitFailed    = "unit_failed"
+
+	// loadRecoveryRatio places the load_sustained clear level at 75% of its
+	// per-core threshold, so load hovering around the threshold stays inside
+	// one episode instead of alternating fire/clear.
+	loadRecoveryRatio = 0.75
 )
 
 type MetricsSampler interface {
@@ -33,21 +39,37 @@ type UnitLister interface {
 }
 
 type Config struct {
-	Store               *store.Store
-	Metrics             MetricsSampler
-	Systemd             UnitLister
-	Sink                notifications.Sink
-	Now                 func() time.Time
-	Cadence             time.Duration
-	DiskHysteresis      float64
-	LoadHysteresis      float64
-	LoadConsecutiveHits int
+	Store          *store.Store
+	Metrics        MetricsSampler
+	Systemd        UnitLister
+	Sink           notifications.Sink
+	Now            func() time.Time
+	Cadence        time.Duration
+	DiskHysteresis float64
+	// CPUCount normalizes load_sustained to load per core. Defaults to
+	// runtime.NumCPU().
+	CPUCount int
+	// LoadFiringFor is how long the 5-minute load per core must stay at or
+	// above the rule threshold before load_sustained fires. Default 5m.
+	LoadFiringFor time.Duration
+	// LoadRecoveryFor is how long it must then stay at or below
+	// loadRecoveryRatio of the threshold before the alert clears. Default
+	// 10m: a busy box dipping briefly under the threshold keeps one episode.
+	LoadRecoveryFor time.Duration
 	// UnitConsecutiveHits is the number of consecutive evaluation cycles a
 	// systemd unit must be observed failed (or observed healthy again)
 	// before its unit_failed alert fires or clears. Without this a unit
 	// that flaps faster than Cadence (e.g. a crash-looping service caught
 	// mid-restart on alternating polls) pages on every single cycle.
 	UnitConsecutiveHits int
+	// RenotifyAfter is the quiet window after an alert clears. If the same
+	// alert fires again inside it, the previous episode reopens without a
+	// new notification. Default 1h.
+	RenotifyAfter time.Duration
+	// MonitorOwns reports whether the Watchtower monitor engine already
+	// pages for a rule's condition (see ownership.go). Nil means the legacy
+	// manager owns every rule.
+	MonitorOwns func(rule string) bool
 }
 
 type Manager struct {
@@ -59,22 +81,29 @@ type Manager struct {
 
 	cadence             time.Duration
 	diskHysteresis      float64
-	loadHysteresis      float64
-	loadConsecutiveHits int
+	cpuCount            int
+	loadFiringHits      int
+	loadRecoveryHits    int
 	unitConsecutiveHits int
+	renotifyAfter       time.Duration
+	monitorOwned        func(rule string) bool
 
 	mu     sync.Mutex
 	active map[string]alertState
 }
 
 type alertState struct {
-	active   bool
+	active bool
+	// hits counts consecutive samples pointing at the opposite state
+	// (failing while clear, healthy while firing).
 	hits     int
 	firedAt  time.Time
 	ruleKind string
 	target   string
 	body     string
 	severity string
+	// clearedAt is when the last episode cleared; zero if it never has.
+	clearedAt time.Time
 }
 
 // ActiveAlert is a snapshot of one currently-fired alert, suitable for
@@ -162,14 +191,20 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.DiskHysteresis <= 0 {
 		cfg.DiskHysteresis = 5
 	}
-	if cfg.LoadHysteresis <= 0 {
-		cfg.LoadHysteresis = 0.5
+	if cfg.CPUCount <= 0 {
+		cfg.CPUCount = runtime.NumCPU()
 	}
-	if cfg.LoadConsecutiveHits <= 0 {
-		cfg.LoadConsecutiveHits = 2
+	if cfg.LoadFiringFor <= 0 {
+		cfg.LoadFiringFor = 5 * time.Minute
+	}
+	if cfg.LoadRecoveryFor <= 0 {
+		cfg.LoadRecoveryFor = 10 * time.Minute
 	}
 	if cfg.UnitConsecutiveHits <= 0 {
 		cfg.UnitConsecutiveHits = 2
+	}
+	if cfg.RenotifyAfter <= 0 {
+		cfg.RenotifyAfter = time.Hour
 	}
 	return &Manager{
 		store:               cfg.Store,
@@ -179,11 +214,19 @@ func New(cfg Config) (*Manager, error) {
 		now:                 cfg.Now,
 		cadence:             cfg.Cadence,
 		diskHysteresis:      cfg.DiskHysteresis,
-		loadHysteresis:      cfg.LoadHysteresis,
-		loadConsecutiveHits: cfg.LoadConsecutiveHits,
+		cpuCount:            max(cfg.CPUCount, 1),
+		loadFiringHits:      samplesFor(cfg.LoadFiringFor, cfg.Cadence),
+		loadRecoveryHits:    samplesFor(cfg.LoadRecoveryFor, cfg.Cadence),
 		unitConsecutiveHits: cfg.UnitConsecutiveHits,
+		renotifyAfter:       cfg.RenotifyAfter,
+		monitorOwned:        cfg.MonitorOwns,
 		active:              make(map[string]alertState),
 	}, nil
+}
+
+// samplesFor converts a hold duration into consecutive evaluation cycles.
+func samplesFor(d, cadence time.Duration) int {
+	return max(int((d+cadence-1)/cadence), 1)
 }
 
 func (m *Manager) Config(ctx context.Context, serverID string) ([]store.InfraAlertRule, error) {
@@ -252,41 +295,34 @@ func (m *Manager) evalDisk(ctx context.Context, rule store.InfraAlertRule, sampl
 		if !d.Available {
 			continue
 		}
-		key := RuleDiskUsage + ":" + d.Mountpoint
-		if d.Percent >= rule.Threshold {
-			m.enter(ctx, key, rule, d.Mountpoint, floatPtr(d.Percent), fmt.Sprintf("Disk %s usage %.1f%%", d.Mountpoint, d.Percent))
-			continue
-		}
-		if d.Percent <= rule.Threshold-m.diskHysteresis {
-			m.clear(ctx, key, rule, d.Mountpoint, floatPtr(d.Percent), fmt.Sprintf("Disk %s recovered to %.1f%%", d.Mountpoint, d.Percent))
-		}
+		m.track(ctx, RuleDiskUsage+":"+d.Mountpoint, rule, d.Mountpoint, floatPtr(d.Percent),
+			d.Percent >= rule.Threshold, d.Percent <= rule.Threshold-m.diskHysteresis, 1, 1,
+			fmt.Sprintf("Disk %s usage %.1f%%", d.Mountpoint, d.Percent),
+			fmt.Sprintf("Disk %s recovered to %.1f%%", d.Mountpoint, d.Percent))
 	}
 }
 
+// evalLoad alerts on the 5-minute load average per CPU core. The 1-minute
+// figure jumps on every cron job, deploy, or backup, and an absolute
+// threshold means something different on a 1-core VPS and a 32-core host.
+// rule.Threshold is therefore load per core.
 func (m *Manager) evalLoad(ctx context.Context, rule store.InfraAlertRule, sample infra.HostMetrics) {
 	key := RuleLoadSustained + ":host"
-	if !rule.Enabled || !sample.Load.Available {
+	if !rule.Enabled {
 		m.clearStatePrefix(key)
 		return
 	}
-	st := m.state(key)
-	if sample.Load.One >= rule.Threshold {
-		st.hits++
-		m.setState(key, st)
-		if st.hits >= m.loadConsecutiveHits {
-			m.enter(ctx, key, rule, "host", floatPtr(sample.Load.One), fmt.Sprintf("Sustained load %.2f", sample.Load.One))
-		}
+	if !sample.Load.Available {
+		// A missed sample says nothing about recovery: hold the current
+		// state rather than dropping a firing episode and re-paging later.
 		return
 	}
-	if st.active && sample.Load.One <= rule.Threshold-m.loadHysteresis {
-		m.clear(ctx, key, rule, "host", floatPtr(sample.Load.One), fmt.Sprintf("Load recovered to %.2f", sample.Load.One))
-		m.setState(key, alertState{})
-		return
-	}
-	if !st.active && st.hits != 0 {
-		st.hits = 0
-		m.setState(key, st)
-	}
+	perCore := sample.Load.Five / float64(m.cpuCount)
+	m.track(ctx, key, rule, "host", floatPtr(perCore),
+		perCore >= rule.Threshold, perCore <= rule.Threshold*loadRecoveryRatio,
+		m.loadFiringHits, m.loadRecoveryHits,
+		fmt.Sprintf("Sustained load %.2f on %d CPUs (%.2f per core)", sample.Load.Five, m.cpuCount, perCore),
+		fmt.Sprintf("Load recovered to %.2f on %d CPUs (%.2f per core)", sample.Load.Five, m.cpuCount, perCore))
 }
 
 func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
@@ -307,6 +343,9 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 	}
 	failed := map[string]bool{}
 	for _, u := range units {
+		if systemd.IgnoredForFailureAlerts(u) {
+			continue
+		}
 		if strings.EqualFold(u.ActiveState, "failed") || strings.EqualFold(u.SubState, "failed") {
 			failed[u.Name] = true
 		}
@@ -341,10 +380,22 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 // crash-looping service caught mid-restart on alternating polls) resets the
 // counter instead of paging on every single cycle.
 func (m *Manager) trackUnit(ctx context.Context, rule store.InfraAlertRule, key, unit string, isFailed bool) {
+	m.track(ctx, key, rule, unit, nil, isFailed, !isFailed, m.unitConsecutiveHits, m.unitConsecutiveHits,
+		fmt.Sprintf("%s entered failed state", unit), fmt.Sprintf("%s recovered", unit))
+}
+
+// track debounces one alert key. failing and healthy are never both true;
+// when neither holds (the value sits inside the hysteresis band) any
+// pending transition is cancelled and the current state stands. The alert
+// fires after fireHits consecutive failing samples and clears after
+// clearHits consecutive healthy ones.
+func (m *Manager) track(ctx context.Context, key string, rule store.InfraAlertRule, target string, value *float64, failing, healthy bool, fireHits, clearHits int, enterBody, clearBody string) {
 	st := m.state(key)
-	if st.active == isFailed {
-		// Already in the target state (still firing and still failed, or
-		// already clear and still healthy): cancel any opposing debounce.
+	toward, need := failing, fireHits
+	if st.active {
+		toward, need = healthy, clearHits
+	}
+	if !toward {
 		if st.hits != 0 {
 			st.hits = 0
 			m.setState(key, st)
@@ -352,31 +403,41 @@ func (m *Manager) trackUnit(ctx context.Context, rule store.InfraAlertRule, key,
 		return
 	}
 	st.hits++
-	if st.hits < m.unitConsecutiveHits {
-		m.setState(key, st)
+	m.setState(key, st)
+	if st.hits < need {
 		return
 	}
-	st.hits = 0
-	m.setState(key, st)
-	if isFailed {
-		m.enter(ctx, key, rule, unit, nil, fmt.Sprintf("%s entered failed state", unit))
+	if st.active {
+		m.clear(ctx, key, rule, target, value, clearBody)
 	} else {
-		m.clear(ctx, key, rule, unit, nil, fmt.Sprintf("%s recovered", unit))
+		m.enter(ctx, key, rule, target, value, enterBody)
 	}
 }
 
+// enter starts a firing episode. If the same alert cleared less than
+// renotifyAfter ago, it reopens that episode instead: it is back in the
+// inbox under its original firedAt (so an earlier ack still applies), but
+// no notification is sent for the repeat.
 func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRule, target string, value *float64, body string) {
 	st := m.state(key)
 	if st.active {
 		return
 	}
+	now := m.now()
+	reopen := !st.clearedAt.IsZero() && now.Sub(st.clearedAt) < m.renotifyAfter
 	st.active = true
-	st.firedAt = m.now()
+	st.hits = 0
+	if !reopen {
+		st.firedAt = now
+	}
 	st.ruleKind = rule.Kind
 	st.target = target
 	st.body = body
 	st.severity = "warning"
 	m.setState(key, st)
+	if reopen {
+		return
+	}
 	m.publish(ctx, rule, target, value, false, body, st.firedAt)
 }
 
@@ -385,14 +446,17 @@ func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRu
 	if !st.active {
 		return
 	}
-	firedAt := st.firedAt
 	st.active = false
 	st.hits = 0
+	st.clearedAt = m.now()
 	m.setState(key, st)
-	m.publish(ctx, rule, target, value, true, body, firedAt)
+	m.publish(ctx, rule, target, value, true, body, st.firedAt)
 }
 
 func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target string, value *float64, clear bool, body string, firedAt time.Time) {
+	if m.monitorOwns(rule.Kind) {
+		return
+	}
 	if m.sink == nil {
 		return
 	}

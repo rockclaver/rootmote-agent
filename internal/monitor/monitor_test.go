@@ -75,14 +75,18 @@ func (f *fakeInfra) OOMEvents(context.Context, time.Time) ([]infra.OOMEvent, err
 }
 
 type fakeDocker struct {
-	summaries []docker.ContainerSummary
-	details   map[string]docker.ContainerDetail
+	summaries  []docker.ContainerSummary
+	details    map[string]docker.ContainerDetail
+	failDetail bool
 }
 
 func (f *fakeDocker) Containers(context.Context) ([]docker.ContainerSummary, error) {
 	return f.summaries, nil
 }
 func (f *fakeDocker) Container(_ context.Context, id string) (docker.ContainerDetail, error) {
+	if f.failDetail {
+		return docker.ContainerDetail{}, errors.New("inspect failed")
+	}
 	return f.details[id], nil
 }
 
@@ -95,20 +99,22 @@ func (f *fakeSystemd) List(context.Context) ([]systemd.Unit, error) { return f.u
 
 // harness builds a Manager driven by a mutable clock.
 type harness struct {
-	m      *Manager
-	sender *fakeSender
-	infra  *fakeInfra
-	docker *fakeDocker
-	now    time.Time
+	m       *Manager
+	sender  *fakeSender
+	infra   *fakeInfra
+	docker  *fakeDocker
+	systemd *fakeSystemd
+	now     time.Time
 }
 
 func newHarness(t *testing.T, withDocker, withSystemd bool) *harness {
 	t.Helper()
 	h := &harness{
-		sender: &fakeSender{},
-		infra:  &fakeInfra{},
-		docker: &fakeDocker{details: map[string]docker.ContainerDetail{}},
-		now:    time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC),
+		sender:  &fakeSender{},
+		infra:   &fakeInfra{},
+		docker:  &fakeDocker{details: map[string]docker.ContainerDetail{}},
+		systemd: &fakeSystemd{},
+		now:     time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC),
 	}
 	cfg := Config{
 		Infra:  h.infra,
@@ -121,7 +127,7 @@ func newHarness(t *testing.T, withDocker, withSystemd bool) *harness {
 		cfg.Docker = h.docker
 	}
 	if withSystemd {
-		cfg.Systemd = &fakeSystemd{}
+		cfg.Systemd = h.systemd
 	}
 	m, err := New(cfg)
 	if err != nil {
@@ -139,7 +145,7 @@ func (h *harness) tick() {
 func diskSample(percent float64) infra.HostMetrics {
 	return infra.HostMetrics{
 		Disks:  []infra.DiskMetric{{Mountpoint: "/", Available: true, Percent: percent}},
-		Memory: infra.MemoryMetric{Percent: 10},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 10},
 	}
 }
 
@@ -319,9 +325,12 @@ func TestStateMachine_FirstFailureSurvivesManagerRestart(t *testing.T) {
 
 // --- AC3: docker stopped + crash-loop ------------------------------------
 
-func TestDockerMonitor_StoppedContainerFiresOnce(t *testing.T) {
+func TestDockerMonitor_CrashedContainerFiresOnce(t *testing.T) {
 	h := newHarness(t, true, false)
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "running"}}
+	h.tick() // observed running
 	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "exited"}}
+	h.docker.details["c1"] = docker.ContainerDetail{ID: "c1", ExitCode: 1, RestartPolicy: "no"}
 	// failure_threshold for docker default is 2.
 	h.tick() // pending
 	h.tick() // firing -> one event
@@ -330,7 +339,150 @@ func TestDockerMonitor_StoppedContainerFiresOnce(t *testing.T) {
 		h.tick()
 	}
 	if got := h.sender.countTo("firing"); got != 1 {
-		t.Fatalf("firing events for stopped container = %d, want exactly 1", got)
+		t.Fatalf("firing events for crashed container = %d, want exactly 1", got)
+	}
+	if !strings.Contains(h.sender.events[0].Summary, "exited with code 1") {
+		t.Fatalf("summary = %q, want exit code", h.sender.events[0].Summary)
+	}
+}
+
+func TestDockerMonitor_ContainerDownDecision(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     string
+		detail    docker.ContainerDetail
+		ranBefore bool
+		want      bool
+	}{
+		{"clean exit never pages", "exited", docker.ContainerDetail{ExitCode: 0, RestartPolicy: "no"}, true, false},
+		{"clean exit with on-failure", "exited", docker.ContainerDetail{ExitCode: 0, RestartPolicy: "on-failure"}, true, false},
+		{"docker stop (SIGTERM) is operator action", "exited", docker.ContainerDetail{ExitCode: 143, RestartPolicy: "unless-stopped"}, true, false},
+		{"docker stop after grace (SIGKILL) is operator action", "exited", docker.ContainerDetail{ExitCode: 137, RestartPolicy: "no"}, true, false},
+		{"SIGKILL with OOMKilled is a crash", "exited", docker.ContainerDetail{ExitCode: 137, OOMKilled: true}, false, true},
+		{"was running then non-zero exit", "exited", docker.ContainerDetail{ExitCode: 2, RestartPolicy: "no"}, true, true},
+		{"old non-zero exit never seen running, policy no", "exited", docker.ContainerDetail{ExitCode: 2, RestartPolicy: "no"}, false, false},
+		{"non-zero exit under unless-stopped", "exited", docker.ContainerDetail{ExitCode: 2, RestartPolicy: "unless-stopped"}, false, true},
+		{"non-zero exit under always", "dead", docker.ContainerDetail{ExitCode: 2, RestartPolicy: "always"}, false, true},
+		{"restart loop in progress", "restarting", docker.ContainerDetail{RestartPolicy: "always"}, false, true},
+		{"created never started", "created", docker.ContainerDetail{}, false, false},
+		{"paused is operator action", "paused", docker.ContainerDetail{}, true, false},
+		{"running", "running", docker.ContainerDetail{}, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containerDown(tt.state, tt.detail, tt.ranBefore); got != tt.want {
+				t.Fatalf("containerDown(%s, %+v, ran=%v) = %v, want %v", tt.state, tt.detail, tt.ranBefore, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDockerMonitor_CleanExitAndOperatorStopNeverPage(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.docker.summaries = []docker.ContainerSummary{
+		{ID: "job", Name: "migrate", State: "running"},
+		{ID: "web", Name: "web", State: "running"},
+	}
+	h.tick()
+	h.docker.summaries = []docker.ContainerSummary{
+		{ID: "job", Name: "migrate", State: "exited"},
+		{ID: "web", Name: "web", State: "exited"},
+	}
+	h.docker.details["job"] = docker.ContainerDetail{ID: "job", ExitCode: 0, RestartPolicy: "no"}
+	h.docker.details["web"] = docker.ContainerDetail{ID: "web", ExitCode: 143, RestartPolicy: "unless-stopped"}
+	for range 6 {
+		h.tick()
+	}
+	if len(h.sender.events) != 0 {
+		t.Fatalf("clean exit / operator stop produced events: %+v", h.sender.events)
+	}
+}
+
+func TestDockerMonitor_DetailFailureHoldsState(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "running"}}
+	h.tick()
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "exited"}}
+	h.docker.details["c1"] = docker.ContainerDetail{ID: "c1", ExitCode: 1}
+	h.tick()
+	h.tick() // firing
+	h.docker.failDetail = true
+	for range 6 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved events while docker inspect failing = %d, want 0 (hold state)", got)
+	}
+}
+
+// --- systemd: oneshot / transient units never page -----------------------
+
+func TestSystemdMonitor_OneshotAndTransientUnitsDoNotPage(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.systemd.units = []systemd.Unit{
+		{Name: "backup.service", ActiveState: "failed", Type: "oneshot"},
+		{Name: "run-r1a2b3.service", ActiveState: "failed"},
+		{Name: "session-4.scope", ActiveState: "failed"},
+	}
+	for range 6 {
+		h.tick()
+	}
+	if len(h.sender.events) != 0 {
+		t.Fatalf("oneshot/transient units produced events: %+v", h.sender.events)
+	}
+}
+
+func TestSystemdMonitor_LongRunningServicePages(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.systemd.units = []systemd.Unit{{Name: "nginx.service", ActiveState: "failed", Type: "simple"}}
+	for range 3 {
+		h.tick()
+	}
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing events for failed long-running service = %d, want 1", got)
+	}
+}
+
+// --- collector failure must hold state, never look healthy ---------------
+
+func TestMemoryMonitor_CollectorFailureHoldsState(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.infra.metrics = infra.HostMetrics{Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 97}}
+	h.tick()
+	h.tick()
+	h.tick() // firing
+	h.infra.metrics = infra.HostMetrics{Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: false}}}
+	for range 6 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved events while memory collector failing = %d, want 0", got)
+	}
+}
+
+func TestDiskMonitor_CollectorFailureHoldsState(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.infra.metrics = diskSample(95)
+	h.tick()
+	h.tick()
+	h.tick() // firing
+	h.infra.metrics = infra.HostMetrics{
+		Disks:  []infra.DiskMetric{{Mountpoint: "/", Available: false}},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 10},
+	}
+	for range 6 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved events while disk collector failing = %d, want 0", got)
+	}
+}
+
+func TestOwnsAlertRule(t *testing.T) {
+	for rule, want := range map[string]bool{"disk_usage": true, "unit_failed": true, "load_sustained": true, "bogus": false} {
+		if got := OwnsAlertRule(rule); got != want {
+			t.Fatalf("OwnsAlertRule(%q) = %v, want %v", rule, got, want)
+		}
 	}
 }
 
@@ -368,7 +520,7 @@ func TestMemoryMonitor_OOMAttribution(t *testing.T) {
 	h := newHarness(t, false, false)
 	// Memory percent below threshold, but an OOM kill forces failing and
 	// names the affected process.
-	h.infra.metrics = infra.HostMetrics{Memory: infra.MemoryMetric{Percent: 40}}
+	h.infra.metrics = infra.HostMetrics{Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 40}}
 	h.infra.oom = []infra.OOMEvent{{
 		At: h.now, PID: 1234, Process: "postgres", ContainerID: "0123456789ab",
 	}}
@@ -398,7 +550,7 @@ func TestMemoryMonitor_OOMAttribution(t *testing.T) {
 func TestMemoryMonitor_HighSwapPressureFires(t *testing.T) {
 	h := newHarness(t, false, false)
 	h.infra.metrics = infra.HostMetrics{
-		Memory: infra.MemoryMetric{Percent: 40},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 40},
 		Swap:   infra.MemoryMetric{Percent: 95},
 	}
 	h.tick()

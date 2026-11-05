@@ -50,6 +50,17 @@ const (
 	KindMemoryPressure  Kind = "memory_pressure"
 	KindDockerContainer Kind = "docker_container"
 	KindSystemdUnit     Kind = "systemd_unit"
+
+	KindCPUPressure        Kind = "cpu_pressure"
+	KindLoadPerCore        Kind = "load_per_core"
+	KindDiskFillRate       Kind = "disk_fill_rate"
+	KindCertExpiry         Kind = "cert_expiry"
+	KindSystemdTimerFailed Kind = "systemd_timer_failed"
+	KindJobFreshness       Kind = "job_freshness"
+	KindPortListening      Kind = "port_listening"
+	KindProcessRunning     Kind = "process_running"
+	KindRebootDetected     Kind = "reboot_detected"
+	KindLogErrorSpike      Kind = "log_error_spike"
 )
 
 // wildcardTarget marks a built-in default that applies to every instance of
@@ -123,6 +134,31 @@ func DefaultDefinitions() []Definition {
 		{
 			Kind: KindSystemdUnit, Target: wildcardTarget, Enabled: true, Severity: "critical", EvaluationLocation: "agent",
 			FailureThreshold: 2, RecoveryThreshold: 3, CooldownSeconds: 300,
+		},
+		// Sustained-condition monitors. Thresholds count 30s ticks: 10 ticks
+		// is ~5 minutes of continuous breach before anything pages.
+		{
+			Kind: KindCPUPressure, Target: "", Enabled: true, Severity: "warning", EvaluationLocation: "agent",
+			FailureThreshold: 10, RecoveryThreshold: 6, CooldownSeconds: 600, FiringThreshold: 95, RecoveryValue: 80,
+		},
+		{
+			Kind: KindLoadPerCore, Target: "", Enabled: true, Severity: "warning", EvaluationLocation: "agent",
+			FailureThreshold: 10, RecoveryThreshold: 6, CooldownSeconds: 600, FiringThreshold: 2, RecoveryValue: 1.5,
+		},
+		// FiringThreshold/RecoveryValue are hours until the disk is full.
+		{
+			Kind: KindDiskFillRate, Target: "/", Enabled: true, Severity: "warning", EvaluationLocation: "agent",
+			FailureThreshold: 3, RecoveryThreshold: 3, CooldownSeconds: 1800, FiringThreshold: 24, RecoveryValue: 36,
+		},
+		{
+			Kind: KindSystemdTimerFailed, Target: wildcardTarget, Enabled: true, Severity: "warning", EvaluationLocation: "agent",
+			FailureThreshold: 2, RecoveryThreshold: 2, CooldownSeconds: 300,
+		},
+		// One event per reboot: fires on the first tick after the boot ID
+		// changes and resolves on the next.
+		{
+			Kind: KindRebootDetected, Target: "", Enabled: true, Severity: "warning", EvaluationLocation: "agent",
+			FailureThreshold: 1, RecoveryThreshold: 1, CooldownSeconds: 300,
 		},
 	}
 }

@@ -84,7 +84,53 @@ func (c *SystemctlClient) List(ctx context.Context) ([]Unit, error) {
 			}
 		}
 	}
+	types, err := c.unitTypes(cctx)
+	if err == nil {
+		for i := range units {
+			units[i].Type = types[units[i].Name]
+		}
+	}
 	return units, nil
+}
+
+// unitTypes returns Type= per service unit via one `systemctl show` call.
+// Failure is non-fatal for callers: an unknown Type is simply not oneshot.
+func (c *SystemctlClient) unitTypes(ctx context.Context) (map[string]string, error) {
+	cmd := exec.CommandContext(ctx, c.bin(), "show", "*.service", "--property=Id,Type", "--no-pager")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseUnitTypes(string(out)), nil
+}
+
+// parseUnitTypes parses `systemctl show --property=Id,Type` output: one
+// property block per unit, blocks separated by a blank line.
+func parseUnitTypes(s string) map[string]string {
+	types := map[string]string{}
+	var id, typ string
+	flush := func() {
+		if id != "" {
+			types[id] = typ
+		}
+		id, typ = "", ""
+	}
+	sc := bufio.NewScanner(strings.NewReader(s))
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			flush()
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "Id="):
+			id = strings.TrimPrefix(line, "Id=")
+		case strings.HasPrefix(line, "Type="):
+			typ = strings.TrimPrefix(line, "Type=")
+		}
+	}
+	flush()
+	return types
 }
 
 func (c *SystemctlClient) unitFileStates(ctx context.Context) (map[string]string, error) {

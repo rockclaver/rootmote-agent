@@ -193,6 +193,7 @@ func TestTokenBindingForKind_RequiresValidatedFirewallBackendAndRendersExactComm
 		{"unsupported backend", aiproposal.KindFirewallAdd, map[string]any{"backend": "iptables", "action": "allow", "port": 443, "protocol": "tcp"}, "", true},
 		{"firewalld explicit deny", aiproposal.KindFirewallAdd, map[string]any{"backend": "firewalld", "action": "deny", "port": 443, "protocol": "tcp"}, "", true},
 		{"close port missing backend", aiproposal.KindSecurityFix, map[string]any{"kind": "close_port", "port": 443, "protocol": "tcp"}, "", true},
+		{"run_script is advisory only and has no token binding", aiproposal.KindSecurityFix, map[string]any{"kind": "run_script", "script": "chmod 640 /etc/shadow"}, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

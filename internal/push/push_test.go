@@ -137,6 +137,18 @@ func TestRelayClient_SendPostsAuthenticatedRequest(t *testing.T) {
 	}
 }
 
+func TestRelayClient_SendForwardsGroup(t *testing.T) {
+	hc := &fakeHTTP{}
+	hc.push(200, `{"results":[{"token":"device-1","ok":true}]}`)
+	c := NewRelayClient("https://notify.example.com", "tok-123", hc)
+	if err := c.Send(context.Background(), Message{Token: "device-1", Group: "rootmote.s1.disk:/"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(hc.reqBody[0], `"group":"rootmote.s1.disk:/"`) {
+		t.Fatalf("group missing from relay request: %s", hc.reqBody[0])
+	}
+}
+
 func TestRelayClient_Send_RejectsEmptyToken(t *testing.T) {
 	c := NewRelayClient("https://notify.example.com", "tok-123", &fakeHTTP{})
 	if err := c.Send(context.Background(), Message{}); err == nil {
@@ -220,9 +232,9 @@ func TestHub_ForwardRoutesByPolicyAndPrunesUnregistered(t *testing.T) {
 		t.Fatalf("closed-by-default kind forwarded: %+v", sender.sent)
 	}
 
-	// infra.runbook defaults open: fan-out + prune.
+	// infra.alert (fired) defaults open: fan-out + prune.
 	hub.Forward(context.Background(), notifications.Notification{
-		ID: "n1", Type: "infra.runbook", Title: "AI runbook", Body: "x",
+		ID: "n1", Type: "infra.alert", Title: "Infrastructure alert", Body: "x",
 		Data: map[string]any{"runbook_id": "rb1", "step_count": 3},
 	})
 	if len(sender.sent) != 3 {
@@ -235,7 +247,7 @@ func TestHub_ForwardRoutesByPolicyAndPrunesUnregistered(t *testing.T) {
 		if m.Data["step_count"] != "3" {
 			t.Fatalf("nested int not JSON-encoded: %+v", m.Data)
 		}
-		if m.Data["type"] != "infra.runbook" || m.Data["notif_id"] != "n1" {
+		if m.Data["type"] != "infra.alert" || m.Data["notif_id"] != "n1" {
 			t.Fatalf("envelope keys missing: %+v", m.Data)
 		}
 	}
@@ -319,6 +331,23 @@ func TestPushEligibleRetiredOverrideCannotReenableRemovedProducer(t *testing.T) 
 	}
 }
 
+// TestRunbookPushIsOptIn: an AI-proposed runbook is a suggestion, not an
+// outage, so it must not wake a phone unless the operator opted in.
+func TestRunbookPushIsOptIn(t *testing.T) {
+	n := notifications.Notification{Type: "infra.runbook"}
+	if pushEligible(n, nil) {
+		t.Fatal("infra.runbook pushed by default")
+	}
+	for _, k := range KnownKinds() {
+		if k.Key == string(KindRunbook) && k.DefaultPush {
+			t.Fatal("KnownKinds advertises runbook push as default-on")
+		}
+	}
+	if pushEligible(n, map[Kind]bool{KindRunbook: false}) {
+		t.Fatal("explicit off override pushed")
+	}
+}
+
 // TestHub_ForwardStampsPerDeviceServerID covers the deep-link routing fix:
 // each device gets ITS OWN client-side server id in the payload, not the
 // agent's internal rule-bucket id, and devices that never sent one are left
@@ -339,7 +368,7 @@ func TestHub_ForwardStampsPerDeviceServerID(t *testing.T) {
 	hub := &Hub{Sender: sender, Store: st}
 
 	hub.Forward(context.Background(), notifications.Notification{
-		Type: "infra.runbook", Title: "T",
+		Type: "infra.alert", Title: "T",
 		Data: map[string]any{"server_id": "local"},
 	})
 	if len(sender.sent) != 2 {
@@ -354,6 +383,36 @@ func TestHub_ForwardStampsPerDeviceServerID(t *testing.T) {
 	}
 	if byToken["d2"].Data["server_id"] != "local" {
 		t.Fatalf("d2 (no client_server_id) should keep the producer's value, got: %+v", byToken["d2"].Data)
+	}
+}
+
+func TestHub_ForwardGroupsByServerAndAlertKey(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutPushDevice(store.PushDevice{Token: "d1", ClientServerID: "client-abc"}); err != nil {
+		t.Fatal(err)
+	}
+	sender := &stubSender{}
+	hub := &Hub{Sender: sender, Store: st}
+
+	hub.Forward(context.Background(), notifications.Notification{
+		Type: "infra.alert", Title: "T",
+		Data: map[string]any{"server_id": "local", "key": "disk:/var"},
+	})
+	if len(sender.sent) != 1 || sender.sent[0].Group != "rootmote.client-abc.disk:/var" {
+		t.Fatalf("group = %+v", sender.sent)
+	}
+
+	sender.sent = nil
+	hub.Forward(context.Background(), notifications.Notification{
+		Type: "infra.alert", Title: "T",
+		Data: map[string]any{"server_id": "local"},
+	})
+	if len(sender.sent) != 1 || sender.sent[0].Group != "" {
+		t.Fatalf("keyless alert must not be grouped: %+v", sender.sent)
 	}
 }
 
@@ -422,7 +481,7 @@ func TestHub_SubscribeBridgesNotificationHub(t *testing.T) {
 	defer cleanup()
 
 	_ = nh.Publish(context.Background(), notifications.Notification{
-		Type: "infra.runbook", Title: "T", Body: "B",
+		Type: "infra.alert", Title: "T", Body: "B",
 	})
 	if len(sender.sent) != 1 || sender.sent[0].Title != "T" {
 		t.Fatalf("subscribe bridge missed message: %+v", sender.sent)

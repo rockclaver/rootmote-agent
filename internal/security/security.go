@@ -38,24 +38,7 @@ const (
 	FixClosePort    FixKind = "close_port"
 	FixKillProcess  FixKind = "kill_process"
 	FixEnableAuditd FixKind = "enable_auditd"
-	// FixRunScript executes an AI-authored POSIX sh script as root. It exists
-	// for findings with no narrow typed fix (e.g. correcting ownership or
-	// permissions on /etc/shadow) where the alternative is refusing to
-	// propose any remediation at all. Safety is enforced procedurally rather
-	// than by restricting the command surface: the script is bound
-	// byte-for-byte into the confirmation token's action hash (see
-	// securityFixTokenBinding / tokenBindingForKind), so approving one
-	// script can never execute a different one, and runbook.materialise
-	// forces Risk=high whenever a run_script step is present so the mobile
-	// client requires a fresh biometric per step instead of one-tap
-	// "approve all".
-	FixRunScript FixKind = "run_script"
 )
-
-// MaxScriptBytes caps an AI-proposed run_script payload. Generous enough for
-// any realistic single-finding remediation while keeping the audit log and
-// mobile approval card readable.
-const MaxScriptBytes = 16 * 1024
 
 type Finding struct {
 	ID             string   `json:"id"`
@@ -103,7 +86,6 @@ type FixRequest struct {
 	PID            int
 	StartTimeTicks uint64
 	Signal         string
-	Script         string
 }
 
 type FixResult struct {
@@ -266,35 +248,9 @@ func (m *Manager) Fix(ctx context.Context, req FixRequest) (FixResult, error) {
 		return FixResult{Kind: req.Kind, Target: target, Summary: "sent " + signal + " to suspicious process " + target}, nil
 	case FixEnableAuditd:
 		return m.enableAuditd(ctx)
-	case FixRunScript:
-		return m.runScript(ctx, req.Script)
 	default:
 		return FixResult{}, fmt.Errorf("security: unsupported fix %q", req.Kind)
 	}
-}
-
-// runScript executes an AI-proposed remediation script as root via the same
-// nsenter+sudo escalation path (and sudoers.d allowlist) every other
-// privileged mutation in this package uses. The operator has already
-// biometrically approved this exact script text (the confirmation token's
-// action hash is bound to it) before this is ever reached.
-func (m *Manager) runScript(ctx context.Context, script string) (FixResult, error) {
-	script = strings.TrimSpace(script)
-	if script == "" {
-		return FixResult{}, errors.New("security: script is empty")
-	}
-	if len(script) > MaxScriptBytes {
-		return FixResult{}, fmt.Errorf("security: script exceeds %d bytes", MaxScriptBytes)
-	}
-	out, err := m.runPrivileged(ctx, "sh", "-c", script)
-	if err != nil {
-		return FixResult{}, fmt.Errorf("security: run script: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	summary := strings.TrimSpace(string(out))
-	if summary == "" {
-		summary = "script completed with no output"
-	}
-	return FixResult{Kind: FixRunScript, Target: "script", Summary: truncateOutput(summary, 500)}, nil
 }
 
 func truncateOutput(s string, n int) string {
@@ -366,8 +322,6 @@ func privilegedCommandPath(name string) string {
 		return "/usr/bin/systemctl"
 	case "nsenter":
 		return "/usr/bin/nsenter"
-	case "sh":
-		return "/bin/sh"
 	default:
 		return name
 	}

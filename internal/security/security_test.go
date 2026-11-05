@@ -331,66 +331,24 @@ func TestFixClosePortRemovesFirewalldAllowRule(t *testing.T) {
 	}
 }
 
-func TestFixRunScriptExecutesAsShellCommand(t *testing.T) {
+// Raw shell is never executed by the agent: a "run_script" fix is refused
+// and no command is issued.
+func TestFixRunScriptIsNotExecutable(t *testing.T) {
 	var calls []string
 	mgr, err := New(Config{
 		Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			calls = append(calls, strings.Join(append([]string{name}, args...), " "))
-			return []byte("chmod applied\n"), nil
+			return nil, nil
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := mgr.Fix(context.Background(), FixRequest{
-		Kind:   FixRunScript,
-		Script: "chmod 640 /etc/shadow && chown root:shadow /etc/shadow",
-	})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := mgr.Fix(context.Background(), FixRequest{Kind: FixKind("run_script")}); err == nil {
+		t.Fatal("expected run_script to be refused")
 	}
-	if res.Kind != FixRunScript || res.Summary != "chmod applied" {
-		t.Fatalf("result = %+v", res)
-	}
-	joined := strings.Join(calls, "\n")
-	if !strings.Contains(joined, "-c chmod 640 /etc/shadow && chown root:shadow /etc/shadow") {
-		t.Fatalf("script not passed to sh -c: %s", joined)
-	}
-}
-
-func TestFixRunScriptRejectsEmptyScript(t *testing.T) {
-	mgr, err := New(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Fix(context.Background(), FixRequest{Kind: FixRunScript}); err == nil {
-		t.Fatal("expected error for empty script")
-	}
-}
-
-func TestFixRunScriptRejectsOversizedScript(t *testing.T) {
-	mgr, err := New(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	huge := strings.Repeat("a", MaxScriptBytes+1)
-	if _, err := mgr.Fix(context.Background(), FixRequest{Kind: FixRunScript, Script: huge}); err == nil {
-		t.Fatal("expected error for oversized script")
-	}
-}
-
-func TestFixRunScriptSurfacesCommandFailure(t *testing.T) {
-	mgr, err := New(Config{
-		Run: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-			return []byte("permission denied\n"), errors.New("exit status 1")
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = mgr.Fix(context.Background(), FixRequest{Kind: FixRunScript, Script: "false"})
-	if err == nil || !strings.Contains(err.Error(), "permission denied") {
-		t.Fatalf("expected error surfacing command output, got %v", err)
+	if len(calls) != 0 {
+		t.Fatalf("refused fix must run nothing, ran %v", calls)
 	}
 }
 

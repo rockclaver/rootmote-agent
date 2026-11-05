@@ -57,7 +57,19 @@ func (s *captureSink) Publish(_ context.Context, n notifications.Notification) e
 	return nil
 }
 
+type testClock struct{ t time.Time }
+
+func (c *testClock) Now() time.Time { return c.t }
+
 func newTestManager(t *testing.T, samples []infra.HostMetrics, units [][]systemd.Unit) (*Manager, *captureSink, *store.Store) {
+	t.Helper()
+	return newTestManagerWithClock(t, samples, units, &testClock{t: time.Unix(1700000000, 0)})
+}
+
+// newTestManagerWithClock runs on a 2-CPU host whose load alert fires and
+// clears after two consecutive 30s samples, so the default per-core
+// threshold of 2 fires at a 5-minute load of 4 and clears at 3.
+func newTestManagerWithClock(t *testing.T, samples []infra.HostMetrics, units [][]systemd.Unit, clock *testClock) (*Manager, *captureSink, *store.Store) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -69,8 +81,11 @@ func newTestManager(t *testing.T, samples []infra.HostMetrics, units [][]systemd
 		Metrics:             &fakeMetrics{samples: samples},
 		Systemd:             &fakeUnits{units: units},
 		Sink:                sink,
-		Now:                 func() time.Time { return time.Unix(1700000000, 0) },
-		LoadConsecutiveHits: 2,
+		Now:                 clock.Now,
+		Cadence:             30 * time.Second,
+		CPUCount:            2,
+		LoadFiringFor:       time.Minute,
+		LoadRecoveryFor:     time.Minute,
 		UnitConsecutiveHits: 2,
 	})
 	if err != nil {
@@ -79,12 +94,20 @@ func newTestManager(t *testing.T, samples []infra.HostMetrics, units [][]systemd
 	return m, sink, st
 }
 
-func sample(disk, load float64) infra.HostMetrics {
+// step runs n evaluation cycles, advancing clock by one cadence after each.
+func step(m *Manager, clock *testClock, n int) {
+	for range n {
+		m.Evaluate(context.Background())
+		clock.t = clock.t.Add(30 * time.Second)
+	}
+}
+
+func sample(disk, load5 float64) infra.HostMetrics {
 	return infra.HostMetrics{
 		Timestamp: time.Unix(1700000000, 0),
 		Load: infra.LoadMetric{
 			MetricReason: infra.MetricReason{Available: true},
-			One:          load,
+			Five:         load5,
 		},
 		Disks: []infra.DiskMetric{{
 			Mountpoint: "/",
@@ -179,8 +202,8 @@ func TestAlertEngine_LoadRequiresSustainedSamplesAndClear(t *testing.T) {
 	m, sink, st := newTestManager(t, []infra.HostMetrics{
 		sample(1, 4.2),
 		sample(1, 4.3),
-		sample(1, 4.4),
-		sample(1, 3.2),
+		sample(1, 2.9),
+		sample(1, 2.8),
 	}, nil)
 	defer st.Close()
 
@@ -192,6 +215,9 @@ func TestAlertEngine_LoadRequiresSustainedSamplesAndClear(t *testing.T) {
 	}
 	if sink.got[0].Data["rule"] != RuleLoadSustained {
 		t.Fatalf("wrong rule: %+v", sink.got[0])
+	}
+	if v, _ := sink.got[0].Data["value"].(float64); v != 2.15 {
+		t.Fatalf("value should be load per core (4.3/2), got %+v", sink.got[0].Data["value"])
 	}
 }
 
@@ -208,6 +234,91 @@ func TestAlertEngine_LoadSamplesMustBeConsecutiveBeforeEntry(t *testing.T) {
 	}
 	if len(sink.got) != 0 {
 		t.Fatalf("non-consecutive load samples emitted: %+v", sink.got)
+	}
+}
+
+// TestAlertEngine_LoadIsNormalizedPerCore: a load that saturates a small
+// box is routine on a large one. 6.0 on 8 CPUs is 0.75 per core.
+func TestAlertEngine_LoadIsNormalizedPerCore(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sink := &captureSink{}
+	m, err := New(Config{
+		Store:    st,
+		Metrics:  &fakeMetrics{samples: []infra.HostMetrics{sample(1, 6)}},
+		Sink:     sink,
+		CPUCount: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 60 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 0 {
+		t.Fatalf("load 6 on 8 CPUs alerted: %+v", sink.got)
+	}
+}
+
+// TestAlertEngine_LoadHoveringAtThresholdNotifiesOnce reproduces the push
+// flood: load sitting around the threshold used to fire, clear on the next
+// dip, and fire again a minute later. Dips shorter than the recovery hold
+// must keep the original episode open.
+func TestAlertEngine_LoadHoveringAtThresholdNotifiesOnce(t *testing.T) {
+	samples := []infra.HostMetrics{sample(1, 4.2), sample(1, 4.2)}
+	for range 30 {
+		samples = append(samples, sample(1, 2.5), sample(1, 4.4))
+	}
+	clock := &testClock{t: time.Unix(1700000000, 0)}
+	m, sink, st := newTestManagerWithClock(t, samples, nil, clock)
+	defer st.Close()
+
+	step(m, clock, len(samples))
+	if len(sink.got) != 1 {
+		t.Fatalf("notifications=%d want a single fire: %+v", len(sink.got), sink.got)
+	}
+	if active := m.ActiveAlerts(); len(active) != 1 {
+		t.Fatalf("alert should stay active through short dips: %+v", active)
+	}
+}
+
+// TestAlertEngine_RefireInsideQuietWindowReopensSilently: once an alert has
+// cleared, coming back within RenotifyAfter is the same problem, not a new
+// emergency. It reappears in the inbox under its original episode without
+// a push; after the window a fresh episode notifies again.
+func TestAlertEngine_RefireInsideQuietWindowReopensSilently(t *testing.T) {
+	high, low := sample(1, 4.5), sample(1, 2)
+	samples := []infra.HostMetrics{high, high, low, low} // fire, clear
+	samples = append(samples, high, high, low, low)      // back within minutes
+	samples = append(samples, high, high)                // back after the window
+	clock := &testClock{t: time.Unix(1700000000, 0)}
+	m, sink, st := newTestManagerWithClock(t, samples, nil, clock)
+	defer st.Close()
+
+	step(m, clock, 4)
+	firstFiredAt := sink.got[0].Data["fired_at"]
+	step(m, clock, 2)
+	if len(sink.got) != 2 {
+		t.Fatalf("re-fire inside quiet window notified: %+v", sink.got)
+	}
+	active := m.ActiveAlerts()
+	if len(active) != 1 || active[0].FiredAt.Unix() != firstFiredAt {
+		t.Fatalf("reopened alert should keep its original episode: %+v", active)
+	}
+	step(m, clock, 2)
+	clock.t = clock.t.Add(2 * time.Hour)
+	step(m, clock, 2)
+	fires := 0
+	for _, n := range sink.got {
+		if n.Data["clear"] == false {
+			fires++
+		}
+	}
+	if fires != 2 {
+		t.Fatalf("fire notifications=%d want 2 (original + after window): %+v", fires, sink.got)
 	}
 }
 
@@ -313,5 +424,73 @@ func TestAlertEngine_DisabledRuleSuppressesNotification(t *testing.T) {
 	m.Evaluate(context.Background())
 	if len(sink.got) != 0 {
 		t.Fatalf("disabled rule emitted: %+v", sink.got)
+	}
+}
+
+// One condition, one push: once the monitor engine owns disk_usage the legacy
+// manager must not publish it, yet the episode stays visible in the inbox
+// feed and load_sustained (not owned) still notifies.
+func TestAlertEngine_MonitorOwnedRuleDoesNotPushButStaysActive(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{
+		sample(95, 1),
+		sample(95, 8),
+		sample(95, 8),
+	}, nil)
+	defer st.Close()
+	owned := true
+	m.monitorOwned = func(rule string) bool { return owned && rule == RuleDiskUsage }
+
+	for range 3 {
+		m.Evaluate(context.Background())
+	}
+	for _, n := range sink.got {
+		if n.Data["rule"] == RuleDiskUsage {
+			t.Fatalf("legacy disk alert pushed while monitor engine owns it: %+v", n)
+		}
+	}
+	if len(sink.got) != 1 || sink.got[0].Data["rule"] != RuleLoadSustained {
+		t.Fatalf("want exactly the unowned load alert, got %+v", sink.got)
+	}
+	active := m.ActiveAlerts()
+	var disk bool
+	for _, a := range active {
+		if a.RuleKind == RuleDiskUsage {
+			disk = true
+		}
+	}
+	if !disk {
+		t.Fatalf("owned disk alert must stay in the inbox feed: %+v", active)
+	}
+}
+
+func TestAlertEngine_UnownedDiskRulePushesWhenMonitorNotRunning(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{sample(95, 1)}, nil)
+	defer st.Close()
+	m.monitorOwned = func(string) bool { return false }
+	m.Evaluate(context.Background())
+	if len(sink.got) != 1 || sink.got[0].Data["rule"] != RuleDiskUsage {
+		t.Fatalf("legacy disk alert must push when no monitor engine runs: %+v", sink.got)
+	}
+}
+
+func TestAlertEngine_OneshotAndTransientUnitsDoNotAlert(t *testing.T) {
+	failed := func(name, typ string) systemd.Unit {
+		return systemd.Unit{Name: name, ActiveState: "failed", SubState: "failed", Type: typ}
+	}
+	m, sink, st := newTestManager(t,
+		[]infra.HostMetrics{sample(1, 1)},
+		[][]systemd.Unit{{
+			failed("backup.service", "oneshot"),
+			failed("run-r42.service", ""),
+			failed("session-3.scope", ""),
+			failed("api.service", "simple"),
+		}},
+	)
+	defer st.Close()
+	for range 3 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 1 || sink.got[0].Data["target"] != "api.service" {
+		t.Fatalf("only the long-running service may alert: %+v", sink.got)
 	}
 }

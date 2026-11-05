@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +51,13 @@ const defaultNotifyRelayURL = "https://notify.orivo.app"
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "pairing-key" {
 		printPairingKey(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == storage.PrivilegedRemoveSubcommand {
+		if err := storage.RunPrivilegedRemove(os.Args[2:]); err != nil {
+			_, _ = os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(1)
+		}
 		return
 	}
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
@@ -195,11 +203,19 @@ func main() {
 		log.Fatalf("rootmote-agent: init remediation: %v", err)
 	}
 	notificationHub := notifications.NewHub()
+	// monitorRunning flips once the Watchtower monitor engine is evaluating.
+	// From then on it owns every condition in monitor.OwnsAlertRule, and the
+	// legacy alerts manager keeps its inbox/ack/silence state for them but
+	// stops publishing a second push (see monitor/ownership.go).
+	var monitorRunning atomic.Bool
 	alertMgr, err := alerts.New(alerts.Config{
 		Store:   st,
 		Metrics: infraMgr,
 		Systemd: systemdMgr,
 		Sink:    notificationHub,
+		MonitorOwns: func(rule string) bool {
+			return monitorRunning.Load() && monitor.OwnsAlertRule(rule)
+		},
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init alerts: %v", err)
@@ -298,6 +314,7 @@ func main() {
 			// Watchtower.
 			bg := context.Background()
 			monMgr.Start(bg)
+			monitorRunning.Store(true)
 			go syncMonitorsLoop(bg, wtClient, monMgr)
 			log.Printf("rootmote-agent: watchtower monitor engine started")
 		})

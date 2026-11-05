@@ -39,6 +39,7 @@ type Message struct {
 	Title string            // notification.title
 	Body  string            // notification.body
 	Data  map[string]string // arbitrary key/value pairs (deep_link, runbook_id, ...)
+	Group string            // optional OS notification group: Android tag / APNs thread-id
 }
 
 // HTTPDoer is satisfied by *http.Client and any test stub.
@@ -122,6 +123,7 @@ type relayMessage struct {
 	Title string            `json:"title"`
 	Body  string            `json:"body"`
 	Data  map[string]string `json:"data,omitempty"`
+	Group string            `json:"group,omitempty"`
 }
 
 type relayNotifyResponse struct {
@@ -141,7 +143,7 @@ func (c *RelayClient) Send(ctx context.Context, m Message) error {
 		return errors.New("push: empty device token")
 	}
 	reqBody, err := json.Marshal(relayNotifyRequest{Messages: []relayMessage{{
-		Token: m.Token, Title: m.Title, Body: m.Body, Data: m.Data,
+		Token: m.Token, Title: m.Title, Body: m.Body, Data: m.Data, Group: m.Group,
 	}}})
 	if err != nil {
 		return err
@@ -276,12 +278,19 @@ func (h *Hub) Forward(ctx context.Context, n notifications.Notification) {
 			}
 			data["server_id"] = d.ClientServerID
 		}
-		err := h.Sender.Send(ctx, Message{
+		msg := Message{
 			Token: d.Token,
 			Title: title,
 			Body:  n.Body,
 			Data:  data,
-		})
+		}
+		// Same identity the app uses to group the local copy of this alert
+		// (lib/notifications/local_notifications.dart alertGroupKey), so
+		// the OS-drawn banner and the re-rendered one share a thread.
+		if key := data["key"]; key != "" {
+			msg.Group = "rootmote." + data["server_id"] + "." + key
+		}
+		err := h.Sender.Send(ctx, msg)
 		if err == nil {
 			continue
 		}
