@@ -201,6 +201,9 @@ func TestMetricsCollector_SkipsDockerAndPseudoMounts(t *testing.T) {
 			"nsfs /run/docker/netns/default nsfs rw 0 0",
 			"/dev/vda1 /run/docker/containers/abc/shm ext4 rw 0 0",
 			"udev /dev/null devtmpfs rw 0 0",
+			// Snap packages are read-only images that always read 100% used.
+			"/dev/loop3 /snap/core20/2922 squashfs ro,nodev,relatime 0 0",
+			"snapfuse /snap/certbot/5893 fuse.snapfuse ro,nodev 0 0",
 			"",
 		}, "\n")),
 	}}

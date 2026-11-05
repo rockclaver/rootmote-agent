@@ -544,6 +544,9 @@ func parseMounts(b []byte, err error) ([]mount, error) {
 		if fsType == "proc" || fsType == "sysfs" || fsType == "tmpfs" || fsType == "devtmpfs" || fsType == "devpts" || fsType == "cgroup2" || fsType == "overlay" {
 			continue
 		}
+		if isReadOnlyImageFS(fsType) {
+			continue
+		}
 		path := unescapeMount(fields[1])
 		if isPseudoMountPath(path) {
 			continue
@@ -562,6 +565,19 @@ func parseMounts(b []byte, err error) ([]mount, error) {
 
 func unescapeMount(s string) string {
 	return strings.ReplaceAll(s, `\040`, " ")
+}
+
+// isReadOnlyImageFS reports filesystems that are packed images: snap
+// packages (squashfs, or snapfuse inside containers), ISOs, EROFS/cramfs.
+// They always report 100% used by construction and can never fill further,
+// so treating them as disks turns every installed snap into a "disk full"
+// alert.
+func isReadOnlyImageFS(fsType string) bool {
+	switch fsType {
+	case "squashfs", "fuse.snapfuse", "iso9660", "erofs", "cramfs", "udf":
+		return true
+	}
+	return false
 }
 
 // isPseudoMountPath reports whether a mount lives under a kernel/runtime
