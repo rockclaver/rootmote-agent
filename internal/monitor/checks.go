@@ -64,7 +64,7 @@ func (e *CPUEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	}
 	cpu := e.Infra.Sample(ctx).CPU
 	if !cpu.Available {
-		return nil, nil
+		return []Observation{{Hold: true}}, nil
 	}
 	fire, recover := def.thresholds(defaultCPUFire, defaultCPURecover, true)
 	failing := evalThreshold(cpu.Percent, fire, recover, e.Held.WasFailing(KindCPUPressure, ""))
@@ -101,7 +101,7 @@ func (e *LoadEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	}
 	load := e.Infra.Sample(ctx).Load
 	if !load.Available {
-		return nil, nil
+		return []Observation{{Hold: true}}, nil
 	}
 	cores := runtime.NumCPU()
 	if e.Cores != nil {
@@ -202,6 +202,7 @@ func (e *DiskFillEvaluator) Evaluate(ctx context.Context) ([]Observation, error)
 		}
 		d, ok := byMount[target]
 		if !ok || !d.Available || d.TotalBytes == 0 {
+			out = append(out, Observation{Target: target, Hold: true})
 			continue
 		}
 		w := e.windows[target]
@@ -222,6 +223,9 @@ func (e *DiskFillEvaluator) Evaluate(ctx context.Context) ([]Observation, error)
 					Target: target, Severity: severityOr(def, "warning"),
 					Summary: fmt.Sprintf("disk %s usage dropped; fill-rate history restarted", target),
 				})
+			} else {
+				// Still warming up: no verdict yet, so hold.
+				out = append(out, Observation{Target: target, Hold: true})
 			}
 			continue
 		}
@@ -405,7 +409,9 @@ func (e *LogSpikeEvaluator) Evaluate(ctx context.Context) ([]Observation, error)
 		}
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			continue // the relay rejects invalid patterns; a stale definition is skipped
+			// The relay rejects invalid patterns; a stale definition holds.
+			out = append(out, Observation{Target: target, Hold: true})
+			continue
 		}
 		tr := e.tracks[target]
 		if tr == nil {
@@ -452,6 +458,8 @@ func (e *LogSpikeEvaluator) Evaluate(ctx context.Context) ([]Observation, error)
 			tr.lastHistory = now
 		}
 		if !ready {
+			// No baseline yet: hold rather than guess.
+			out = append(out, Observation{Target: target, Hold: true})
 			continue
 		}
 

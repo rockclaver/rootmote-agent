@@ -91,10 +91,13 @@ func (f *fakeDocker) Container(_ context.Context, id string) (docker.ContainerDe
 }
 
 type fakeSystemd struct {
-	units []systemd.Unit
+	units       []systemd.Unit
+	unavailable bool
 }
 
-func (f *fakeSystemd) Status(context.Context) systemd.Status        { return systemd.Status{Available: true} }
+func (f *fakeSystemd) Status(context.Context) systemd.Status {
+	return systemd.Status{Available: !f.unavailable}
+}
 func (f *fakeSystemd) List(context.Context) ([]systemd.Unit, error) { return f.units, nil }
 
 // harness builds a Manager driven by a mutable clock.
@@ -109,6 +112,17 @@ type harness struct {
 
 func newHarness(t *testing.T, withDocker, withSystemd bool) *harness {
 	t.Helper()
+	return newHarnessWithStates(t, withDocker, withSystemd)
+}
+
+// newHarnessWithStates starts the engine with persisted runtime state, as an
+// agent upgraded in place would.
+func newHarnessWithStates(t *testing.T, withDocker, withSystemd bool, states ...store.MonitorState) *harness {
+	t.Helper()
+	st := newFakeStateStore()
+	for _, s := range states {
+		st.states[s.Key] = s
+	}
 	h := &harness{
 		sender:  &fakeSender{},
 		infra:   &fakeInfra{},
@@ -118,7 +132,7 @@ func newHarness(t *testing.T, withDocker, withSystemd bool) *harness {
 	}
 	cfg := Config{
 		Infra:  h.infra,
-		Store:  newFakeStateStore(),
+		Store:  st,
 		Client: h.sender,
 		Now:    func() time.Time { return h.now },
 		Logf:   t.Logf,
@@ -621,5 +635,111 @@ func TestDefinitionsFromSync_SkipsRelayEvaluatedMonitors(t *testing.T) {
 	}
 	if got[0].ID != "mon_agent" || got[1].ID != "mon_default" {
 		t.Fatalf("unexpected surviving definitions: %+v", got)
+	}
+}
+
+// --- targets that stop being reported must not stay firing forever --------
+
+func firingDocker(t *testing.T, h *harness) {
+	t.Helper()
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "running"}}
+	h.tick()
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "api", State: "exited"}}
+	h.docker.details["c1"] = docker.ContainerDetail{ID: "c1", ExitCode: 1}
+	h.tick()
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("setup: firing events = %d, want 1", got)
+	}
+}
+
+func TestDockerMonitor_RemovedContainerResolvesItsIncident(t *testing.T) {
+	h := newHarness(t, true, false)
+	firingDocker(t, h)
+
+	h.docker.summaries = nil // docker rm api
+	for range 6 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 1 {
+		t.Fatalf("resolved events after container removal = %d, want 1", got)
+	}
+	last := h.sender.events[len(h.sender.events)-1]
+	if last.Target != "api" || last.Attributes[AttrReason] != ReasonTargetGone {
+		t.Fatalf("resolved event = %+v, want target api marked %s", last, ReasonTargetGone)
+	}
+	if h.m.WasFailing(KindDockerContainer, "api") {
+		t.Fatal("removed container is still mid-episode")
+	}
+}
+
+func TestDockerMonitor_RecreatedContainerKeepsItsIncident(t *testing.T) {
+	h := newHarness(t, true, false)
+	firingDocker(t, h)
+
+	// compose recreate: gone for one tick, back under the same name, still
+	// broken. That is the same outage, not a recovery and a new page.
+	h.docker.summaries = nil
+	h.tick()
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c2", Name: "api", State: "restarting"}}
+	for range 4 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved events across a quick recreate = %d, want 0", got)
+	}
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing events across a quick recreate = %d, want 1", got)
+	}
+}
+
+func TestSystemdMonitor_EpisodeForNowIgnoredUnitResolves(t *testing.T) {
+	// An agent from before the oneshot rule left this unit firing.
+	h := newHarnessWithStates(t, false, true, store.MonitorState{
+		Key: key(KindSystemdUnit, "backup.service"), State: string(StateFiring),
+		ConsecutiveFail: 5, FirstFailureAt: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	})
+	h.systemd.units = []systemd.Unit{{Name: "backup.service", ActiveState: "failed", Type: "oneshot"}}
+	for range 4 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 1 {
+		t.Fatalf("resolved events for a now-ignored oneshot unit = %d, want 1", got)
+	}
+	if got := h.sender.countTo("firing"); got != 0 {
+		t.Fatalf("ignored unit fired again: %+v", h.sender.events)
+	}
+}
+
+func TestSystemdMonitor_UnavailableSystemdHoldsEpisodes(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.systemd.units = []systemd.Unit{{Name: "nginx.service", ActiveState: "failed", Type: "simple"}}
+	for range 3 {
+		h.tick()
+	}
+	h.systemd.unavailable = true
+	for range 6 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved events while systemd unavailable = %d, want 0", got)
+	}
+	if !h.m.WasFailing(KindSystemdUnit, "nginx.service") {
+		t.Fatal("episode dropped while systemd was unavailable")
+	}
+}
+
+func TestDockerMonitor_StalePendingForVanishedContainerClearsSilently(t *testing.T) {
+	h := newHarnessWithStates(t, true, false, store.MonitorState{
+		Key: key(KindDockerContainer, "0dfc002e43c1_web-1"), State: string(StatePending),
+		ConsecutiveFail: 1, FirstFailureAt: time.Date(2026, 10, 1, 5, 0, 0, 0, time.UTC),
+	})
+	h.docker.summaries = []docker.ContainerSummary{{ID: "c1", Name: "web-1", State: "running"}}
+	h.tick()
+	if h.m.WasFailing(KindDockerContainer, "0dfc002e43c1_web-1") {
+		t.Fatal("pending state for a container that no longer exists was kept")
+	}
+	if len(h.sender.events) != 0 {
+		t.Fatalf("clearing a pending state emitted events: %+v", h.sender.events)
 	}
 }

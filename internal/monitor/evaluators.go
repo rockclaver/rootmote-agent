@@ -70,6 +70,7 @@ func (e *DiskEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		}
 		d, ok := byMount[target]
 		if !ok || !d.Available {
+			out = append(out, Observation{Target: target, Hold: true})
 			continue
 		}
 		var value float64
@@ -130,7 +131,7 @@ func (e *MemoryEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		// and would resolve a firing episode). No observation holds the
 		// current state. Swap is optional: hosts without swap report it
 		// unavailable and it simply contributes 0.
-		return nil, nil
+		return []Observation{{Target: "", Hold: true}}, nil
 	}
 	memoryPercent := sample.Memory.Percent
 	swapPercent := sample.Swap.Percent
@@ -235,8 +236,9 @@ func (e *DockerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		detail, derr := e.Docker.Container(ctx, s.ID)
 		if derr != nil && !running && !strings.EqualFold(s.State, "restarting") {
 			// Without the exit code a stopped container cannot be told
-			// apart from a clean stop. Emit nothing so the state machine
-			// holds its current state instead of guessing either way.
+			// apart from a clean stop. Hold the current state instead of
+			// guessing either way.
+			out = append(out, Observation{Target: target, Hold: true})
 			continue
 		}
 		crashLoop := e.trackCrashLoop(s.ID, detail.RestartCount, now)
@@ -362,7 +364,7 @@ func (e *SystemdEvaluator) Kind() Kind { return KindSystemdUnit }
 func (e *SystemdEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	status := e.Systemd.Status(ctx)
 	if !status.Available {
-		return nil, nil
+		return nil, ErrSourceUnavailable
 	}
 	units, err := e.Systemd.List(ctx)
 	if err != nil {
@@ -376,7 +378,9 @@ func (e *SystemdEvaluator) Evaluate(ctx context.Context) ([]Observation, error) 
 		}
 		if systemd.IgnoredForFailureAlerts(u) {
 			// Oneshot jobs and transient run-*/scope units end in "failed"
-			// as a normal outcome of a single command, not an outage.
+			// as a normal outcome of a single command, not an outage. Not
+			// reporting them also retires any episode opened for one
+			// before this rule existed.
 			continue
 		}
 		failing := strings.EqualFold(u.ActiveState, "failed")

@@ -99,8 +99,9 @@ func (e *CertEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 				}
 			}
 			// A transient dial failure says nothing about expiry: keep the
-			// last known date, or stay silent if there never was one.
+			// last known date, or hold if there never was one.
 			if !c.haveValue {
+				out = append(out, Observation{Target: target, Hold: true})
 				continue
 			}
 			notAfter = c.notAfter
@@ -176,7 +177,7 @@ func (e *TimerEvaluator) Kind() Kind { return KindSystemdTimerFailed }
 
 func (e *TimerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	if !e.Systemd.Status(ctx).Available {
-		return nil, nil
+		return nil, ErrSourceUnavailable
 	}
 	list, err := e.Host.Run(ctx, "systemctl", "list-units", "--type=timer", "--all", "--no-legend", "--plain", "--no-pager")
 	if err != nil {
@@ -225,6 +226,7 @@ func (e *TimerEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		svc := svcOf[t]
 		props, ok := svcProps[svc]
 		if !ok {
+			out = append(out, Observation{Target: t, Hold: true})
 			continue
 		}
 		state, result := props["ActiveState"], props["Result"]
@@ -397,7 +399,9 @@ func (e *PortEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 		}
 		host, port, err := ParsePortTarget(target)
 		if err != nil {
-			continue // the relay rejects malformed targets
+			// The relay rejects malformed targets; a stale definition holds.
+			out = append(out, Observation{Target: target, Hold: true})
+			continue
 		}
 		proto := strings.ToLower(def.param("protocol"))
 		if proto == "" {

@@ -7,7 +7,10 @@
 // transitions only -- a single transient failure never pages.
 package monitor
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // State is one node in the per-(kind,target) monitor state machine. The
 // full enum mirrors the relay/mobile-visible state set (issue #78 §7); the
@@ -171,6 +174,18 @@ type Observation struct {
 	Severity   string
 	Summary    string
 	Attributes map[string]string
+
+	// Hold marks a target the evaluator still knows about but could not
+	// read this tick (collector unavailable, still warming up, transient
+	// dial or inspect failure). Its state is left exactly as it was.
+	//
+	// Every in-episode target of the evaluator's kind that is neither
+	// observed nor held after a successful Evaluate is treated as gone (a
+	// removed container, a deleted unit, a target the evaluator no longer
+	// monitors) and is walked to resolved -- see Manager.retireAbsent. An
+	// evaluator must therefore report Hold, never silence, for a target it
+	// merely failed to read.
+	Hold bool
 }
 
 // Evaluator produces observations for one monitor kind from live collector
@@ -179,6 +194,21 @@ type Evaluator interface {
 	Kind() Kind
 	Evaluate(ctx context.Context) ([]Observation, error)
 }
+
+// ErrSourceUnavailable is returned by an evaluator whose whole collector is
+// unavailable this tick (e.g. systemd not running). The tick is skipped
+// without logging and without retiring absent targets, so every existing
+// episode holds.
+var ErrSourceUnavailable = errors.New("monitor: collector unavailable")
+
+// AttrReason / ReasonTargetGone mark the resolved event emitted when a
+// failing target stops being reported at all, so the relay can close the
+// incident without sending a "recovered" push for something that was
+// removed.
+const (
+	AttrReason       = "reason"
+	ReasonTargetGone = "target_gone"
+)
 
 // key returns the store.MonitorState primary key for one (kind,target).
 func key(kind Kind, target string) string {

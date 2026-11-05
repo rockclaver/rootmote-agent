@@ -217,11 +217,11 @@ func TestCPUPressure_HysteresisBand(t *testing.T) {
 	}
 }
 
-func TestCPUPressure_UnavailableSampleProducesNothing(t *testing.T) {
+func TestCPUPressure_UnavailableSampleHolds(t *testing.T) {
 	ev := &CPUEvaluator{Infra: &fakeInfraSampler{}, Defs: newDefs(Definition{Kind: KindCPUPressure}), Held: heldSet{}}
 	obs, _ := ev.Evaluate(context.Background())
-	if len(obs) != 0 {
-		t.Fatalf("obs = %+v, want none", obs)
+	if len(obs) != 1 || !obs[0].Hold {
+		t.Fatalf("obs = %+v, want one held observation", obs)
 	}
 }
 
@@ -300,7 +300,7 @@ func TestDiskFillRate_NeedsThirtyMinutesOfHistory(t *testing.T) {
 	for i := 0; i < 29; i++ {
 		obs = h.step(perMin)
 	}
-	if len(obs) != 0 {
+	if len(obs) != 1 || !obs[0].Hold {
 		t.Fatalf("29 minutes of history produced a verdict: %+v", obs)
 	}
 	obs = h.step(perMin) // 30 samples spanning 29min... still short
@@ -451,14 +451,14 @@ func TestCertExpiry_DialsAtMostHourlyAndKeepsLastKnownOnError(t *testing.T) {
 	}
 }
 
-func TestCertExpiry_DialErrorWithNoHistoryIsSilent(t *testing.T) {
+func TestCertExpiry_DialErrorWithNoHistoryHolds(t *testing.T) {
 	host := newFakeHost()
 	host.certErr = errors.New("no route")
 	ev := &CertEvaluator{Host: host, Held: heldSet{}, Now: newClock().now,
 		Defs: newDefs(Definition{Kind: KindCertExpiry, Target: "example.com:8443"})}
 	obs, err := ev.Evaluate(context.Background())
-	if err != nil || len(obs) != 0 {
-		t.Fatalf("obs=%v err=%v, want silence", obs, err)
+	if err != nil || len(obs) != 1 || !obs[0].Hold {
+		t.Fatalf("obs=%v err=%v, want one held observation", obs, err)
 	}
 }
 
@@ -858,7 +858,7 @@ func TestLogErrorSpike_FileThresholdAndBaseline(t *testing.T) {
 		return obs
 	}
 
-	if obs := run(); len(obs) != 0 { // first read only records the file size
+	if obs := run(); len(obs) != 1 || !obs[0].Hold { // first read only records the file size
 		t.Fatalf("warm-up produced %+v", obs)
 	}
 	// Quiet baseline (2 errors/min = ~10 per 5m) for 16 minutes: no verdicts
@@ -867,6 +867,9 @@ func TestLogErrorSpike_FileThresholdAndBaseline(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		write(2, 20)
 		for _, o := range run() {
+			if o.Hold {
+				continue
+			}
 			sawVerdict = true
 			if o.Failing {
 				t.Fatalf("baseline traffic fired: %+v", o)

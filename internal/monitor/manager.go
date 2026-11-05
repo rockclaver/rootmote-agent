@@ -3,7 +3,9 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -251,12 +253,56 @@ func (m *Manager) Evaluate(ctx context.Context) {
 	for _, ev := range m.evaluators {
 		obs, err := ev.Evaluate(ctx)
 		if err != nil {
-			m.logf("monitor: evaluate %s: %v", ev.Kind(), err)
+			if !errors.Is(err, ErrSourceUnavailable) {
+				m.logf("monitor: evaluate %s: %v", ev.Kind(), err)
+			}
 			continue
 		}
+		reported := make(map[string]bool, len(obs))
 		for _, o := range obs {
+			reported[o.Target] = true
+			if o.Hold {
+				continue
+			}
 			m.process(ctx, ev.Kind(), o)
 		}
+		m.retireAbsent(ctx, ev.Kind(), reported)
+	}
+}
+
+// retireAbsent closes episodes whose target the evaluator no longer reports
+// at all: a removed container, a deleted unit, a oneshot unit that is no
+// longer monitored, a monitor whose definition went away. Nothing will ever
+// observe those targets again, so without this their state -- and the
+// relay incident behind it -- would stay firing forever.
+//
+// Absence counts as a healthy reading, so the usual recovery threshold
+// still applies: a container recreated under the same name within a couple
+// of ticks simply carries on its episode instead of flapping.
+func (m *Manager) retireAbsent(ctx context.Context, kind Kind, reported map[string]bool) {
+	prefix := string(kind) + ":"
+	var gone []string
+	m.mu.Lock()
+	for k, rt := range m.states {
+		if !strings.HasPrefix(k, prefix) || !State(rt.State).inEpisode() {
+			continue
+		}
+		if target := strings.TrimPrefix(k, prefix); !reported[target] {
+			gone = append(gone, target)
+		}
+	}
+	m.mu.Unlock()
+	sort.Strings(gone)
+	for _, target := range gone {
+		label := target
+		if label == "" {
+			label = string(kind)
+		}
+		m.process(ctx, kind, Observation{
+			Target:     target,
+			Summary:    fmt.Sprintf("%s is no longer reported; closing its alert", label),
+			Attributes: map[string]string{AttrReason: ReasonTargetGone},
+		})
 	}
 }
 
