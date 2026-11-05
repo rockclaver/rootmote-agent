@@ -122,6 +122,11 @@ func DefaultDefinitions() []Definition {
 			Kind: KindDiskCapacity, Target: "/", Enabled: true, Severity: "critical", EvaluationLocation: "agent",
 			FailureThreshold: 3, RecoveryThreshold: 3, CooldownSeconds: 300, FiringThreshold: 90, RecoveryValue: 85,
 		},
+		// Every other mounted filesystem uses the same thresholds as "/".
+		{
+			Kind: KindDiskCapacity, Target: wildcardTarget, Enabled: true, Severity: "critical", EvaluationLocation: "agent",
+			FailureThreshold: 3, RecoveryThreshold: 3, CooldownSeconds: 300, FiringThreshold: 90, RecoveryValue: 85,
+		},
 		{
 			Kind: KindInodeCapacity, Target: "/", Enabled: true, Severity: "warning", EvaluationLocation: "agent",
 			FailureThreshold: 3, RecoveryThreshold: 3, CooldownSeconds: 300, FiringThreshold: 90, RecoveryValue: 85,

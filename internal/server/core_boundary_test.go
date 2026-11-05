@@ -64,8 +64,15 @@ func TestRetiredRoutesAreUnknownAndCoreReviewRemainsAvailable(t *testing.T) {
 		"project.create", "session.start", "skills.list", "github.repo_list", "action.submit", "preview.start",
 		"docker.container.list", "infra.metrics.subscribe", "infra.service.action", "infra.webserver.list",
 		"infra.process.kill", "infra.firewall.rule_add", "storage.delete", "security.ai_fix", "infra.snapshot",
-		"infra.proposal.create", "infra.proposal.list", "infra.proposal.get",
 	} {
+		retired := coreRoundTrip(t, url, "core-key", Frame{ID: kind, Kind: kind})
+		if retired.Kind != "error.unknown_kind" {
+			t.Fatalf("retired %s response = %q", kind, retired.Kind)
+		}
+	}
+	// The old approval queue and automatic runbook kinds are gone too.
+	for _, name := range []string{"runbook.list", "runbook.get", "proposal.approve", "proposal.decline"} {
+		kind := "infra." + name
 		retired := coreRoundTrip(t, url, "core-key", Frame{ID: kind, Kind: kind})
 		if retired.Kind != "error.unknown_kind" {
 			t.Fatalf("retired %s response = %q", kind, retired.Kind)

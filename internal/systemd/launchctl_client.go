@@ -104,10 +104,6 @@ func (c *LaunchctlClient) Action(ctx context.Context, name string, action Action
 	return nil
 }
 
-func (c *LaunchctlClient) Reboot(context.Context) error {
-	return errors.New("launchctl: reboot is not supported by this agent")
-}
-
 func (c *LaunchctlClient) domain() string {
 	uid := c.UID
 	if uid == "" {

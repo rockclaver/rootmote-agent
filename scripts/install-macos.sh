@@ -2,8 +2,8 @@
 # Rootmote macOS agent installer.
 #
 # Installs the agent as a per-user launchd LaunchAgent. Do not run this script
-# with sudo: Claude, Codex, GitHub CLI auth, transcripts, and installed skills
-# should live under the same macOS account that Rootmote reaches over SSH.
+# with sudo: the agent's data and logs should live under the same macOS account
+# that Rootmote reaches over SSH.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/main/scripts/install-macos.sh | bash

@@ -68,29 +68,40 @@ echo "[deploy] building linux/$ARCH from $ROOT"
 (cd "$ROOT" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -o "$BIN" ./cmd/rootmote-agent)
 
 SERVICE_SRC="$ROOT/systemd/rootmote-agent.service"
-SUDOERS_SRC="$ROOT/systemd/rootmote-agent-firewall.sudoers"
+SUDOERS_SRC="$ROOT/systemd/rootmote-agent.sudoers"
 TMPFILES_SRC="$ROOT/systemd/rootmote-agent-sudo.tmpfiles.conf"
 
-echo "[deploy] copying binary + systemd/sudoers/tmpfiles fragments to $TARGET:/tmp"
-scp -q "$BIN" "$SERVICE_SRC" "$SUDOERS_SRC" "$TMPFILES_SRC" "$TARGET:/tmp/"
+# Stage the files in a private directory (mktemp -d is mode 0700 and owned by
+# the SSH user) so no other local user can swap a file before the root-run
+# `install` copies it.
+STAGE="$(ssh "$TARGET" 'mktemp -d')"
+case "$STAGE" in
+  /*) ;;
+  *) echo "could not create a staging directory on $TARGET" >&2; exit 1 ;;
+esac
+
+echo "[deploy] copying binary + systemd/sudoers/tmpfiles fragments to $TARGET:$STAGE"
+scp -q "$BIN" "$SERVICE_SRC" "$SUDOERS_SRC" "$TMPFILES_SRC" "$TARGET:$STAGE/"
 
 echo "[deploy] installing binary + config fragments on $TARGET"
 ssh "$TARGET" "
   set -euo pipefail
-  $SUDO install -m 0755 /tmp/rootmote-agent /usr/local/bin/rootmote-agent
-  $SUDO install -m 0644 /tmp/rootmote-agent.service /etc/systemd/system/rootmote-agent.service
-  $SUDO install -m 0644 /tmp/rootmote-agent-sudo.tmpfiles.conf /etc/tmpfiles.d/rootmote-agent-sudo.conf
-  $SUDO systemd-tmpfiles --create /etc/tmpfiles.d/rootmote-agent-sudo.conf
-  $SUDO install -m 0440 /tmp/rootmote-agent-firewall.sudoers /etc/sudoers.d/rootmote-agent-firewall.new
-  if $SUDO visudo -c -f /etc/sudoers.d/rootmote-agent-firewall.new >/dev/null; then
-    $SUDO mv /etc/sudoers.d/rootmote-agent-firewall.new /etc/sudoers.d/rootmote-agent-firewall
-  else
-    echo 'warning: rootmote-agent-firewall sudoers fragment failed visudo check; leaving previous fragment in place' >&2
-    $SUDO rm -f /etc/sudoers.d/rootmote-agent-firewall.new
+  trap 'rm -rf \"$STAGE\"' EXIT
+  # Check the sudo rule first. If it is broken, change nothing.
+  $SUDO install -m 0440 \"$STAGE/rootmote-agent.sudoers\" /etc/sudoers.d/rootmote-agent.new
+  if ! $SUDO visudo -c -f /etc/sudoers.d/rootmote-agent.new >/dev/null; then
+    $SUDO rm -f /etc/sudoers.d/rootmote-agent.new
+    echo 'rootmote-agent sudoers rule failed visudo check; nothing was installed' >&2
+    exit 1
   fi
+  $SUDO install -m 0755 \"$STAGE/rootmote-agent\" /usr/local/bin/rootmote-agent
+  $SUDO install -m 0644 \"$STAGE/rootmote-agent.service\" /etc/systemd/system/rootmote-agent.service
+  $SUDO install -m 0644 \"$STAGE/rootmote-agent-sudo.tmpfiles.conf\" /etc/tmpfiles.d/rootmote-agent-sudo.conf
+  $SUDO systemd-tmpfiles --create /etc/tmpfiles.d/rootmote-agent-sudo.conf
+  $SUDO mv /etc/sudoers.d/rootmote-agent.new /etc/sudoers.d/rootmote-agent
+  $SUDO rm -f /etc/sudoers.d/rootmote-agent-firewall
   $SUDO systemctl daemon-reload
   $SUDO systemctl restart rootmote-agent
-  rm -f /tmp/rootmote-agent /tmp/rootmote-agent.service /tmp/rootmote-agent-firewall.sudoers /tmp/rootmote-agent-sudo.tmpfiles.conf
 "
 
 echo "[deploy] installed version on $TARGET:"

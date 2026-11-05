@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "name": "private_key",
+      "kind": "regex",
+      "pattern": "(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
+      "replacement": "[REDACTED:private_key]"
+    },
+    {
+      "name": "jwt",
+      "kind": "regex",
+      "pattern": "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]*",
+      "replacement": "[REDACTED:jwt]"
+    },
+    {
+      "name": "auth_header",
+      "kind": "regex",
+      "pattern": "(?im)^([ \\t]*(?:Proxy-)?Authorization[ \\t]*:[ \\t]*)[^\\r\\n]+$",
+      "replacement": "${1}[REDACTED:secret]"
+    },
+    {
+      "name": "bearer_token",
+      "kind": "regex",
+      "pattern": "(?i)\\b(Bearer|Basic)[ \\t]+[A-Za-z0-9._~+/=-]{8,}",
+      "replacement": "${1} [REDACTED:bearer]"
+    },
+    {
+      "name": "cookie",
+      "kind": "regex",
+      "pattern": "(?im)^([ \\t]*(?:Set-Cookie|Cookie)[ \\t]*:[ \\t]*)[^\\r\\n]+$",
+      "replacement": "${1}[REDACTED:cookie]"
+    },
+    {
+      "name": "database_url",
+      "kind": "regex",
+      "pattern": "(?i)\\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\\+srv)?|rediss?|amqps?)://)[^\\s/@]+@",
+      "replacement": "${1}[REDACTED:credentials]@"
+    },
+    {
+      "name": "url_credentials",
+      "kind": "regex",
+      "pattern": "(?i)\\b([a-z][a-z0-9+.-]{1,15}://)[^\\s/@:]+:[^\\s/@]+@",
+      "replacement": "${1}[REDACTED:credentials]@"
+    },
+    {
+      "name": "aws_access_key",
+      "kind": "regex",
+      "pattern": "\\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA)[0-9A-Z]{16}\\b",
+      "replacement": "[REDACTED:aws_key]"
+    },
+    {
+      "name": "gcp_api_key",
+      "kind": "regex",
+      "pattern": "\\bAIza[0-9A-Za-z_-]{35}\\b",
+      "replacement": "[REDACTED:gcp_key]"
+    },
+    {
+      "name": "gcp_oauth_token",
+      "kind": "regex",
+      "pattern": "\\bya29\\.[0-9A-Za-z_-]{20,}",
+      "replacement": "[REDACTED:gcp_token]"
+    },
+    {
+      "name": "stripe_paystack_key",
+      "kind": "regex",
+      "pattern": "\\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{10,}|\\bwhsec_[0-9A-Za-z]{16,}",
+      "replacement": "[REDACTED:payment_key]"
+    },
+    {
+      "name": "flutterwave_key",
+      "kind": "regex",
+      "pattern": "\\bFLW(?:SECK|PUBK)(?:_TEST)?[-_][0-9A-Za-z_-]{8,}",
+      "replacement": "[REDACTED:payment_key]"
+    },
+    {
+      "name": "provider_api_key",
+      "kind": "regex",
+      "pattern": "sk-ant-[A-Za-z0-9_-]{10,}|\\bsk-[A-Za-z0-9_-]{16,}|\\boauth_[A-Za-z0-9_-]+|\\bgithub_pat_[A-Za-z0-9_-]+|\\bgh[pousr]_[A-Za-z0-9_-]{16,}|\\bxox[baprs]-[A-Za-z0-9_-]+|\\bnpm_[A-Za-z0-9]{20,}",
+      "replacement": "[REDACTED:api_key]"
+    },
+    {
+      "name": "uuid_hex_secret",
+      "kind": "regex",
+      "pattern": "(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[-_.:]?[0-9a-f]{8,}|[0-9a-f]{8,}[-_.:]?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+      "replacement": "[REDACTED:secret]"
+    },
+    {
+      "name": "hex_secret",
+      "kind": "regex",
+      "pattern": "(?i)[0-9a-f]{32,}",
+      "replacement": "[REDACTED:secret]"
+    },
+    {
+      "name": "env_value",
+      "kind": "regex",
+      "pattern": "(?im)^([ \\t]*[\\w.-]*(?:pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth)[\\w.-]*[ \\t]*[:=][ \\t]*)[^\\r\\n]+$",
+      "replacement": "${1}[REDACTED:secret]"
+    },
+    {
+      "name": "secret_assignment",
+      "kind": "regex",
+      "pattern": "(?i)\\b([\\w.-]*(?:pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth)[\\w.-]*[\\\"']?[ \\t]*[:=][ \\t]*[\\\"']?)[^\\s\\\"',;&]+",
+      "replacement": "${1}[REDACTED:secret]"
+    },
+    {
+      "name": "key_assignment",
+      "kind": "regex",
+      "pattern": "(?i)\\b((?:[\\w.-]*[-_.])?(?:api[-_]?key|key|sig|signature|code|session(?:[-_]?id)?|sid|auth)(?:[-_.][\\w.-]*)?[\\\"']?[ \\t]*[:=][ \\t]*[\\\"']?)[^\\s\\\"',;&]{8,}",
+      "replacement": "${1}[REDACTED:secret]"
+    },
+    {
+      "name": "email",
+      "kind": "regex",
+      "pattern": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,}\\b",
+      "replacement": "[REDACTED:email]"
+    },
+    {
+      "name": "ipv4",
+      "kind": "regex",
+      "pattern": "\\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\b",
+      "replacement": "[REDACTED:ip]"
+    },
+    {
+      "name": "ipv6",
+      "kind": "regex",
+      "pattern": "(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}(?::[0-9a-f]{1,4}){1,6}\\b",
+      "replacement": "[REDACTED:ip]"
+    },
+    {
+      "name": "ipv6_leading",
+      "kind": "regex",
+      "pattern": "(?i)(^|[^0-9a-z:])(::(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4})\\b",
+      "replacement": "${1}[REDACTED:ip]"
+    },
+    {
+      "name": "high_entropy",
+      "kind": "entropy",
+      "minLength": 32,
+      "minBitsPerChar": 4.0,
+      "replacement": "[REDACTED:secret]",
+      "hexMinLength": 32,
+      "hexMinBitsPerChar": 3.0
+    }
+  ]
+}

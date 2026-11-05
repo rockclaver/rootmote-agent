@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -20,21 +21,16 @@ func defaultRunner(ctx context.Context, name string, args ...string) ([]byte, er
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-// UFWBackend wraps the `ufw` CLI. When Sudo is true, commands are run via
-// `sudo -n ufw …` so the unprivileged agent user can call into a binary
-// that requires root. The packaged install ships a /etc/sudoers.d
-// fragment granting passwordless NOPASSWD access to ufw and firewall-cmd.
+// UFWBackend wraps the `ufw` CLI. It must run as root: the agent only uses
+// it inside the privilege helper (`rootmote-agent priv`).
 type UFWBackend struct {
 	Run     runner
 	LookBin func(string) (string, error)
-	Sudo    bool
 }
 
-// NewUFWBackend returns a ufw Backend using exec.CommandContext. Sudo is
-// auto-enabled when the agent is not running as root, matching the
-// packaged install where the agent runs as `rootmote`.
+// NewUFWBackend returns a ufw Backend using exec.CommandContext.
 func NewUFWBackend() *UFWBackend {
-	return &UFWBackend{Run: defaultRunner, LookBin: exec.LookPath, Sudo: needsSudo()}
+	return &UFWBackend{Run: defaultRunner, LookBin: exec.LookPath}
 }
 
 func (u *UFWBackend) Kind() BackendKind { return BackendUFW }
@@ -44,12 +40,7 @@ func (u *UFWBackend) run(ctx context.Context, args ...string) ([]byte, error) {
 	if run == nil {
 		run = defaultRunner
 	}
-	name := "ufw"
-	if u.Sudo {
-		name = "sudo"
-		args = append([]string{"-n", "ufw"}, args...)
-	}
-	return run(ctx, name, args...)
+	return run(ctx, "ufw", args...)
 }
 
 func (u *UFWBackend) Available(ctx context.Context) error {
@@ -59,11 +50,6 @@ func (u *UFWBackend) Available(ctx context.Context) error {
 	}
 	if _, err := lookup("ufw"); err != nil {
 		return fmt.Errorf("ufw not installed: %w", err)
-	}
-	if u.Sudo {
-		if _, err := lookup("sudo"); err != nil {
-			return fmt.Errorf("sudo required to manage ufw as non-root: %w", err)
-		}
 	}
 	if _, err := u.run(ctx, "status"); err != nil {
 		return fmt.Errorf("ufw status: %w", err)
@@ -155,21 +141,18 @@ func splitPortProto(tok string) (int, Protocol, bool) {
 	return port, proto, true
 }
 
-// FirewalldBackend wraps the `firewall-cmd` CLI. When Sudo is true,
-// commands are run via `sudo -n firewall-cmd …`.
+// FirewalldBackend wraps the `firewall-cmd` CLI. It must run as root (see
+// UFWBackend).
 type FirewalldBackend struct {
 	Run     runner
 	LookBin func(string) (string, error)
-	Sudo    bool
 	// Zone is the firewalld zone the agent operates in; defaults to "public".
 	Zone string
 }
 
-// NewFirewalldBackend returns a firewalld Backend using
-// exec.CommandContext. Sudo is auto-enabled when the agent is not
-// running as root.
+// NewFirewalldBackend returns a firewalld Backend using exec.CommandContext.
 func NewFirewalldBackend() *FirewalldBackend {
-	return &FirewalldBackend{Run: defaultRunner, LookBin: exec.LookPath, Sudo: needsSudo()}
+	return &FirewalldBackend{Run: defaultRunner, LookBin: exec.LookPath}
 }
 
 func (f *FirewalldBackend) Kind() BackendKind { return BackendFirewalld }
@@ -186,12 +169,7 @@ func (f *FirewalldBackend) run(ctx context.Context, args ...string) ([]byte, err
 	if run == nil {
 		run = defaultRunner
 	}
-	name := "firewall-cmd"
-	if f.Sudo {
-		name = "sudo"
-		args = append([]string{"-n", "firewall-cmd"}, args...)
-	}
-	return run(ctx, name, args...)
+	return run(ctx, "firewall-cmd", args...)
 }
 
 func (f *FirewalldBackend) Available(ctx context.Context) error {
@@ -201,11 +179,6 @@ func (f *FirewalldBackend) Available(ctx context.Context) error {
 	}
 	if _, err := lookup("firewall-cmd"); err != nil {
 		return fmt.Errorf("firewall-cmd not installed: %w", err)
-	}
-	if f.Sudo {
-		if _, err := lookup("sudo"); err != nil {
-			return fmt.Errorf("sudo required to manage firewalld as non-root: %w", err)
-		}
 	}
 	out, err := f.run(ctx, "--state")
 	if err != nil {
@@ -244,10 +217,15 @@ func (f *FirewalldBackend) Add(ctx context.Context, r Rule) error {
 		proto = "tcp"
 	}
 	port := fmt.Sprintf("%d/%s", r.Port, proto)
-	if _, err := f.run(ctx, "--zone="+f.zone(), "--add-port="+port, "--permanent"); err != nil {
+	// Change the running rules and the saved rules one at a time. A reload
+	// would throw away runtime-only rules, such as the one that keeps SSH
+	// reachable on a custom port.
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--add-port="+port); err != nil {
 		return fmt.Errorf("firewalld add-port: %w", err)
 	}
-	_, _ = f.run(ctx, "--reload")
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--add-port="+port, "--permanent"); err != nil {
+		return fmt.Errorf("firewalld add-port --permanent: %w", err)
+	}
 	return nil
 }
 
@@ -257,19 +235,13 @@ func (f *FirewalldBackend) Remove(ctx context.Context, r Rule) error {
 		proto = "tcp"
 	}
 	port := fmt.Sprintf("%d/%s", r.Port, proto)
-	if _, err := f.run(ctx, "--zone="+f.zone(), "--remove-port="+port, "--permanent"); err != nil {
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--remove-port="+port); err != nil {
 		return fmt.Errorf("firewalld remove-port: %w", err)
 	}
-	_, _ = f.run(ctx, "--reload")
+	if _, err := f.run(ctx, "--zone="+f.zone(), "--remove-port="+port, "--permanent"); err != nil {
+		return fmt.Errorf("firewalld remove-port --permanent: %w", err)
+	}
 	return nil
-}
-
-// needsSudo returns true when the current process is not running as
-// root. The packaged install runs the agent as `rootmote`, and ufw /
-// firewall-cmd require root, so we wrap with `sudo -n` via a
-// /etc/sudoers.d fragment shipped by the installer.
-func needsSudo() bool {
-	return os.Geteuid() != 0
 }
 
 // SSCommandReader is a SocketReader backed by `ss -tulnp`.
@@ -538,8 +510,14 @@ func parseDarwinNetstatProcess(fields []string) (string, int) {
 	return "", 0
 }
 
+// isSSHProcess reports whether a process name belongs to the SSH server.
+// OpenSSH 9.8 and later hand every connection to sshd-session.
+func isSSHProcess(name string) bool {
+	return name == "sshd" || name == "sshd-session" || name == "sshd-auth"
+}
+
 // SSHFromSockets resolves SSH ports by inspecting listening sockets whose
-// owning process name is "sshd". Falls back to 22 only if the reader
+// owning process is the SSH server. Falls back to 22 only if the reader
 // returned no sockets at all.
 type SSHFromSockets struct {
 	Reader SocketReader
@@ -556,7 +534,7 @@ func (s SSHFromSockets) SSHPorts(ctx context.Context) []int {
 	seen := map[int]bool{}
 	var out []int
 	for _, sock := range sockets {
-		if sock.Process == "sshd" {
+		if isSSHProcess(sock.Process) {
 			if !seen[sock.Port] {
 				seen[sock.Port] = true
 				out = append(out, sock.Port)
@@ -567,4 +545,149 @@ func (s SSHFromSockets) SSHPorts(ctx context.Context) []int {
 		return []int{22}
 	}
 	return out
+}
+
+// SSHFromHost resolves every SSH port that must never be closed: ports where
+// sshd listens, ports of socket-activated ssh (ssh.socket, where systemd owns
+// the listener), local ports of live SSH connections (the port the agent was
+// reached on), and Port lines from sshd_config. It falls back to 22 when none
+// of those say anything. It needs root to see process names, so it is used by
+// the privilege helper.
+type SSHFromHost struct {
+	Reader   SocketReader
+	ReadFile func(string) ([]byte, error)
+	ReadDir  func(string) ([]os.DirEntry, error)
+	// Established lists live SSH connections; nil uses `ss`.
+	Established func(ctx context.Context) []Socket
+	// Activated lists the ports of ssh.socket and sshd.socket; nil asks systemd.
+	Activated func(ctx context.Context) []int
+}
+
+func (s SSHFromHost) SSHPorts(ctx context.Context) []int {
+	seen := map[int]bool{}
+	var out []int
+	add := func(p int) {
+		if p > 0 && p <= 65535 && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	if s.Reader != nil {
+		if socks, err := s.Reader.Listening(ctx); err == nil {
+			for _, sock := range socks {
+				if isSSHProcess(sock.Process) {
+					add(sock.Port)
+				}
+			}
+		}
+	}
+	act := s.Activated
+	if act == nil {
+		act = activatedSSHPorts
+	}
+	for _, p := range act(ctx) {
+		add(p)
+	}
+	est := s.Established
+	if est == nil {
+		est = establishedSSHD
+	}
+	for _, sock := range est(ctx) {
+		add(sock.Port)
+	}
+	for _, p := range sshdConfigPorts(s.ReadFile, s.ReadDir) {
+		add(p)
+	}
+	if len(out) == 0 {
+		return []int{22}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// activatedSSHPorts reads the listen ports of the ssh socket units.
+func activatedSSHPorts(ctx context.Context) []int {
+	raw, err := defaultRunner(ctx, "systemctl", "show", "--property=Listen", "ssh.socket", "sshd.socket")
+	if err != nil {
+		return nil
+	}
+	return parseListenPorts(string(raw))
+}
+
+// parseListenPorts reads `Listen=[::]:22 (Stream)` lines from systemctl show.
+func parseListenPorts(raw string) []int {
+	var ports []int
+	for _, line := range strings.Split(raw, "\n") {
+		v, ok := strings.CutPrefix(strings.TrimSpace(line), "Listen=")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(v)
+		if len(f) == 0 || strings.HasPrefix(f[0], "/") {
+			continue
+		}
+		if _, port, ok := splitAddrPort(f[0]); ok {
+			ports = append(ports, port)
+		}
+	}
+	return ports
+}
+
+// establishedSSHD lists the local ports of sshd's established connections.
+func establishedSSHD(ctx context.Context) []Socket {
+	raw, err := defaultRunner(ctx, "ss", "-tnpH", "state", "established")
+	if err != nil {
+		return nil
+	}
+	var out []Socket
+	sc := bufio.NewScanner(strings.NewReader(string(raw)))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		// Recv-Q Send-Q Local Peer Process
+		if len(f) < 5 {
+			continue
+		}
+		_, port, ok := splitAddrPort(f[2])
+		if !ok {
+			continue
+		}
+		if name, _ := parseSSProcess(f[len(f)-1]); isSSHProcess(name) {
+			out = append(out, Socket{Protocol: ProtoTCP, Port: port, Process: name})
+		}
+	}
+	return out
+}
+
+// sshdConfigPorts reads Port lines from sshd_config and its include dir.
+func sshdConfigPorts(readFile func(string) ([]byte, error), readDir func(string) ([]os.DirEntry, error)) []int {
+	if readFile == nil {
+		return nil
+	}
+	files := []string{"/etc/ssh/sshd_config"}
+	if readDir != nil {
+		if entries, err := readDir("/etc/ssh/sshd_config.d"); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".conf") {
+					files = append(files, "/etc/ssh/sshd_config.d/"+e.Name())
+				}
+			}
+		}
+	}
+	var ports []int
+	for _, f := range files {
+		raw, err := readFile(f)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(strings.NewReader(string(raw)))
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) >= 2 && strings.EqualFold(fields[0], "Port") {
+				if p, err := strconv.Atoi(fields[1]); err == nil {
+					ports = append(ports, p)
+				}
+			}
+		}
+	}
+	return ports
 }

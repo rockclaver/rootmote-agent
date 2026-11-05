@@ -1,145 +1,183 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Rootmote VPS agent installer.
 #
-# Idempotent. Designed to be invoked over SSH by the mobile app as:
-#     curl -fsSL https://.../install.sh | sudo bash
-# or pin to a specific version:
-#     curl -fsSL https://.../install.sh | sudo bash -s -- --version 0.1.2
+# Idempotent. The mobile app runs it over SSH, pinned to one release:
+#     curl -fsSL https://raw.githubusercontent.com/rockclaver/rootmote-agent/<tag>/scripts/install.sh \
+#       | sudo ROOTMOTE_AGENT_VERSION=<tag> sh
+#
+# ROOTMOTE_AGENT_VERSION is required and must be a release tag such as v0.2.0.
+# Every file is downloaded from that release and checked against the release's
+# SHA256SUMS before it is installed. A mismatch stops the install.
+#
+# ROOTMOTE_AGENT_BASE_URL replaces the download directory (default
+# https://github.com/rockclaver/rootmote-agent/releases/download/<tag>). It is
+# meant for local testing: it must serve the release files and SHA256SUMS.
 #
 # Steps:
-#   1. Ensure a `rootmote` system user exists.
-#   2. Download the agent binary for the host arch.
-#   3. Install the systemd unit.
+#   1. Check the version tag, then download and verify the release files.
+#   2. Ensure a `rootmote` system user exists.
+#   3. Install the binary and the systemd unit.
 #   4. Retire any legacy claver-agent unit and kill whatever still holds the
 #      agent port (7676), so the new service can bind.
 #   5. Enable + start the service.
-#   6. Print the installed version to stdout (Phase 1 acceptance criterion).
+#   6. Print the installed version to stdout.
 
-set -euo pipefail
+set -eu
 
-VERSION="${VERSION:-latest}"
-RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/rootmote-agent/releases/download}"
-RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/rootmote-agent/releases/latest}"
 BIN_DST="/usr/local/bin/rootmote-agent"
 UNIT_DST="/etc/systemd/system/rootmote-agent.service"
 STATE_DIR="/var/lib/rootmote"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --version) VERSION="$2"; shift 2 ;;
-    --release-base) RELEASE_BASE="$2"; shift 2 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
-  esac
-done
-
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "install.sh must run as root (use sudo)" >&2
+die() {
+  echo "$*" >&2
   exit 1
-fi
+}
 
-if [[ "$VERSION" == "latest" ]]; then
-  echo "resolving latest rootmote-agent release" >&2
-  # Follow the /releases/latest redirect to find the current tag without
-  # hitting the rate-limited GitHub API.
-  resolved="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$RELEASES_LATEST_URL" || true)"
-  VERSION="${resolved##*/tag/v}"
-  if [[ -z "$VERSION" || "$VERSION" == "$resolved" ]]; then
-    echo "failed to resolve latest release from $RELEASES_LATEST_URL" >&2
-    echo "pass --version X.Y.Z to pin a specific release" >&2
-    exit 1
+VERSION="${ROOTMOTE_AGENT_VERSION:-}"
+# The value must be exactly one tag like v0.2.0. The checks below look at the
+# whole string (not line by line), so a value with a newline cannot slip by.
+case "$VERSION" in
+  v*.*.*) ;;
+  *) die "ROOTMOTE_AGENT_VERSION must be a release tag like v0.2.0." ;;
+esac
+case "${VERSION#v}" in
+  ""|*[!0-9.]*|.*|*.|*..*|*.*.*.*) die "ROOTMOTE_AGENT_VERSION must be a release tag like v0.2.0." ;;
+esac
+
+BASE_URL="${ROOTMOTE_AGENT_BASE_URL:-https://github.com/rockclaver/rootmote-agent/releases/download/${VERSION}}"
+BASE_URL="${BASE_URL%/}"
+
+# sha256_of prints the SHA-256 of a file using whichever tool the host has.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "Cannot check downloads: neither sha256sum nor shasum is installed."
   fi
-  echo "latest release: v${VERSION}" >&2
-fi
+}
+
+# verify_file NAME PATH checks PATH against the SHA256SUMS entry for NAME.
+# A missing entry or a different hash stops the whole install.
+verify_file() {
+  name="$1"
+  path="$2"
+  expected="$(awk -v f="$name" '$2 == f || $2 == "*" f { print $1; exit }' "$TMP/SHA256SUMS")"
+  if [ -z "$expected" ]; then
+    die "Checksum mismatch for ${name}: refusing to install."
+  fi
+  actual="$(sha256_of "$path")"
+  if [ "$actual" != "$expected" ]; then
+    die "Checksum mismatch for ${name}: refusing to install."
+  fi
+}
+
+# fetch NAME DEST downloads NAME from the release into DEST and verifies it.
+# Returns 1 when the download itself fails; a checksum mismatch exits.
+fetch() {
+  name="$1"
+  dest="$2"
+  if ! curl -fsSL "${BASE_URL}/${name}" -o "$dest"; then
+    return 1
+  fi
+  verify_file "$name" "$dest"
+}
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"; [ -z "${SUDOERS_DST:-}" ] || rm -f "$SUDOERS_DST.new"' EXIT
 
 arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) arch=amd64 ;;
   aarch64|arm64) arch=arm64 ;;
-  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+  *) die "unsupported arch: $arch" ;;
 esac
+
+echo "downloading ${BASE_URL}/SHA256SUMS" >&2
+if ! curl -fsSL "${BASE_URL}/SHA256SUMS" -o "$TMP/SHA256SUMS"; then
+  die "failed to download SHA256SUMS for rootmote-agent ${VERSION}; refusing to install."
+fi
+
+BIN_NAME="rootmote-agent-linux-${arch}"
+echo "downloading ${BASE_URL}/${BIN_NAME}" >&2
+if ! fetch "$BIN_NAME" "$TMP/rootmote-agent"; then
+  die "failed to download rootmote-agent ${VERSION} for linux-${arch} (${BASE_URL}/${BIN_NAME})"
+fi
+chmod 0755 "$TMP/rootmote-agent"
+
+if ! fetch rootmote-agent.service "$TMP/rootmote-agent.service"; then
+  die "failed to download the rootmote-agent systemd unit (${BASE_URL}/rootmote-agent.service)"
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  die "install.sh must run as root (use sudo)"
+fi
+
+# Install the sudoers rule so the agent (running as `rootmote`) can call the
+# privilege helper through `sudo -n`. Check it before anything else changes:
+# a broken or missing rule stops the install and leaves the running agent
+# alone. visudo --check also makes sure we never lay down a file that could
+# lock out sudo entirely.
+SUDOERS_DST="/etc/sudoers.d/rootmote-agent"
+if ! fetch rootmote-agent.sudoers "$TMP/rootmote-agent.sudoers"; then
+  die "failed to download the rootmote-agent sudo rule (${BASE_URL}/rootmote-agent.sudoers). Nothing was installed and the current agent was left running."
+fi
+install -m 0440 "$TMP/rootmote-agent.sudoers" "$SUDOERS_DST.new"
+if ! visudo -c -f "$SUDOERS_DST.new" >/dev/null 2>&1; then
+  rm -f "$SUDOERS_DST.new"
+  die "The rootmote-agent sudo rule did not pass visudo, so nothing was installed. The current agent was left running."
+fi
 
 if ! id rootmote >/dev/null 2>&1; then
   useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin rootmote
 fi
+
+# The agent reads and restarts Docker containers through the Docker socket
+# (monitoring, discovery, container.restart, disk.docker_prune), which only
+# root and the `docker` group may open. Add `rootmote` to that group when it
+# exists. Docker group access is equal to root on the host; this is the one
+# deliberate widening besides the sudoers rule, and only on servers that run
+# Docker. Re-running the installer after Docker is installed adds it then.
+if getent group docker >/dev/null 2>&1; then
+  usermod -aG docker rootmote
+fi
+# Earlier versions also put `rootmote` in the `adm` group (it can read
+# /var/log/auth.log) and created .claude and .codex skill folders. Neither is
+# used any more: take the group away again and remove those folders when they
+# hold nothing (rmdir never deletes a folder that has files in it).
+if id -nG rootmote 2>/dev/null | tr ' ' '\n' | grep -qx adm; then
+  gpasswd -d rootmote adm >/dev/null
+fi
+rmdir "$STATE_DIR/.claude/skills" "$STATE_DIR/.claude" \
+  "$STATE_DIR/.codex/skills" "$STATE_DIR/.codex" 2>/dev/null || true
 install -d -o rootmote -g rootmote -m 0750 "$STATE_DIR"
-install -d -o rootmote -g rootmote -m 0700 \
-  "$STATE_DIR/.claude" \
-  "$STATE_DIR/.claude/skills" \
-  "$STATE_DIR/.codex" \
-  "$STATE_DIR/.codex/skills"
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+install -m 0755 "$TMP/rootmote-agent" "$BIN_DST"
+install -m 0644 "$TMP/rootmote-agent.service" "$UNIT_DST"
 
-url="${RELEASE_BASE}/v${VERSION}/rootmote-agent-linux-${arch}"
-echo "downloading $url" >&2
-if ! curl -fsSL "$url" -o "$tmp/rootmote-agent"; then
-  echo "failed to download rootmote-agent ${VERSION} for linux-${arch}" >&2
-  echo "expected release asset: $url" >&2
-  exit 1
-fi
-chmod 0755 "$tmp/rootmote-agent"
-install -m 0755 "$tmp/rootmote-agent" "$BIN_DST"
-
-# Install systemd unit. The unit file is expected next to this script when
-# invoked locally during development, or fetched from the release otherwise.
-if [[ -f "$(dirname "$0")/../systemd/rootmote-agent.service" ]]; then
-  install -m 0644 "$(dirname "$0")/../systemd/rootmote-agent.service" "$UNIT_DST"
-else
-  unit_url="${RELEASE_BASE}/v${VERSION}/rootmote-agent.service"
-  if ! curl -fsSL "$unit_url" -o "$UNIT_DST"; then
-    echo "failed to download rootmote-agent systemd unit" >&2
-    echo "expected release asset: $unit_url" >&2
-    exit 1
-  fi
-  chmod 0644 "$UNIT_DST"
-fi
-
-# Install the firewall sudoers fragment so the agent (running as `rootmote`)
-# can call ufw / firewall-cmd through `sudo -n`. visudo --check ensures we
-# do not lay down a broken file that could lock out sudo entirely.
-SUDOERS_SRC="$(dirname "$0")/../systemd/rootmote-agent-firewall.sudoers"
-SUDOERS_DST="/etc/sudoers.d/rootmote-agent-firewall"
-if [[ -f "$SUDOERS_SRC" ]]; then
-  install -m 0440 "$SUDOERS_SRC" "$SUDOERS_DST.new"
-  if visudo -c -f "$SUDOERS_DST.new" >/dev/null; then
-    mv "$SUDOERS_DST.new" "$SUDOERS_DST"
-  else
-    rm -f "$SUDOERS_DST.new"
-    echo "warning: rootmote-agent-firewall sudoers fragment failed visudo check; firewall management will be read-only" >&2
-  fi
-else
-  sudoers_url="${RELEASE_BASE}/v${VERSION}/rootmote-agent-firewall.sudoers"
-  if curl -fsSL "$sudoers_url" -o "$SUDOERS_DST.new"; then
-    chmod 0440 "$SUDOERS_DST.new"
-    if visudo -c -f "$SUDOERS_DST.new" >/dev/null; then
-      mv "$SUDOERS_DST.new" "$SUDOERS_DST"
-    else
-      rm -f "$SUDOERS_DST.new"
-      echo "warning: rootmote-agent-firewall sudoers fragment failed visudo check; firewall management will be read-only" >&2
-    fi
-  else
-    echo "warning: rootmote-agent-firewall sudoers fragment not found; firewall management will be read-only" >&2
-  fi
-fi
+# The sudoers rule was checked and staged above, before anything else was
+# changed. The file holds exactly one rule:
+#   rootmote ALL=(root) NOPASSWD: /usr/local/bin/rootmote-agent priv *
+# The helper validates every argument itself, as root.
+mv "$SUDOERS_DST.new" "$SUDOERS_DST"
+# Older versions installed broad sudo rules (ufw, firewall-cmd, kill, reboot,
+# storage-rm, ...). Remove them: the single rule above replaces all of them.
+rm -f /etc/sudoers.d/rootmote-agent-firewall
 
 # Install the /run/sudo tmpfiles fragment: sudo needs to create its own
 # timestamp directory there on every call (even with NOPASSWD), and
 # ProtectSystem=strict in the unit above makes /run read-only unless this
 # path is pre-created and listed in ReadWritePaths=. Apply it immediately
 # (not just at next boot) so an existing deployment doesn't need a reboot
-# for sudo-gated actions (firewall, reboot, storage cleanup) to start working.
-TMPFILES_SRC="$(dirname "$0")/../systemd/rootmote-agent-sudo.tmpfiles.conf"
+# for fixes that need root to start working.
 TMPFILES_DST="/etc/tmpfiles.d/rootmote-agent-sudo.conf"
-if [[ -f "$TMPFILES_SRC" ]]; then
-  install -m 0644 "$TMPFILES_SRC" "$TMPFILES_DST"
+if fetch rootmote-agent-sudo.tmpfiles.conf "$TMP/rootmote-agent-sudo.tmpfiles.conf"; then
+  install -m 0644 "$TMP/rootmote-agent-sudo.tmpfiles.conf" "$TMPFILES_DST"
 else
-  tmpfiles_url="${RELEASE_BASE}/v${VERSION}/rootmote-agent-sudo.tmpfiles.conf"
-  if ! curl -fsSL "$tmpfiles_url" -o "$TMPFILES_DST"; then
-    echo "warning: rootmote-agent-sudo tmpfiles fragment not found; sudo-gated actions (firewall, reboot, storage cleanup) may fail until /run/sudo is created" >&2
-  fi
+  echo "warning: rootmote-agent-sudo tmpfiles fragment not found; fixes that need root may fail until /run/sudo is created" >&2
 fi
-if [[ -f "$TMPFILES_DST" ]] && command -v systemd-tmpfiles >/dev/null 2>&1; then
+if [ -f "$TMPFILES_DST" ] && command -v systemd-tmpfiles >/dev/null 2>&1; then
   systemd-tmpfiles --create "$TMPFILES_DST"
 fi
 
@@ -149,15 +187,15 @@ fi
 # installed" loop the app shows). Retire the legacy unit for good, then clear
 # any remaining listener on the agent port before starting ours.
 AGENT_PORT="${AGENT_PORT:-7676}"
-if [[ -f /etc/systemd/system/claver-agent.service ]] || \
+if [ -f /etc/systemd/system/claver-agent.service ] || \
    systemctl cat claver-agent.service >/dev/null 2>&1; then
   echo "retiring legacy claver-agent.service" >&2
   systemctl disable --now claver-agent.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/claver-agent.service
 fi
-if [[ -d /var/lib/claver && ! -L /var/lib/claver ]]; then
-  echo "note: legacy agent state found at /var/lib/claver (pairing key, projects," >&2
-  echo "      CLI sign-ins). It was left untouched; to carry it over see" >&2
+if [ -d /var/lib/claver ] && [ ! -L /var/lib/claver ]; then
+  echo "note: legacy agent state found at /var/lib/claver (pairing key and" >&2
+  echo "      projects). It was left untouched; to carry it over see" >&2
   echo "      'Migrating from claver-agent' in the rootmote-agent README." >&2
 fi
 
@@ -173,7 +211,7 @@ list_port_pids() {
 }
 
 pids="$(list_port_pids "$AGENT_PORT" || true)"
-if [[ -n "$pids" ]]; then
+if [ -n "$pids" ]; then
   for pid in $pids; do
     comm="$(ps -o comm= -p "$pid" 2>/dev/null || echo '?')"
     echo "killing process $pid ($comm) holding 127.0.0.1:$AGENT_PORT" >&2
@@ -182,9 +220,9 @@ if [[ -n "$pids" ]]; then
   for _ in 1 2 3 4 5; do
     sleep 1
     pids="$(list_port_pids "$AGENT_PORT" || true)"
-    [[ -z "$pids" ]] && break
+    [ -z "$pids" ] && break
   done
-  if [[ -n "$pids" ]]; then
+  if [ -n "$pids" ]; then
     echo "escalating to SIGKILL for: $pids" >&2
     for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
   fi
@@ -200,19 +238,21 @@ systemctl restart rootmote-agent.service
 # Restart= policy retries the bind. Wait until the agent is actually up and
 # listening so the installer's verdict is definitive.
 agent_up=""
-for _ in $(seq 1 20); do
-  if [[ "$(systemctl is-active rootmote-agent.service 2>/dev/null)" == "active" ]] && \
-     [[ -n "$(list_port_pids "$AGENT_PORT")" ]]; then
+tries=0
+while [ "$tries" -lt 20 ]; do
+  if [ "$(systemctl is-active rootmote-agent.service 2>/dev/null)" = "active" ] && \
+     [ -n "$(list_port_pids "$AGENT_PORT")" ]; then
     agent_up=1
     break
   fi
+  tries=$((tries + 1))
   sleep 1
 done
-if [[ -z "$agent_up" ]]; then
+if [ -z "$agent_up" ]; then
   echo "error: rootmote-agent did not reach active+listening within 20s" >&2
   journalctl -u rootmote-agent -n 10 --no-pager >&2 || true
   exit 1
 fi
 
-# Phase 1 AC: print installed version to stdout.
+# Print the installed version to stdout.
 "$BIN_DST" --version

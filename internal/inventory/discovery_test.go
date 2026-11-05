@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -177,9 +178,9 @@ func TestDiscover_ReturnsEverySection(t *testing.T) {
 		},
 	}}
 
-	glob.matches["/etc/letsencrypt/live/*/fullchain.pem"] = []string{"/etc/letsencrypt/live/a.example/fullchain.pem"}
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
-	rf.files["/etc/letsencrypt/live/a.example/fullchain.pem"] = generateTestCert(t, "a.example", "Let's Encrypt", now.AddDate(0, 0, 42))
+	priv := newFakePriv()
+	priv.out["certs-list"] = `[{"name":"a.example","expiresAt":"` + now.AddDate(0, 0, 42).Format(time.RFC3339) + `"}]`
 
 	sample := infra.HostMetrics{
 		Memory: infra.MemoryMetric{TotalBytes: 8_000_000_000},
@@ -193,7 +194,7 @@ func TestDiscover_ReturnsEverySection(t *testing.T) {
 
 	d := NewDiscoverer(DiscoveryConfig{
 		Infra: fakeInfraSampler{sample: sample}, Docker: docker, Systemd: sysd, Webserver: web,
-		Run: run.run, ReadFile: rf.read, Glob: glob.glob, Now: func() time.Time { return now },
+		Run: run.run, ReadFile: rf.read, Glob: glob.glob, Priv: priv.run, Now: func() time.Time { return now },
 	})
 	report := d.Discover(context.Background())
 
@@ -441,16 +442,114 @@ func TestDiscover_InfersDatabasesFromDockerSystemdAndPorts(t *testing.T) {
 
 // --- TLS certificate expiry ---------------------------------------------
 
-func TestDiscover_ParsesTLSCertificateExpiry(t *testing.T) {
+// fakePriv scripts the privileged helper by "action arg1 arg2" key.
+type fakePriv struct {
+	out   map[string]string
+	errs  map[string]error
+	calls []string
+}
+
+func newFakePriv() *fakePriv {
+	return &fakePriv{out: map[string]string{}, errs: map[string]error{}}
+}
+
+func (f *fakePriv) run(_ context.Context, action string, args ...string) ([]byte, error) {
+	key := strings.TrimSpace(action + " " + strings.Join(args, " "))
+	f.calls = append(f.calls, key)
+	if err, ok := f.errs[key]; ok {
+		return nil, err
+	}
+	if s, ok := f.out[key]; ok {
+		return []byte(s), nil
+	}
+	return nil, fmt.Errorf("fakePriv: no response scripted for %q", key)
+}
+
+func hasWarning(report DiscoveryReport, substr string) bool {
+	for _, w := range report.Warnings {
+		if strings.Contains(w, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDiscover_LetsEncryptCertsViaHelper(t *testing.T) {
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+
+	t.Run("success fills certs and legacy tlsCertificates", func(t *testing.T) {
+		run := newFakeRun()
+		rf := newFakeReadFile()
+		glob := newFakeGlob()
+		baseOSStubs(run, rf)
+		priv := newFakePriv()
+		priv.out["certs-list"] = `[{"name":"b.example","expiresAt":"2026-08-01T12:00:00Z"},{"name":"a.example","expiresAt":"2026-08-12T12:00:00Z"}]`
+
+		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: glob.glob, Priv: priv.run, Now: func() time.Time { return now }})
+		report := d.Discover(context.Background())
+
+		if len(report.Certs) != 2 || report.Certs[0].Name != "a.example" || report.Certs[0].ExpiresAt != "2026-08-12T12:00:00Z" {
+			t.Fatalf("certs = %+v", report.Certs)
+		}
+		if len(report.TLSCertificates) != 2 {
+			t.Fatalf("tlsCertificates = %+v", report.TLSCertificates)
+		}
+		a := report.TLSCertificates[0]
+		if a.Domain != "a.example" || a.DaysRemaining != 7 || a.ChainError != "" ||
+			a.Path != "/etc/letsencrypt/live/a.example/fullchain.pem" || !a.NotAfter.Equal(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)) {
+			t.Fatalf("legacy entry = %+v", a)
+		}
+		if b := report.TLSCertificates[1]; b.Domain != "b.example" || b.ChainError == "" {
+			t.Fatalf("expired entry = %+v, want a chainError", b)
+		}
+		if hasWarning(report, "Let's Encrypt") {
+			t.Fatalf("unexpected warning: %v", report.Warnings)
+		}
+	})
+
+	t.Run("helper failure warns plainly", func(t *testing.T) {
+		run := newFakeRun()
+		rf := newFakeReadFile()
+		baseOSStubs(run, rf)
+		priv := newFakePriv()
+		priv.errs["certs-list"] = errors.New("exit status 1")
+
+		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Priv: priv.run, Now: func() time.Time { return now }})
+		report := d.Discover(context.Background())
+
+		if !hasWarning(report, "Let's Encrypt certificates could not be read") {
+			t.Fatalf("warnings = %v", report.Warnings)
+		}
+		if len(report.Certs) != 0 || len(report.TLSCertificates) != 0 {
+			t.Fatalf("certs = %+v tls = %+v, want empty", report.Certs, report.TLSCertificates)
+		}
+	})
+
+	t.Run("nil helper warns plainly", func(t *testing.T) {
+		run := newFakeRun()
+		rf := newFakeReadFile()
+		baseOSStubs(run, rf)
+
+		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Now: func() time.Time { return now }})
+		report := d.Discover(context.Background())
+
+		if !hasWarning(report, "Let's Encrypt certificates could not be read") {
+			t.Fatalf("warnings = %v", report.Warnings)
+		}
+	})
+}
+
+func TestDiscover_ParsesCaddyCertificateFiles(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	const caddyGlob = "/var/lib/caddy/.local/share/caddy/certificates/**/*.crt"
 
 	t.Run("valid certificate reports days remaining", func(t *testing.T) {
 		run := newFakeRun()
 		rf := newFakeReadFile()
 		glob := newFakeGlob()
 		baseOSStubs(run, rf)
-		glob.matches["/etc/letsencrypt/live/*/fullchain.pem"] = []string{"/etc/letsencrypt/live/a.example/fullchain.pem"}
-		rf.files["/etc/letsencrypt/live/a.example/fullchain.pem"] = generateTestCert(t, "a.example", "Let's Encrypt", now.AddDate(0, 0, 7))
+		glob.matches[caddyGlob] = []string{"/caddy/a.example.crt"}
+		rf.files["/caddy/a.example.crt"] = generateTestCert(t, "a.example", "Let's Encrypt", now.AddDate(0, 0, 7))
 
 		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: glob.glob, Now: func() time.Time { return now }})
 		report := d.Discover(context.Background())
@@ -459,14 +558,8 @@ func TestDiscover_ParsesTLSCertificateExpiry(t *testing.T) {
 			t.Fatalf("tlsCertificates = %+v, want 1 entry", report.TLSCertificates)
 		}
 		cert := report.TLSCertificates[0]
-		if cert.Domain != "a.example" || cert.Issuer != "Let's Encrypt" {
-			t.Fatalf("cert = %+v, want domain a.example issuer Let's Encrypt", cert)
-		}
-		if cert.DaysRemaining != 7 {
-			t.Fatalf("daysRemaining = %d, want 7", cert.DaysRemaining)
-		}
-		if cert.ChainError != "" {
-			t.Fatalf("chainError = %q, want empty for a valid cert", cert.ChainError)
+		if cert.Domain != "a.example" || cert.Issuer != "Let's Encrypt" || cert.DaysRemaining != 7 || cert.ChainError != "" {
+			t.Fatalf("cert = %+v", cert)
 		}
 	})
 
@@ -475,21 +568,14 @@ func TestDiscover_ParsesTLSCertificateExpiry(t *testing.T) {
 		rf := newFakeReadFile()
 		glob := newFakeGlob()
 		baseOSStubs(run, rf)
-		glob.matches["/etc/letsencrypt/live/*/fullchain.pem"] = []string{"/etc/letsencrypt/live/old.example/fullchain.pem"}
-		rf.files["/etc/letsencrypt/live/old.example/fullchain.pem"] = generateTestCert(t, "old.example", "Let's Encrypt", now.AddDate(0, 0, -3))
+		glob.matches[caddyGlob] = []string{"/caddy/old.example.crt"}
+		rf.files["/caddy/old.example.crt"] = generateTestCert(t, "old.example", "Let's Encrypt", now.AddDate(0, 0, -3))
 
 		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: glob.glob, Now: func() time.Time { return now }})
 		report := d.Discover(context.Background())
 
-		if len(report.TLSCertificates) != 1 {
-			t.Fatalf("tlsCertificates = %+v, want 1 entry", report.TLSCertificates)
-		}
-		cert := report.TLSCertificates[0]
-		if cert.ChainError == "" {
-			t.Fatal("expired certificate should report a chainError")
-		}
-		if cert.Domain != "old.example" {
-			t.Fatalf("domain = %q, want old.example even when expired", cert.Domain)
+		if len(report.TLSCertificates) != 1 || report.TLSCertificates[0].ChainError == "" || report.TLSCertificates[0].Domain != "old.example" {
+			t.Fatalf("tlsCertificates = %+v", report.TLSCertificates)
 		}
 	})
 
@@ -498,20 +584,137 @@ func TestDiscover_ParsesTLSCertificateExpiry(t *testing.T) {
 		rf := newFakeReadFile()
 		glob := newFakeGlob()
 		baseOSStubs(run, rf)
-		glob.matches["/etc/letsencrypt/live/*/fullchain.pem"] = []string{"/etc/letsencrypt/live/broken.example/fullchain.pem"}
-		rf.files["/etc/letsencrypt/live/broken.example/fullchain.pem"] = []byte("not a pem file")
+		glob.matches[caddyGlob] = []string{"/caddy/broken.crt"}
+		rf.files["/caddy/broken.crt"] = []byte("not a pem file")
 
 		d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: glob.glob, Now: func() time.Time { return now }})
 		report := d.Discover(context.Background())
 
-		if len(report.TLSCertificates) != 1 {
-			t.Fatalf("tlsCertificates = %+v, want 1 entry", report.TLSCertificates)
-		}
-		cert := report.TLSCertificates[0]
-		if cert.ChainError == "" || cert.Path == "" {
-			t.Fatalf("cert = %+v, want a chainError and path for an unparseable file", cert)
+		if len(report.TLSCertificates) != 1 || report.TLSCertificates[0].ChainError == "" || report.TLSCertificates[0].Path == "" {
+			t.Fatalf("tlsCertificates = %+v", report.TLSCertificates)
 		}
 	})
+}
+
+// --- stack discovery: PM2, PHP-FPM, supervisor, database units -----------
+
+const testPasswd = `root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+deploy:x:1001:1001::/home/deploy:/bin/bash
+app:x:1000:1000::/home/app:/bin/zsh
+svc:x:1002:1002::/home/svc:/usr/sbin/nologin
+nohome:x:1003:1003::: /bin/bash
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+`
+
+func TestDiscover_PM2AppsPerUserWithOneFailing(t *testing.T) {
+	run := newFakeRun()
+	rf := newFakeReadFile()
+	baseOSStubs(run, rf)
+	rf.files["/etc/passwd"] = []byte(testPasswd)
+	priv := newFakePriv()
+	priv.out["pm2-list app"] = `[{"app":"api","status":"online","restarts":0},{"app":"worker","status":"stopped","restarts":3}]`
+	priv.errs["pm2-list deploy"] = errors.New("exit status 1")
+	priv.out["certs-list"] = `[]`
+
+	d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Priv: priv.run})
+	report := d.Discover(context.Background())
+
+	want := []PM2AppInfo{{User: "app", App: "api", Status: "online"}, {User: "app", App: "worker", Status: "stopped"}}
+	if len(report.PM2Apps) != 2 || report.PM2Apps[0] != want[0] || report.PM2Apps[1] != want[1] {
+		t.Fatalf("pm2Apps = %+v, want %+v", report.PM2Apps, want)
+	}
+	if !hasWarning(report, "user deploy") {
+		t.Fatalf("warnings = %v, want one for user deploy", report.Warnings)
+	}
+	var pm2Calls []string
+	for _, c := range priv.calls {
+		if strings.HasPrefix(c, "pm2-list") {
+			pm2Calls = append(pm2Calls, c)
+		}
+	}
+	if strings.Join(pm2Calls, ",") != "pm2-list app,pm2-list deploy" {
+		t.Fatalf("pm2 calls = %v, want only app and deploy, sorted", pm2Calls)
+	}
+}
+
+func TestDiscover_StackUnitsAndSupervisor(t *testing.T) {
+	run := newFakeRun()
+	rf := newFakeReadFile()
+	baseOSStubs(run, rf)
+	names := []string{
+		"php8.3-fpm.service", "php-fpm.service", "php8.2-fpm.service", "phpfoo.service",
+		"mysql.service", "mariadb.service", "postgresql.service", "postgresql@16-main.service",
+		"redis-server.service", "redis.service", "redis-exporter.service", "supervisor.service", "nginx.service",
+	}
+	var units []systemd.Unit
+	for _, n := range names {
+		units = append(units, systemd.Unit{Name: n, ActiveState: "active"})
+		run.responses[systemctlShowKey(n)] = "0\nn/a\n"
+	}
+	priv := newFakePriv()
+	priv.out["supervisor-status"] = `[{"name":"queue-worker:queue-worker_00","state":"RUNNING"}]`
+	priv.out["certs-list"] = `[]`
+
+	d := NewDiscoverer(DiscoveryConfig{Systemd: fakeSystemdSource{units: units}, Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Priv: priv.run})
+	report := d.Discover(context.Background())
+
+	if got := strings.Join(report.PHPFPMUnits, ","); got != "php-fpm.service,php8.2-fpm.service,php8.3-fpm.service" {
+		t.Fatalf("phpFpmUnits = %v", report.PHPFPMUnits)
+	}
+	want := []DatabaseUnitInfo{
+		{"mariadb", "mariadb.service"},
+		{"mysql", "mysql.service"},
+		{"postgresql", "postgresql.service"},
+		{"postgresql", "postgresql@16-main.service"},
+		{"redis", "redis-server.service"},
+		{"redis", "redis.service"},
+	}
+	if len(report.DatabaseUnits) != len(want) {
+		t.Fatalf("databaseUnits = %+v, want %+v", report.DatabaseUnits, want)
+	}
+	for i := range want {
+		if report.DatabaseUnits[i] != want[i] {
+			t.Fatalf("databaseUnits[%d] = %+v, want %+v", i, report.DatabaseUnits[i], want[i])
+		}
+	}
+	if len(report.SupervisorPrograms) != 1 || report.SupervisorPrograms[0] != (SupervisorProgramInfo{Name: "queue-worker:queue-worker_00", State: "RUNNING"}) {
+		t.Fatalf("supervisorPrograms = %+v", report.SupervisorPrograms)
+	}
+
+	t.Run("supervisor helper failure is a warning", func(t *testing.T) {
+		priv := newFakePriv()
+		priv.errs["supervisor-status"] = errors.New("exit status 1")
+		priv.out["certs-list"] = `[]`
+		d := NewDiscoverer(DiscoveryConfig{Systemd: fakeSystemdSource{units: units}, Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Priv: priv.run})
+		report := d.Discover(context.Background())
+		if !hasWarning(report, "supervisor programs could not be listed") || len(report.SupervisorPrograms) != 0 {
+			t.Fatalf("warnings = %v programs = %+v", report.Warnings, report.SupervisorPrograms)
+		}
+	})
+}
+
+func TestDiscover_NewSlicesSerializeAsEmptyArrays(t *testing.T) {
+	run := newFakeRun()
+	rf := newFakeReadFile()
+	baseOSStubs(run, rf)
+	priv := newFakePriv()
+	priv.out["certs-list"] = `[]`
+
+	d := NewDiscoverer(DiscoveryConfig{Run: run.run, ReadFile: rf.read, Glob: newFakeGlob().glob, Priv: priv.run})
+	raw, err := json.Marshal(d.Discover(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"pm2Apps", "phpFpmUnits", "supervisorPrograms", "databaseUnits", "certs", "tlsCertificates"} {
+		if string(m[k]) != "[]" {
+			t.Errorf("%s = %s, want []", k, m[k])
+		}
+	}
 }
 
 // --- production-critical suggestions (AC5) ------------------------------

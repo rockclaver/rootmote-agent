@@ -1,29 +1,128 @@
-// Package redact implements the PRD 12.3 redaction rules used by the agent's
+// Package redact implements the redaction rules used by the agent's
 // diagnostic pipeline. Raw evidence never leaves the server: everything the
 // agent collects passes through a Redactor before it is shown to the AI or
 // summarized for the relay.
+//
+// The rule set lives in rules.json, a byte-identical copy of the Watchtower
+// playbook's redact_rules.json, and is embedded at build time.
 package redact
 
 import (
+	_ "embed"
+	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
-// Rule names, stable and used in Report.Rules.
+// Rule names, stable and used in Report.Rules. They match the names in
+// rules.json; RuleUserPattern is the only rule that is not in that file.
 const (
 	RuleEnvValue    = "env_value"
 	RuleAuthHeader  = "auth_header"
 	RuleCookie      = "cookie"
 	RulePrivateKey  = "private_key"
 	RuleDatabaseURL = "database_url"
-	RuleAPIKey      = "api_key"
+	RuleAPIKey      = "provider_api_key"
 	RuleUserPattern = "user_pattern"
 )
 
-// Placeholder replaces every redacted value.
+// Placeholder replaces every user-pattern match and every value known to be
+// secret (see Value).
 const Placeholder = "[REDACTED]"
+
+//go:embed rules.json
+var rulesJSON []byte
+
+const (
+	kindRegex   = "regex"
+	kindEntropy = "entropy"
+)
+
+// ruleFile is the on-disk shape of rules.json.
+type ruleFile struct {
+	Version int        `json:"version"`
+	Rules   []ruleSpec `json:"rules"`
+}
+
+type ruleSpec struct {
+	Name           string  `json:"name"`
+	Kind           string  `json:"kind"`
+	Pattern        string  `json:"pattern"`
+	Replacement    string  `json:"replacement"`
+	MinLength      int     `json:"minLength"`
+	MinBitsPerChar float64 `json:"minBitsPerChar"`
+	// HexMinLength and HexMinBitsPerChar replace the two limits above for
+	// tokens made only of hex digits (hex has at most 4 bits per character).
+	HexMinLength      int     `json:"hexMinLength"`
+	HexMinBitsPerChar float64 `json:"hexMinBitsPerChar"`
+}
+
+// compiledRule is a validated ruleSpec; re is nil for entropy rules.
+type compiledRule struct {
+	ruleSpec
+	re *regexp.Regexp
+}
+
+var (
+	loadOnce  sync.Once
+	loaded    []compiledRule
+	loadError error
+)
+
+// loadRules parses and compiles the embedded rules exactly once.
+func loadRules() ([]compiledRule, error) {
+	loadOnce.Do(func() {
+		loaded, loadError = parseRules(rulesJSON)
+	})
+	return loaded, loadError
+}
+
+func parseRules(data []byte) ([]compiledRule, error) {
+	var f ruleFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("redact: parse rules.json: %w", err)
+	}
+	if f.Version != 1 {
+		return nil, fmt.Errorf("redact: unsupported rules.json version %d", f.Version)
+	}
+	seen := make(map[string]struct{}, len(f.Rules))
+	out := make([]compiledRule, 0, len(f.Rules))
+	for i, spec := range f.Rules {
+		if spec.Name == "" {
+			return nil, fmt.Errorf("redact: rule %d has no name", i)
+		}
+		if _, dup := seen[spec.Name]; dup {
+			return nil, fmt.Errorf("redact: duplicate rule name %q", spec.Name)
+		}
+		seen[spec.Name] = struct{}{}
+		cr := compiledRule{ruleSpec: spec}
+		switch spec.Kind {
+		case kindRegex:
+			re, err := regexp.Compile(spec.Pattern)
+			if err != nil {
+				return nil, fmt.Errorf("redact: rule %q: %w", spec.Name, err)
+			}
+			cr.re = re
+		case kindEntropy:
+			if spec.MinLength <= 0 || spec.MinBitsPerChar <= 0 {
+				return nil, fmt.Errorf("redact: entropy rule %q needs positive minLength and minBitsPerChar", spec.Name)
+			}
+			if (spec.HexMinLength > 0) != (spec.HexMinBitsPerChar > 0) || spec.HexMinLength < 0 || spec.HexMinBitsPerChar < 0 {
+				return nil, fmt.Errorf("redact: entropy rule %q needs both hexMinLength and hexMinBitsPerChar, or neither", spec.Name)
+			}
+		default:
+			return nil, fmt.Errorf("redact: rule %q has unknown kind %q", spec.Name, spec.Kind)
+		}
+		out = append(out, cr)
+	}
+	return out, nil
+}
 
 // Report records what a redaction pass changed.
 type Report struct {
@@ -37,92 +136,9 @@ func (r *Report) Merge(other Report) {
 	r.Applied = r.Applied || other.Applied
 }
 
-// secretKeyword matches the field-name vocabulary the PRD treats as
-// secret-bearing: passwords, tokens, API/access/private keys, credentials
-// and auth material of any kind.
-const secretKeyword = `pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth`
-
-var (
-	// reSecretKey matches a field/header *name* that looks secret-bearing,
-	// independent of the value's shape. Used by Map to decide by key first.
-	reSecretKey = regexp.MustCompile(`(?i)(?:` + secretKeyword + `)`)
-
-	// RuleEnvValue: "KEY=value" / "KEY: value" lines where KEY matches the
-	// secret vocabulary. The whole remainder of the line is the value.
-	reEnvValueLine = regexp.MustCompile(`(?im)^([ \t]*[\w.-]*(?:` + secretKeyword + `)[\w.-]*)([ \t]*[:=][ \t]*)([^\r\n]+)$`)
-
-	// RuleAuthHeader: "Authorization: ..." / "Proxy-Authorization: ..."
-	// header lines, plus bare "Bearer <token>" / "Basic <token>" tokens
-	// that are not part of such a header line.
-	reAuthHeaderLine = regexp.MustCompile(`(?im)^([ \t]*(?:Proxy-)?Authorization)([ \t]*:[ \t]*)([^\r\n]+)$`)
-	reBareAuthToken  = regexp.MustCompile(`(?i)\b(Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=-]+)`)
-
-	// RuleCookie: "Cookie:" / "Set-Cookie:" header lines.
-	reCookieLine = regexp.MustCompile(`(?im)^([ \t]*(?:Set-Cookie|Cookie))([ \t]*:[ \t]*)([^\r\n]+)$`)
-
-	// RulePrivateKey: a PEM private key block, terminated or running to the
-	// end of input when the closing marker is missing (truncated logs).
-	rePrivateKey = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)`)
-
-	// RuleDatabaseURL: scheme://user:password@host... connection strings.
-	// Only the password component is replaced.
-	reDatabaseURL = regexp.MustCompile(`(?i)\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://([^:@/\s]*):([^@\s]*)@`)
-
-	// RuleAPIKey: recognizable API-key/token shapes. Ordered so the more
-	// specific "sk-ant-" prefix wins over the generic "sk-" prefix.
-	reAPIKey = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{16,}|oauth_[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_-]+|ghp_[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9_-]+|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
-)
-
-// builtinRule pairs a rule name with the function that applies it. apply
-// returns the (possibly unchanged) string and whether it changed the input.
-type builtinRule struct {
-	name  string
-	apply func(string) (string, bool)
-}
-
-// builtinRules runs in a fixed order. The more specific header/cookie forms
-// run before the generic KEY=value scan so a line like
-// "Authorization: Bearer xyz" is reported as auth_header, not env_value; by
-// the time the generic scan runs, the value has already become Placeholder
-// and the generic regex is a no-op (change-detected, so it is not
-// double-reported). Private keys run first so their base64 body is never
-// mistaken for an API key.
-var builtinRules = []builtinRule{
-	{RulePrivateKey, applyLiteral(rePrivateKey)},
-	{RuleAuthHeader, applyAuthHeader},
-	{RuleCookie, applyTemplate(reCookieLine, "${1}${2}"+Placeholder)},
-	{RuleDatabaseURL, applyTemplate(reDatabaseURL, "${1}://${2}:"+Placeholder+"@")},
-	{RuleAPIKey, applyLiteral(reAPIKey)},
-	{RuleEnvValue, applyTemplate(reEnvValueLine, "${1}${2}"+Placeholder)},
-}
-
-// applyTemplate replaces every match of re with a $-template replacement
-// (may reference capture groups) and reports whether anything changed.
-func applyTemplate(re *regexp.Regexp, tmpl string) func(string) (string, bool) {
-	return func(s string) (string, bool) {
-		out := re.ReplaceAllString(s, tmpl)
-		return out, out != s
-	}
-}
-
-// applyLiteral replaces every match of re with the literal Placeholder
-// (no group substitution) and reports whether anything changed.
-func applyLiteral(re *regexp.Regexp) func(string) (string, bool) {
-	return func(s string) (string, bool) {
-		out := re.ReplaceAllLiteralString(s, Placeholder)
-		return out, out != s
-	}
-}
-
-// applyAuthHeader handles both the "Authorization: ..." header-line form and
-// bare "Bearer <token>" / "Basic <token>" tokens that appear on their own.
-func applyAuthHeader(s string) (string, bool) {
-	out := reAuthHeaderLine.ReplaceAllString(s, "${1}${2}"+Placeholder)
-	headerChanged := out != s
-	out2 := reBareAuthToken.ReplaceAllString(out, "${1} "+Placeholder)
-	tokenChanged := out2 != out
-	return out2, headerChanged || tokenChanged
-}
+// reSecretKey matches a field/header *name* that looks secret-bearing,
+// independent of the value's shape. Used by Map to decide by key first.
+var reSecretKey = regexp.MustCompile(`(?i)(?:pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth)`)
 
 // sortDedup returns rules sorted and deduplicated. A nil/empty input yields
 // nil so Report.Rules serializes as [] rather than accumulating garbage.
@@ -143,15 +159,107 @@ func sortDedup(rules []string) []string {
 	return out
 }
 
-// Redactor applies the PRD 12.3 rule set plus user-supplied patterns.
+// shannonBits returns the Shannon entropy of s in bits per rune and the
+// rune count.
+func shannonBits(s string) (float64, int) {
+	counts := make(map[rune]int)
+	n := 0
+	for _, c := range s {
+		counts[c]++
+		n++
+	}
+	if n == 0 {
+		return 0, 0
+	}
+	var h float64
+	for _, c := range counts {
+		p := float64(c) / float64(n)
+		h -= p * math.Log2(p)
+	}
+	return h, n
+}
+
+// trimEdges are quoting and punctuation characters kept outside a redacted
+// token (same set as the Watchtower playbook redactor).
+const trimEdges = "\"'`()<>[]{},;"
+
+// isHex reports whether s is non-empty and made only of hex digits.
+func isHex(s string) bool {
+	for i := range len(s) {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// applyEntropy replaces every whitespace-delimited token that is at least
+// minLength runes long and has at least minBitsPerChar bits of entropy per
+// character, keeping surrounding quotes/brackets. Tokens already holding a
+// [REDACTED marker are skipped. Whitespace between tokens is preserved.
+func applyEntropy(rule compiledRule, s string) string {
+	var b strings.Builder
+	changed := false
+	start := -1 // byte offset of the current token, -1 between tokens
+	flush := func(end int) {
+		tok := s[start:end]
+		start = -1
+		if !strings.Contains(tok, "[REDACTED") {
+			core := strings.Trim(tok, trimEdges)
+			minLen, minBits := rule.MinLength, rule.MinBitsPerChar
+			if rule.HexMinLength > 0 && isHex(core) {
+				minLen, minBits = rule.HexMinLength, rule.HexMinBitsPerChar
+			}
+			if utf8.RuneCountInString(core) >= minLen {
+				if bits, _ := shannonBits(core); bits >= minBits {
+					i := strings.Index(tok, core)
+					b.WriteString(tok[:i])
+					b.WriteString(rule.Replacement)
+					b.WriteString(tok[i+len(core):])
+					changed = true
+					return
+				}
+			}
+		}
+		b.WriteString(tok)
+	}
+	for i, c := range s {
+		if unicode.IsSpace(c) {
+			if start >= 0 {
+				flush(i)
+			}
+			b.WriteRune(c)
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		flush(len(s))
+	}
+	if !changed {
+		return s
+	}
+	return b.String()
+}
+
+// Redactor applies the embedded rule set plus user-supplied patterns.
 type Redactor struct {
+	rules        []compiledRule
 	userPatterns []*regexp.Regexp
 }
 
 // New builds a Redactor. userPatterns are Go regexps; an invalid pattern is
 // reported in err and the Redactor is still usable with the built-in rules.
+// If the embedded rules cannot be loaded New returns a nil Redactor.
 func New(userPatterns []string) (*Redactor, error) {
-	r := &Redactor{}
+	rules, err := loadRules()
+	if err != nil {
+		return nil, err
+	}
+	r := &Redactor{rules: rules}
 	var bad []string
 	for _, p := range userPatterns {
 		re, err := regexp.Compile(p)
@@ -168,27 +276,45 @@ func New(userPatterns []string) (*Redactor, error) {
 }
 
 // Text redacts a blob and reports which rules fired. It never panics on
-// malformed input and never grows the output.
+// malformed input.
 func (r *Redactor) Text(s string) (string, Report) {
-	var rep Report
+	var fired []string
 	out := s
-	for _, rule := range builtinRules {
-		var changed bool
-		out, changed = rule.apply(out)
-		if changed {
-			rep.Rules = append(rep.Rules, rule.name)
+	for _, rule := range r.rules {
+		var next string
+		if rule.re != nil {
+			next = rule.re.ReplaceAllString(out, rule.Replacement)
+		} else {
+			next = applyEntropy(rule, out)
+		}
+		if next != out {
+			fired = append(fired, rule.Name)
+			out = next
 		}
 	}
 	for _, re := range r.userPatterns {
 		replaced := re.ReplaceAllLiteralString(out, Placeholder)
 		if replaced != out {
-			rep.Rules = append(rep.Rules, RuleUserPattern)
+			fired = append(fired, RuleUserPattern)
 		}
 		out = replaced
 	}
-	rep.Rules = sortDedup(rep.Rules)
+	rep := Report{Rules: sortDedup(fired)}
 	rep.Applied = len(rep.Rules) > 0
 	return out, rep
+}
+
+// ForRequest applies the request placeholders p (hostnames and public IPs)
+// and then the redaction rules.
+func (r *Redactor) ForRequest(p *Placeholders, s string) (string, Report) {
+	return r.Text(p.Apply(s))
+}
+
+// Clean reports whether running the rules over s changes nothing, i.e. no
+// sensitive material is left in it.
+func (r *Redactor) Clean(s string) bool {
+	out, _ := r.Text(s)
+	return out == s
 }
 
 // Value redacts a single value that is known to be a secret-bearing field

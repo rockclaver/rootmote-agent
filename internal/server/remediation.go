@@ -12,15 +12,11 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
-	"github.com/rockclaver/rootmote-agent/internal/firewall"
-	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
-	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
-	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
 // remediationExecuteAction and remediationRollbackAction are the exact
@@ -81,176 +77,84 @@ func (v *reviewApprovalValidator) Validate(_ context.Context, token, executionID
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// serverStepExecutor adapts the same typed managers human-initiated WS
-// mutations use (systemd/process/firewall/security) into
-// remediation.StepExecutor, so a runbook step is always a typed, guarded
-// call -- never a raw shell command. Guards (protected unit, protected PID,
-// anti-lockout) are enforced inside those managers exactly as they are for
-// infra.service.action / infra.process.kill / infra.firewall.rule_* /
-// security.fix; this adapter adds one remediation-specific guard of its
-// own -- for a firewall or close_port step, the runbook's approved
-// "backend" param must match the manager's live-detected backend before
-// any mutation, so an approval minted against one backend's semantics can
-// never mutate a different one.
+// serverStepExecutor runs a runbook step through the typed step catalog.
+// Every step is validated (name rules, protected units, existence) before it
+// runs, and root steps go through the privilege helper, which validates
+// again as root -- never a raw shell command.
 type serverStepExecutor struct {
-	systemd   *systemd.Manager
-	processes *agentprocess.Manager
-	firewall  *firewall.Manager
-	security  *security.Manager
+	runner *steps.Runner
 }
 
 // NewRemediationStepExecutor builds the production StepExecutor wired in
-// cmd/rootmote-agent/main.go. Any manager may be nil; a step requiring an
-// unconfigured manager fails that step (stopping later steps) rather than
-// panicking.
-func NewRemediationStepExecutor(sys *systemd.Manager, proc *agentprocess.Manager, fw *firewall.Manager, sec *security.Manager) remediation.StepExecutor {
-	return &serverStepExecutor{systemd: sys, processes: proc, firewall: fw, security: sec}
+// cmd/rootmote-agent/main.go.
+func NewRemediationStepExecutor(runner *steps.Runner) remediation.StepExecutor {
+	return &serverStepExecutor{runner: runner}
 }
 
 func (e *serverStepExecutor) ExecuteStep(ctx context.Context, step runbook.Step) (remediation.StepResult, error) {
-	switch step.Kind {
-	case aiproposal.KindServiceAction:
-		if e.systemd == nil {
-			return remediation.StepResult{Output: "systemd subsystem not configured", ExitCode: 1}, nil
-		}
-		name, _ := step.Params["name"].(string)
-		act, _ := step.Params["action"].(string)
-		return stepOutcome(e.systemd.Action(ctx, name, systemd.Action(act)))
-	case aiproposal.KindProcessKill:
-		if e.processes == nil {
-			return remediation.StepResult{Output: "process subsystem not configured", ExitCode: 1}, nil
-		}
-		pid := intFromParams(step.Params["pid"])
-		startTicks := uint64FromParams(step.Params["start_time_ticks"])
-		signal, _ := step.Params["signal"].(string)
-		return stepOutcome(e.processes.Kill(ctx, pid, startTicks, signal))
-	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
-		if e.firewall == nil {
-			return remediation.StepResult{Output: "firewall subsystem not configured", ExitCode: 1}, nil
-		}
-		rule, err := ruleFromParams(step.Params)
-		if err != nil {
-			return remediation.StepResult{Output: err.Error(), ExitCode: 1}, nil
-		}
-		if err := e.checkFirewallBackend(ctx, step.Params); err != nil {
-			return remediation.StepResult{Output: err.Error(), ExitCode: 1}, nil
-		}
-		if step.Kind == aiproposal.KindFirewallAdd {
-			return stepOutcome(e.firewall.RuleAdd(ctx, rule))
-		}
-		return stepOutcome(e.firewall.RuleRemove(ctx, rule))
-	case aiproposal.KindSecurityFix:
-		if e.security == nil {
-			return remediation.StepResult{Output: "security subsystem not configured", ExitCode: 1}, nil
-		}
-		req, err := securityFixRequestFromParams(step.Params)
-		if err != nil {
-			return remediation.StepResult{Output: err.Error(), ExitCode: 1}, nil
-		}
-		if req.Kind == security.FixClosePort {
-			if err := e.checkFirewallBackend(ctx, step.Params); err != nil {
-				return remediation.StepResult{Output: err.Error(), ExitCode: 1}, nil
-			}
-		}
-		_, err = e.security.Fix(ctx, req)
-		return stepOutcome(err)
-	default:
-		return remediation.StepResult{}, fmt.Errorf("remediation: unsupported step kind %q", step.Kind)
-	}
-}
-
-// checkFirewallBackend enforces that a firewall or close_port step's
-// approved "backend" param matches the manager's live-detected backend
-// before any mutation -- see serverStepExecutor's doc comment.
-func (e *serverStepExecutor) checkFirewallBackend(ctx context.Context, params map[string]any) error {
-	if e.firewall == nil {
-		return errors.New("firewall subsystem not configured")
-	}
-	approved, _ := params["backend"].(string)
-	if approved == "" {
-		return errors.New("step missing approved backend")
-	}
-	st, err := e.firewall.Status(ctx)
+	out, err := e.runner.Execute(ctx, step.Kind, step.Params)
 	if err != nil {
-		return fmt.Errorf("resolve firewall backend: %w", err)
-	}
-	if string(st.Backend) != approved {
-		return fmt.Errorf("approved backend %q does not match active backend %q", approved, st.Backend)
-	}
-	return nil
-}
-
-// stepOutcome maps a typed manager's error into remediation.StepResult:
-// nil is exit 0; any error is a legitimate "the guarded call refused or
-// failed" outcome (protected unit, anti-lockout, backend mismatch, host
-// failure) -- never a StepExecutor transport failure -- so it is reported
-// as a non-zero exit with the error text as output, and Execute stops
-// later steps exactly as it does for a real nonzero exit code.
-func stepOutcome(err error) (remediation.StepResult, error) {
-	if err != nil {
+		// A refusal or a failed command is a legitimate "the guarded call
+		// said no" outcome, never an executor transport failure: report a
+		// non-zero exit with the plain message so Execute stops later steps.
 		return remediation.StepResult{Output: err.Error(), ExitCode: 1}, nil
 	}
-	return remediation.StepResult{ExitCode: 0}, nil
+	return remediation.StepResult{Output: out}, nil
 }
 
-// serverInternalVerifier runs a runbook's own bounded post-execution checks
-// (runbook.VerificationCheck) against the same typed managers -- never a
-// new host command. An empty Verification list is a deliberate "no
-// automated check" runbook and passes trivially; an unsupported check Kind
-// fails closed rather than silently skipping, so an author who wrote a
-// check the agent cannot yet run sees verification fail rather than a
-// false "resolved".
+// serverInternalVerifier runs each step's own catalog verification, then the
+// runbook's explicit checks (runbook.VerificationCheck). An unsupported
+// check kind fails closed rather than silently skipping. A runbook with no
+// steps and no checks passes trivially.
 type serverInternalVerifier struct {
-	systemd  *systemd.Manager
-	firewall *firewall.Manager
+	runner *steps.Runner
+	units  steps.Units
 }
 
 // NewRemediationInternalVerifier builds the production InternalVerifier
 // wired in cmd/rootmote-agent/main.go.
-func NewRemediationInternalVerifier(sys *systemd.Manager, fw *firewall.Manager) remediation.InternalVerifier {
-	return &serverInternalVerifier{systemd: sys, firewall: fw}
+func NewRemediationInternalVerifier(runner *steps.Runner, units steps.Units) remediation.InternalVerifier {
+	return &serverInternalVerifier{runner: runner, units: units}
 }
 
 func (v *serverInternalVerifier) Verify(ctx context.Context, rb runbook.Runbook) (remediation.VerificationResult, error) {
-	if len(rb.Verification) == 0 {
+	total := len(rb.Steps) + len(rb.Verification)
+	if total == 0 {
 		return remediation.VerificationResult{Passed: true, Detail: "no verification checks configured"}, nil
 	}
 	var failures []string
+	perStep := make([]remediation.StepVerification, 0, len(rb.Steps))
+	for i, st := range rb.Steps {
+		sv := remediation.StepVerification{Index: i, Kind: string(st.Kind), Passed: true, Detail: "passed"}
+		if err := v.runner.Verify(ctx, st.Kind, st.Params); err != nil {
+			sv.Passed, sv.Detail = false, err.Error()
+			failures = append(failures, fmt.Sprintf("step %d (%s): %s", i+1, st.Kind, err.Error()))
+		}
+		perStep = append(perStep, sv)
+	}
 	for _, chk := range rb.Verification {
 		if err := v.runCheck(ctx, chk); err != nil {
 			failures = append(failures, chk.ID+": "+err.Error())
 		}
 	}
 	if len(failures) > 0 {
-		return remediation.VerificationResult{Passed: false, Detail: strings.Join(failures, "; ")}, nil
+		return remediation.VerificationResult{Passed: false, Detail: strings.Join(failures, "; "), Steps: perStep}, nil
 	}
-	return remediation.VerificationResult{Passed: true, Detail: fmt.Sprintf("%d check(s) passed", len(rb.Verification))}, nil
+	return remediation.VerificationResult{Passed: true, Detail: fmt.Sprintf("%d check(s) passed", total), Steps: perStep}, nil
 }
 
 func (v *serverInternalVerifier) runCheck(ctx context.Context, chk runbook.VerificationCheck) error {
 	switch chk.Kind {
-	case "service_active":
-		if v.systemd == nil {
+	case "service_active", "service_inactive":
+		if v.units == nil {
 			return errors.New("systemd subsystem not configured")
 		}
-		detail, err := v.systemd.Get(ctx, chk.Target)
+		st, err := v.units.Status(ctx, chk.Target)
 		if err != nil {
 			return err
 		}
-		if detail.ActiveState != "active" {
-			return fmt.Errorf("active_state=%q", detail.ActiveState)
-		}
-		return nil
-	case "service_inactive":
-		if v.systemd == nil {
-			return errors.New("systemd subsystem not configured")
-		}
-		detail, err := v.systemd.Get(ctx, chk.Target)
-		if err != nil {
-			return err
-		}
-		if detail.ActiveState == "active" {
-			return fmt.Errorf("active_state=%q", detail.ActiveState)
+		if (chk.Kind == "service_active") != (st.ActiveState == "active") {
+			return fmt.Errorf("active_state=%q", st.ActiveState)
 		}
 		return nil
 	default:
@@ -323,6 +227,8 @@ func (s *Server) dispatchRemediation(ctx context.Context, c *websocket.Conn, wri
 		s.handleRemediationVerify(ctx, c, writeMu, f)
 	case "incident.rollback":
 		s.handleRemediationRollback(ctx, c, writeMu, f)
+	case "incident.playbook.generate":
+		s.handlePlaybookGenerate(ctx, c, writeMu, f)
 	}
 }
 

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
@@ -114,8 +114,8 @@ func twoStepRunbook(id string, blocked bool) runbook.Runbook {
 		Risk:          runbook.RiskL1,
 		Blocked:       blocked,
 		Steps: []runbook.Step{
-			{Kind: aiproposal.KindServiceAction, Params: map[string]any{"service": "nginx", "action": "restart"}, Description: "restart nginx"},
-			{Kind: aiproposal.KindServiceAction, Params: map[string]any{"service": "nginx", "action": "status"}, Description: "confirm nginx is up"},
+			{Kind: steps.ServiceRestartID, Params: map[string]any{"unit": "nginx.service"}, Description: "restart nginx"},
+			{Kind: steps.ServiceReloadID, Params: map[string]any{"unit": "nginx.service"}, Description: "reload nginx"},
 		},
 	}
 }
@@ -614,8 +614,8 @@ func TestManager_DeriveRollback_RejectsExecutingParent(t *testing.T) {
 func threeStepFirewallRunbook(id string) runbook.Runbook {
 	mkStep := func(port float64, desc string) runbook.Step {
 		return runbook.Step{
-			Kind:        aiproposal.KindFirewallAdd,
-			Params:      map[string]any{"action": "deny", "protocol": "tcp", "port": port, "backend": "ufw", "zone": "public"},
+			Kind:        steps.FirewallAllowID,
+			Params:      map[string]any{"proto": "tcp", "port": port},
 			Description: desc,
 		}
 	}
@@ -677,7 +677,7 @@ func TestManager_DeriveRollback_OnlyInvertsDurableSuccessfulSteps(t *testing.T) 
 	if len(rollbackRb.Steps) != 1 {
 		t.Fatalf("rollback steps = %+v, want exactly 1 (inverse of step 1 only)", rollbackRb.Steps)
 	}
-	if rollbackRb.Steps[0].Kind != aiproposal.KindFirewallRemove {
+	if rollbackRb.Steps[0].Kind != steps.FirewallRemoveID {
 		t.Fatalf("rollback step kind = %s, want firewall_remove", rollbackRb.Steps[0].Kind)
 	}
 	if port, _ := rollbackRb.Steps[0].Params["port"].(float64); port != 1000 {
@@ -726,7 +726,7 @@ func TestManager_DeriveRollback_VerifyingInvertsAllSuccessfulSteps(t *testing.T)
 	wantPorts := []float64{3000, 2000, 1000} // undo last change first
 	for i, want := range wantPorts {
 		got, _ := rollbackRb.Steps[i].Params["port"].(float64)
-		if got != want || rollbackRb.Steps[i].Kind != aiproposal.KindFirewallRemove {
+		if got != want || rollbackRb.Steps[i].Kind != steps.FirewallRemoveID {
 			t.Fatalf("rollback step %d = %+v, want firewall_remove port %v", i, rollbackRb.Steps[i], want)
 		}
 	}
@@ -864,7 +864,7 @@ func TestManager_AuditTrailCoversEveryRemediationStep(t *testing.T) {
 
 	rb := twoStepRunbook("rb-audit", false)
 	rb.DiagnosisID = "diag-audit-1"
-	rb.ProviderVersion = "claude-v9"
+	rb.ProviderVersion = "catalog"
 	hash, err := runbook.ContentHash(rb)
 	if err != nil {
 		t.Fatalf("content hash: %v", err)
@@ -928,7 +928,7 @@ func TestManager_AuditTrailCoversEveryRemediationStep(t *testing.T) {
 	for _, e := range entries {
 		joined += e.Type + "|" + e.Summary + "|" + e.Data + "\n"
 	}
-	for _, want := range []string{"diag-audit-1", "claude-v9", hash, "tok-audit-1"} {
+	for _, want := range []string{"diag-audit-1", "catalog", hash, "tok-audit-1"} {
 		if indexOf(joined, want) < 0 {
 			t.Fatalf("audit trail missing %q", want)
 		}
@@ -1085,5 +1085,69 @@ func TestManager_ProjectsFailedExecutionWithoutVerification(t *testing.T) {
 	}
 	if got[len(got)-1] != "remediation_failed" {
 		t.Fatalf("projected kinds = %v, want to end in remediation_failed", got)
+	}
+}
+
+// proposeApproveExecute drives one runbook through to "verifying" and returns
+// its execution id.
+func proposeApproveExecute(t *testing.T, m *Manager, execID string, rb runbook.Runbook) {
+	t.Helper()
+	ctx := context.Background()
+	e, err := m.Propose(ctx, execID, "inc-1", rb)
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := m.Approve(ctx, execID, e.RunbookHash, "raw-token"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := m.Execute(ctx, execID, e.RunbookHash); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+}
+
+// A run whose steps have no catalog undo cannot be rolled back, and the
+// error says so instead of proposing an empty rollback.
+func TestManager_DeriveRollback_NoUndoableStepsIsUnsupported(t *testing.T) {
+	m, _ := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, nil)
+	rb := runbook.Runbook{
+		ID: "rb-noundo", SchemaVersion: runbook.SchemaVersion, IncidentID: "inc-1", Risk: runbook.RiskL1,
+		Steps:    []runbook.Step{{Kind: steps.ServiceRestartID, Params: runbook.Params{"unit": "api.service"}, Description: "Restart api"}},
+		Rollback: []runbook.Command{{Command: "display only"}},
+	}
+	proposeApproveExecute(t, m, "ex-noundo", rb)
+	if _, err := m.DeriveRollback(context.Background(), "ex-noundo"); !errors.Is(err, ErrRollbackUnsupported) {
+		t.Fatalf("DeriveRollback error = %v, want ErrRollbackUnsupported", err)
+	}
+}
+
+// A mixed run is rolled back as far as the catalog allows: the undoable step
+// is reversed and the one that cannot be undone is listed for the user.
+func TestManager_DeriveRollback_UndoesWhatItCanAndListsTheRest(t *testing.T) {
+	m, _ := newTestManager(t, &fakeExecutor{}, &fakeValidator{tokenID: "tok"}, &fakeVerifier{}, nil)
+	rb := runbook.Runbook{
+		ID: "rb-mixed", SchemaVersion: runbook.SchemaVersion, IncidentID: "inc-1", Risk: runbook.RiskL1, Title: "Fix api",
+		Steps: []runbook.Step{
+			{Kind: steps.ServiceRestartID, Params: runbook.Params{"unit": "api.service"}, Description: "Restart api"},
+			{Kind: steps.ServiceStopID, Params: runbook.Params{"unit": "worker.service"}, Description: "Stop worker", Undoable: true},
+		},
+		Rollback: []runbook.Command{{Command: "systemctl start worker.service"}},
+	}
+	proposeApproveExecute(t, m, "ex-mixed", rb)
+	rollback, err := m.DeriveRollback(context.Background(), "ex-mixed")
+	if err != nil {
+		t.Fatalf("derive rollback: %v", err)
+	}
+	got, err := m.Runbook(rollback.RunbookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Steps) != 1 || got.Steps[0].Kind != steps.ServiceStartID {
+		t.Fatalf("rollback steps = %+v, want only service.start", got.Steps)
+	}
+	if len(got.ManualSteps) != 1 || !strings.Contains(got.ManualSteps[0].Text, "cannot be undone: Restart api") {
+		t.Fatalf("manual steps = %+v, want the restart listed as not undoable", got.ManualSteps)
+	}
+	if got.Title != "Undo: Fix api" {
+		t.Fatalf("title = %q", got.Title)
 	}
 }

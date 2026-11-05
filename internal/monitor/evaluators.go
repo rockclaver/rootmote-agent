@@ -54,10 +54,24 @@ func (e *DiskEvaluator) Kind() Kind { return e.MonitorKind }
 
 func (e *DiskEvaluator) Evaluate(ctx context.Context) ([]Observation, error) {
 	targets := e.Defs.Targets(e.MonitorKind)
-	if len(targets) == 0 {
+	if len(targets) == 0 && e.MonitorKind != KindDiskCapacity {
 		return nil, nil
 	}
 	sample := e.Infra.Sample(ctx)
+	if e.MonitorKind == KindDiskCapacity {
+		// Disk usage watches every mounted filesystem, not only the ones
+		// with their own definition: the "*" default covers the rest.
+		seen := make(map[string]bool, len(targets))
+		for _, t := range targets {
+			seen[t] = true
+		}
+		for _, d := range sample.Disks {
+			if d.Available && !seen[d.Mountpoint] {
+				seen[d.Mountpoint] = true
+				targets = append(targets, d.Mountpoint)
+			}
+		}
+	}
 	byMount := make(map[string]infra.DiskMetric, len(sample.Disks))
 	for _, d := range sample.Disks {
 		byMount[d.Mountpoint] = d
@@ -370,6 +384,13 @@ func (e *SystemdEvaluator) Evaluate(ctx context.Context) ([]Observation, error) 
 	if err != nil {
 		return nil, err
 	}
+	// A unit the user picked by name is one they expect to be running, so a
+	// stop pages as well as a crash. Units covered only by the wildcard
+	// default page on "failed" alone: most units on a host are idle by design.
+	named := map[string]bool{}
+	for _, t := range e.Defs.Targets(KindSystemdUnit) {
+		named[t] = true
+	}
 	var out []Observation
 	for _, u := range units {
 		def, enabled := e.Defs.Resolve(KindSystemdUnit, u.Name)
@@ -383,7 +404,8 @@ func (e *SystemdEvaluator) Evaluate(ctx context.Context) ([]Observation, error) 
 			// before this rule existed.
 			continue
 		}
-		failing := strings.EqualFold(u.ActiveState, "failed")
+		failing := strings.EqualFold(u.ActiveState, "failed") || strings.EqualFold(u.SubState, "failed") ||
+			(named[u.Name] && strings.EqualFold(u.ActiveState, "inactive"))
 		out = append(out, Observation{
 			Target:     u.Name,
 			Failing:    failing,

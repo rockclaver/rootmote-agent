@@ -17,37 +17,37 @@ RestartSec=2s
 
 # Hardening.
 # NoNewPrivileges MUST stay off: the agent runs as the unprivileged `rootmote`
-# user and escalates privileged operations (firewall ufw/firewall-cmd from
-# issue #44, host reboot, terminating a suspicious process owned by another
-# user, and storage cleanup's file/journal deletion) through `sudo -n`,
-# scoped by sudoers.d fragments to specific binaries/verbs. NoNewPrivileges
-# blocks sudo's setuid, which breaks every one of those paths. Crucially,
-# several systemd sandboxing directives
+# user and escalates every privileged fix step through exactly one command,
+# `sudo -n /usr/local/bin/rootmote-agent priv <action> <args>` (the single
+# rule in /etc/sudoers.d/rootmote-agent). The helper validates its own
+# arguments as root. NoNewPrivileges blocks sudo's setuid, which would break
+# it. Crucially, several systemd sandboxing directives
 # (PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,
 # ProtectControlGroups=, RestrictAddressFamilies=) *implicitly* force
 # NoNewPrivileges=yes (see systemd.exec(5)), so they are deliberately omitted
 # here — setting them silently re-broke sudo despite the explicit intent.
-# Storage cleanup's delete/apt-cache/journal-vacuum escalation additionally
-# routes through `nsenter --mount=/proc/1/ns/mnt` before the target command:
-# ProtectSystem=strict's read-only bind mounts are enforced by the mount
-# namespace, not by UID, so a plain sudo-escalated root child would still be
-# stuck read-only outside ReadWritePaths below. Joining PID 1's real,
-# unsandboxed mount namespace first is what actually reaches the rest of the
-# host filesystem. Separately, /run/sudo below is required for `sudo` itself
-# to function at all under this sandbox: sudo creates its own timestamp
-# ("ticket") directory there on every call, even with NOPASSWD, and treats
-# being unable to (read-only filesystem) as a hard "a password is required"
-# failure rather than something NOPASSWD can route around. The installer's
+# Helper actions that must write outside the sandbox (certbot, journal
+# vacuum, apt clean, nginx config test) or read /home (PM2) re-run themselves
+# through `nsenter --mount=/proc/1/ns/mnt`: ProtectSystem=strict's read-only
+# bind mounts and ProtectHome are enforced by the mount namespace, not by
+# UID, so a plain sudo-escalated root child would still be stuck read-only
+# outside ReadWritePaths below. Joining PID 1's real, unsandboxed mount
+# namespace is what actually reaches the rest of the host filesystem.
+# Separately, /run/sudo below is required for `sudo` itself to function at
+# all under this sandbox: sudo creates its own timestamp ("ticket")
+# directory there on every call, even with NOPASSWD, and treats being unable
+# to (read-only filesystem) as a hard "a password is required" failure
+# rather than something NOPASSWD can route around. The installer's
 # rootmote-agent-sudo.tmpfiles.conf guarantees /run/sudo exists before this
 # unit starts (it's on tmpfs and empty on every boot).
-# All privileged mutations still pass through the agent's biometric +
-# single-use confirmation-token (+ firewall anti-lockout) pipeline before sudo.
+# Every privileged fix still passes through the agent's biometric +
+# single-use confirmation-token pipeline before sudo is called.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 # The agent's *listener* is locked to loopback by an in-process self-check
-# (assertLoopback). Outbound access supports monitoring, push delivery, and
-# optional AI provider authentication and diagnosis.
+# (assertLoopback). Outbound access supports monitoring and
+# playbook requests.
 ReadWritePaths=/var/lib/rootmote /run/sudo
 
 [Install]

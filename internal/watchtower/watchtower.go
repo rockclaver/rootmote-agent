@@ -126,6 +126,13 @@ type Client struct {
 	// HTTP performs outbound requests. Defaults to a 10s-timeout
 	// *http.Client when nil.
 	HTTP HTTPDoer
+	// PlaybookHTTP performs playbook requests, which may wait minutes for the
+	// relay. Defaults to a client with a three-minute timeout when nil.
+	PlaybookHTTP HTTPDoer
+	// IncidentOpened, when set, is called once for every firing event the
+	// relay answers with an incident id. It runs on the sending goroutine, so
+	// it must return quickly. Set it before the monitor engine starts.
+	IncidentOpened func(ev MonitorEvent, incidentID string)
 	// Now returns the current time. Defaults to time.Now.
 	Now func() time.Time
 	// Logf receives non-fatal diagnostics (unenrolled skips, heartbeat

@@ -176,11 +176,39 @@ func (c *Client) SendMonitorEvents(ctx context.Context, events []MonitorEvent) e
 		return fmt.Errorf("watchtower: monitor-events: %w", err)
 	}
 	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return fmt.Errorf("watchtower: monitor-events: relay returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
+	c.reportOpenedIncidents(events, respBody)
 	return nil
+}
+
+// reportOpenedIncidents reads the relay's answer to a batch and tells
+// IncidentOpened which incident each firing event opened or joined. An
+// answer without an incidents list (an older relay) is ignored.
+func (c *Client) reportOpenedIncidents(events []MonitorEvent, respBody []byte) {
+	if c.IncidentOpened == nil {
+		return
+	}
+	var answer struct {
+		Incidents []struct {
+			EventID    string `json:"eventId"`
+			IncidentID string `json:"incidentId"`
+		} `json:"incidents"`
+	}
+	if err := json.Unmarshal(respBody, &answer); err != nil {
+		return
+	}
+	byID := make(map[string]MonitorEvent, len(events))
+	for _, e := range events {
+		byID[e.EventID] = e
+	}
+	for _, inc := range answer.Incidents {
+		if ev, ok := byID[inc.EventID]; ok && inc.IncidentID != "" {
+			c.IncidentOpened(ev, inc.IncidentID)
+		}
+	}
 }
 
 // QueueFileName is the offline monitor-event queue's basename inside the

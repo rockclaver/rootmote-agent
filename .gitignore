@@ -1,7 +1,6 @@
 .DS_Store
 
 dist/
-e2e-smoke
 /rootmote-agent
 
 # Local-only credentials from the pre-relay direct-FCM setup. The agent no

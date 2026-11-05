@@ -168,16 +168,6 @@ type InboxState struct {
 	UpdatedAt      time.Time
 }
 
-// GitHubToken stores the encrypted OAuth access token material for one agent.
-// CiphertextPath points at the on-disk encrypted blob; token plaintext never
-// lives in SQLite.
-type GitHubToken struct {
-	AccountLogin   string
-	CiphertextPath string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
 // PushDevice is one registered mobile device that can receive FCM-delivered
 // push notifications from this agent. We keep the registry on-host (rather
 // than in a separate cloud service) so the agent has no external dependency
@@ -196,18 +186,6 @@ type PushDevice struct {
 	ClientServerID string
 	RegisteredAt   time.Time
 	LastSeenAt     time.Time
-}
-
-// CliToken stores the encrypted credential material for one CLI (claude or
-// codex). Method records how the credential was obtained so callers can
-// reconstruct the right env vars / on-disk file when launching sessions.
-type CliToken struct {
-	Kind           string // "claude" | "codex"
-	Method         string // "subscription" | "token" | "api_key" | "auth_json"
-	Account        string // best-effort identifier (email, login) — may be empty
-	CiphertextPath string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
 }
 
 // ProjectMemory is one long-lived note the agent reuses across sessions for a
@@ -672,6 +650,16 @@ CREATE TABLE IF NOT EXISTS remediation_executions (
 
 CREATE INDEX IF NOT EXISTS remediation_executions_status_idx ON remediation_executions(status);
 CREATE INDEX IF NOT EXISTS remediation_executions_incident_idx ON remediation_executions(incident_id);
+
+CREATE TABLE IF NOT EXISTS incident_bindings (
+	incident_id  TEXT PRIMARY KEY,
+	monitor_kind TEXT NOT NULL,
+	target       TEXT NOT NULL,
+	severity     TEXT NOT NULL DEFAULT '',
+	summary      TEXT NOT NULL DEFAULT '',
+	event_id     TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS remediation_events (
 	execution_id TEXT NOT NULL,
@@ -1603,122 +1591,6 @@ func (s *Store) PutDiffSummary(d DiffSummary) error {
 	return err
 }
 
-// PutGitHubToken upserts the encrypted token pointer for the authenticated
-// GitHub account.
-func (s *Store) PutGitHubToken(t GitHubToken) error {
-	now := time.Now()
-	if t.CreatedAt.IsZero() {
-		t.CreatedAt = now
-	}
-	if t.UpdatedAt.IsZero() {
-		t.UpdatedAt = now
-	}
-	_, err := s.db.Exec(
-		`INSERT INTO github_tokens (account_login, ciphertext_path, created_at, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(account_login) DO UPDATE SET
-		   ciphertext_path = excluded.ciphertext_path,
-		   updated_at = excluded.updated_at`,
-		t.AccountLogin, t.CiphertextPath, t.CreatedAt.Unix(), t.UpdatedAt.Unix(),
-	)
-	return err
-}
-
-// GetGitHubToken loads the token pointer for one GitHub account.
-func (s *Store) GetGitHubToken(accountLogin string) (GitHubToken, error) {
-	row := s.db.QueryRow(
-		`SELECT account_login, ciphertext_path, created_at, updated_at
-		 FROM github_tokens WHERE account_login = ?`, accountLogin,
-	)
-	var t GitHubToken
-	var created, updated int64
-	if err := row.Scan(&t.AccountLogin, &t.CiphertextPath, &created, &updated); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return GitHubToken{}, fmt.Errorf("github_token: %w", ErrNotFound)
-		}
-		return GitHubToken{}, err
-	}
-	t.CreatedAt = time.Unix(created, 0)
-	t.UpdatedAt = time.Unix(updated, 0)
-	return t, nil
-}
-
-// ListGitHubTokens returns all stored token pointers.
-func (s *Store) ListGitHubTokens() ([]GitHubToken, error) {
-	rows, err := s.db.Query(
-		`SELECT account_login, ciphertext_path, created_at, updated_at
-		 FROM github_tokens ORDER BY account_login ASC`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []GitHubToken
-	for rows.Next() {
-		var t GitHubToken
-		var created, updated int64
-		if err := rows.Scan(&t.AccountLogin, &t.CiphertextPath, &created, &updated); err != nil {
-			return nil, err
-		}
-		t.CreatedAt = time.Unix(created, 0)
-		t.UpdatedAt = time.Unix(updated, 0)
-		out = append(out, t)
-	}
-	return out, rows.Err()
-}
-
-// DeleteGitHubToken removes one token pointer.
-func (s *Store) DeleteGitHubToken(accountLogin string) error {
-	_, err := s.db.Exec(`DELETE FROM github_tokens WHERE account_login = ?`, accountLogin)
-	return err
-}
-
-// PutCliToken upserts the encrypted credential pointer for a CLI.
-func (s *Store) PutCliToken(t CliToken) error {
-	now := time.Now()
-	if t.CreatedAt.IsZero() {
-		t.CreatedAt = now
-	}
-	t.UpdatedAt = now
-	_, err := s.db.Exec(
-		`INSERT INTO cli_tokens (kind, method, account, ciphertext_path, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(kind) DO UPDATE SET
-		   method = excluded.method,
-		   account = excluded.account,
-		   ciphertext_path = excluded.ciphertext_path,
-		   updated_at = excluded.updated_at`,
-		t.Kind, t.Method, t.Account, t.CiphertextPath, t.CreatedAt.Unix(), t.UpdatedAt.Unix(),
-	)
-	return err
-}
-
-// GetCliToken loads the credential pointer for one CLI kind.
-func (s *Store) GetCliToken(kind string) (CliToken, error) {
-	row := s.db.QueryRow(
-		`SELECT kind, method, account, ciphertext_path, created_at, updated_at
-		 FROM cli_tokens WHERE kind = ?`, kind,
-	)
-	var t CliToken
-	var created, updated int64
-	if err := row.Scan(&t.Kind, &t.Method, &t.Account, &t.CiphertextPath, &created, &updated); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return CliToken{}, fmt.Errorf("cli_token: %w", ErrNotFound)
-		}
-		return CliToken{}, err
-	}
-	t.CreatedAt = time.Unix(created, 0)
-	t.UpdatedAt = time.Unix(updated, 0)
-	return t, nil
-}
-
-// DeleteCliToken removes one CLI credential pointer.
-func (s *Store) DeleteCliToken(kind string) error {
-	_, err := s.db.Exec(`DELETE FROM cli_tokens WHERE kind = ?`, kind)
-	return err
-}
-
-// CreatePreview inserts a new preview row.
 func (s *Store) CreatePreview(p Preview) error {
 	if p.StartedAt.IsZero() {
 		p.StartedAt = time.Now()
@@ -1870,7 +1742,7 @@ func (s *Store) PutAgentSetting(key, value string) error {
 // LastSeenAt is always bumped to now (or to the value supplied by the caller
 // if non-zero), so the agent can later prune stale tokens that FCM has
 // rejected as unregistered. ClientServerID, when the caller supplies one, is
-// always overwritten -- the client re-sends it on every push.register call
+// always overwritten -- the client re-sent it on every registration call
 // and the app may have renamed/re-added the server since the last register.
 func (s *Store) PutPushDevice(d PushDevice) error {
 	if d.Token == "" {
@@ -2556,4 +2428,83 @@ func (s *Store) RemediationEventsAfter(executionID string, afterSeq int64) ([]Re
 // text-match approach since the driver does not expose a typed error.
 func isUniqueViolation(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// IncidentBinding ties a Watchtower incident id to the local monitor
+// (kind and target) that fired it. The relay tells the agent the incident id
+// in its answer to the firing event; the agent keeps the pair so a later
+// request that only carries the incident id (the app asking for a playbook)
+// can find the monitor again.
+type IncidentBinding struct {
+	IncidentID  string
+	MonitorKind string
+	Target      string
+	Severity    string
+	Summary     string
+	EventID     string
+	CreatedAt   time.Time
+}
+
+// PutIncidentBinding stores b and reports whether it was new. A second call
+// for the same incident id keeps the first binding: the first firing event is
+// the one that opened it.
+func (s *Store) PutIncidentBinding(b IncidentBinding) (bool, error) {
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO incident_bindings (incident_id, monitor_kind, target, severity, summary, event_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(incident_id) DO NOTHING`,
+		b.IncidentID, b.MonitorKind, b.Target, b.Severity, b.Summary, b.EventID, b.CreatedAt.Unix(),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// GetIncidentBinding loads the binding for one incident id.
+func (s *Store) GetIncidentBinding(incidentID string) (IncidentBinding, error) {
+	row := s.db.QueryRow(
+		`SELECT incident_id, monitor_kind, target, severity, summary, event_id, created_at
+		 FROM incident_bindings WHERE incident_id = ?`, incidentID,
+	)
+	var b IncidentBinding
+	var created int64
+	if err := row.Scan(&b.IncidentID, &b.MonitorKind, &b.Target, &b.Severity, &b.Summary, &b.EventID, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return IncidentBinding{}, fmt.Errorf("incident binding %s: %w", incidentID, ErrNotFound)
+		}
+		return IncidentBinding{}, err
+	}
+	b.CreatedAt = time.Unix(created, 0)
+	return b, nil
+}
+
+// ExecutionsForIncident lists the primary (non-rollback) executions of one
+// incident, newest first.
+func (s *Store) ExecutionsForIncident(incidentID string) ([]RemediationExecution, error) {
+	rows, err := s.db.Query(
+		`SELECT id, incident_id, runbook_id, runbook_hash, status, kind, parent_execution_id, created_at, updated_at
+		 FROM remediation_executions WHERE incident_id = ? AND kind = ?
+		 ORDER BY created_at DESC, id DESC`, incidentID, RemediationKindExecute,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RemediationExecution
+	for rows.Next() {
+		var e RemediationExecution
+		var created, updated int64
+		if err := rows.Scan(&e.ID, &e.IncidentID, &e.RunbookID, &e.RunbookHash, &e.Status, &e.Kind, &e.ParentExecutionID, &created, &updated); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(created, 0)
+		e.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }

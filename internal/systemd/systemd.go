@@ -55,12 +55,13 @@ const (
 	ActionStart   Action = "start"
 	ActionStop    Action = "stop"
 	ActionRestart Action = "restart"
+	ActionReload  Action = "reload"
 	ActionEnable  Action = "enable"
 	ActionDisable Action = "disable"
 )
 
 var allowedActions = map[Action]struct{}{
-	ActionStart: {}, ActionStop: {}, ActionRestart: {},
+	ActionStart: {}, ActionStop: {}, ActionRestart: {}, ActionReload: {},
 	ActionEnable: {}, ActionDisable: {},
 }
 
@@ -86,6 +87,9 @@ type UnitDetail struct {
 	Unit
 	FragmentPath string `json:"fragment_path,omitempty"`
 	Following    string `json:"following,omitempty"`
+	// NRestarts is how many times systemd restarted the unit on its own
+	// (the NRestarts property); 0 when unknown.
+	NRestarts int `json:"n_restarts,omitempty"`
 }
 
 // Status is a typed availability snapshot.
@@ -103,8 +107,6 @@ type Client interface {
 	List(ctx context.Context) ([]Unit, error)
 	Get(ctx context.Context, name string) (UnitDetail, error)
 	Action(ctx context.Context, name string, action Action) error
-	// Reboot triggers an immediate reboot of the whole host.
-	Reboot(ctx context.Context) error
 }
 
 // Config configures the Manager.
@@ -200,13 +202,6 @@ func (m *Manager) Action(ctx context.Context, name string, action Action) error 
 		}
 	}
 	return m.client.Action(ctx, name, action)
-}
-
-// Reboot triggers an immediate reboot of the whole host. There is no
-// protected-unit check: a full reboot is a host-wide action gated solely by the
-// caller's confirmation token, not by the per-unit blocklist.
-func (m *Manager) Reboot(ctx context.Context) error {
-	return m.client.Reboot(ctx)
 }
 
 // IsProtected reports whether name is in the protected-unit blocklist.

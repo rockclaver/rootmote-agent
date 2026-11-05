@@ -12,63 +12,40 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
-	"github.com/rockclaver/rootmote-agent/internal/alerts"
-	"github.com/rockclaver/rootmote-agent/internal/cliauth"
+	"github.com/rockclaver/rootmote-agent/internal/diagnose/redact"
 	"github.com/rockclaver/rootmote-agent/internal/docker"
-	"github.com/rockclaver/rootmote-agent/internal/firewall"
-	gh "github.com/rockclaver/rootmote-agent/internal/github"
 	"github.com/rockclaver/rootmote-agent/internal/infra"
-	"github.com/rockclaver/rootmote-agent/internal/inventory"
 	"github.com/rockclaver/rootmote-agent/internal/monitor"
 	"github.com/rockclaver/rootmote-agent/internal/notifications"
-	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
-	"github.com/rockclaver/rootmote-agent/internal/push"
 	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
-	"github.com/rockclaver/rootmote-agent/internal/runbook"
-	"github.com/rockclaver/rootmote-agent/internal/security"
 	"github.com/rockclaver/rootmote-agent/internal/server"
-	"github.com/rockclaver/rootmote-agent/internal/storage"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
-	"github.com/rockclaver/rootmote-agent/internal/tooling"
 	"github.com/rockclaver/rootmote-agent/internal/version"
 	"github.com/rockclaver/rootmote-agent/internal/watchtower"
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
 )
-
-// defaultNotifyRelayURL is the org-operated rootmote-notify deployment (see
-// github.com/rockclaver/rootmote-notify). Override with --notify-relay-url or
-// ROOTMOTE_NOTIFY_RELAY_URL to point at a self-hosted relay instead, or set
-// to "" to disable server-side push entirely.
-const defaultNotifyRelayURL = "https://notify.orivo.app"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "pairing-key" {
 		printPairingKey(os.Args[2:])
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == storage.PrivilegedRemoveSubcommand {
-		if err := storage.RunPrivilegedRemove(os.Args[2:]); err != nil {
-			_, _ = os.Stderr.WriteString(err.Error() + "\n")
-			os.Exit(1)
-		}
-		return
+	if len(os.Args) > 1 && os.Args[1] == "priv" {
+		os.Exit(runPriv(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "steps" {
+		os.Exit(runSteps(os.Args[2:], os.Stdout))
 	}
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
-	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state, encrypted CLI credentials, and managed tooling")
+	dataDir := flag.String("data-dir", defaultDataDir(), "directory for agent state")
 	requirePairing := flag.Bool("require-pairing", true, "require the mobile app to present the control-plane pairing key on the WebSocket; disable only for local development")
-	notifyRelayURL := flag.String("notify-relay-url", envOr("ROOTMOTE_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central rootmote-notify relay; set to empty to disable push")
-	notifyToken := flag.String("notify-token", envOr("ROOTMOTE_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
-	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("ROOTMOTE_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
 	watchtowerRelayURL := flag.String("watchtower-relay-url", envOr("ROOTMOTE_WATCHTOWER_RELAY_URL", ""), "base URL of the Watchtower relay (github.com/rockclaver/rootmote-watchtower); starts the outbound heartbeat loop at boot. Leave empty to stay opt-out until enrolled via the watchtower.enable control-plane kind (also auto-resumes at boot if a prior enrollment's cred file exists)")
-	runbookAgent := flag.String("runbook-agent", envOr("ROOTMOTE_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
-	serverID := flag.String("server-id", envOr("ROOTMOTE_SERVER_ID", "local"), "stable identifier attached to this host's operational telemetry")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -91,28 +68,11 @@ func main() {
 	}
 	defer st.Close()
 
-	toolingMgr, err := tooling.New(tooling.Config{
-		BinDir:    filepath.Join(*dataDir, "bin"),
-		NpmPrefix: filepath.Join(*dataDir, "npm-prefix"),
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init tooling: %v", err)
-	}
+	removeRetiredCredentials(*dataDir)
 	reviewMgr := review.New(st)
-	// Keep the established vault paths so upgrades can still decrypt existing
-	// AI provider credentials, even though repository operations are retired.
-	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
-
-	// cliauth reuses the same vault for CLI credentials. SQLite keeps the
-	// two namespaces separate (cli_tokens vs github_tokens).
-	authMgr, err := cliauth.New(cliauth.Config{
-		BinDir:  toolingMgr.BinDir(),
-		HomeDir: homeDirOr(*dataDir),
-		Vault:   vault,
-		Store:   st,
-	})
+	diagnoseRedactor, err := redact.New(nil)
 	if err != nil {
-		log.Fatalf("rootmote-agent: init cliauth: %v", err)
+		log.Fatalf("rootmote-agent: init redaction rules: %v", err)
 	}
 	dockerMgr, err := docker.New(docker.Config{
 		Client: docker.NewSocketClient(""),
@@ -123,14 +83,6 @@ func main() {
 	infraMgr, err := infra.New(infra.Config{})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init infra: %v", err)
-	}
-	storageMgr, err := storage.New(storage.Config{
-		HomeDir: homeDirOr(*dataDir),
-		DataDir: *dataDir,
-		Docker:  dockerMgr,
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init storage: %v", err)
 	}
 	var serviceClient systemd.Client = systemd.NewSystemctlClient()
 	if runtime.GOOS == "darwin" {
@@ -143,29 +95,6 @@ func main() {
 	webserverMgr, err := webserver.New(webserver.Config{Systemd: systemdMgr})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init webservers: %v", err)
-	}
-	processMgr, err := agentprocess.New(agentprocess.Config{Platform: runtime.GOOS})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init process inspector: %v", err)
-	}
-	var socketReader firewall.SocketReader = firewall.NewSSCommandReader()
-	if runtime.GOOS == "darwin" {
-		socketReader = firewall.NewNetstatSocketReader()
-	}
-	firewallMgr, err := firewall.New(firewall.Config{
-		Backends: []firewall.Backend{firewall.NewUFWBackend(), firewall.NewFirewalldBackend()},
-		Sockets:  socketReader,
-		SSH:      firewall.SSHFromSockets{Reader: socketReader},
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init firewall: %v", err)
-	}
-	securityMgr, err := security.New(security.Config{
-		Firewall:  firewallMgr,
-		Processes: processMgr,
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init security audit: %v", err)
 	}
 
 	// Watchtower Phase 1 tracer (issue #79): a pure outbound heartbeat
@@ -182,107 +111,32 @@ func main() {
 	}
 
 	// Remediation owns the durable "approve, execute, verify" lifecycle for
-	// one approved runbook (issue #74). The typed StepExecutor/
-	// InternalVerifier adapters reuse exactly the same systemd/process/
-	// firewall/security managers infra.service.action / infra.process.kill
-	// / infra.firewall.rule_* / security.fix mutate through -- no second,
-	// unguarded execution path. The Projector posts every lifecycle event
-	// to the relay through the watchtower client (issue #74 Task 4) via
-	// watchtower.RemediationProjector, which redacts to the relay's
-	// accepted wire shape and resolves each event's incident from st.
-	// wtClient may be nil (watchtower disabled); RemediationProjector is a
-	// safe no-op in that case, exactly like an unenrolled client.
+	// one approved runbook. Steps run through the typed step catalog: each
+	// step is validated, root steps go through the privilege helper
+	// (`sudo -n rootmote-agent priv ...`), and nothing runs a free-form
+	// command. The Projector posts every lifecycle event to the relay
+	// through the watchtower client, which redacts to the relay's accepted
+	// wire shape and resolves each event's incident from st. wtClient may
+	// be nil (watchtower disabled); RemediationProjector is then a no-op.
+	privCaller := steps.ExecPriv{}
+	urlAllowlist := server.NewURLAllowlist(webserverMgr)
+	stepRunner := &steps.Runner{Env: server.NewStepsEnv(server.StepsDeps{
+		Systemd: systemdMgr,
+		Docker:  dockerMgr,
+		Priv:    privCaller,
+		URLs:    urlAllowlist,
+	})}
 	remediationMgr, err := remediation.New(remediation.Config{
 		Store:     st,
-		Executor:  server.NewRemediationStepExecutor(systemdMgr, processMgr, firewallMgr, securityMgr),
+		Executor:  server.NewRemediationStepExecutor(stepRunner),
 		Validator: server.NewRemediationApprovalValidator(reviewMgr, st),
-		Verifier:  server.NewRemediationInternalVerifier(systemdMgr, firewallMgr),
+		Verifier:  server.NewRemediationInternalVerifier(stepRunner, stepRunner.Env.Units),
 		Projector: watchtower.RemediationProjector{Client: wtClient, Store: st},
 	})
 	if err != nil {
 		log.Fatalf("rootmote-agent: init remediation: %v", err)
 	}
 	notificationHub := notifications.NewHub()
-	// monitorRunning flips once the Watchtower monitor engine is evaluating.
-	// From then on it owns every condition in monitor.OwnsAlertRule, and the
-	// legacy alerts manager keeps its inbox/ack/silence state for them but
-	// stops publishing a second push (see monitor/ownership.go).
-	var monitorRunning atomic.Bool
-	alertMgr, err := alerts.New(alerts.Config{
-		Store:   st,
-		Metrics: infraMgr,
-		Systemd: systemdMgr,
-		Sink:    notificationHub,
-		MonitorOwns: func(rule string) bool {
-			return monitorRunning.Load() && monitor.OwnsAlertRule(rule)
-		},
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init alerts: %v", err)
-	}
-
-	aiProposalMgr := aiproposal.New()
-
-	// Runbook turns fired alerts into AI-proposed remediations that fan out
-	// through the existing aiproposal queue. The proposer shells out to the
-	// host-installed claude/codex CLI (already authenticated via cliauth),
-	// so we add no second auth surface.
-	runbookMgr, err := runbook.New(runbook.Config{
-		AIProposals: aiProposalMgr,
-		Proposer: runbook.CLIProposer{
-			Agent:   *runbookAgent,
-			BinDir:  toolingMgr.BinDir(),
-			HomeDir: homeDirOr(*dataDir),
-			Secrets: authMgr.Secrets,
-		},
-		ProposerForAgent: func(agent string) runbook.Proposer {
-			switch agent {
-			case "claude", "codex":
-				return runbook.CLIProposer{
-					Agent:   agent,
-					BinDir:  toolingMgr.BinDir(),
-					HomeDir: homeDirOr(*dataDir),
-					Secrets: authMgr.Secrets,
-				}
-			default:
-				return nil
-			}
-		},
-		Snapshotter: runbook.SnapshotFunc(func(ctx context.Context) runbook.Grounding {
-			g := runbook.Grounding{Metrics: infraMgr.Sample(ctx)}
-			if systemdMgr != nil {
-				if units, err := systemdMgr.List(ctx); err == nil {
-					g.Services = units
-				}
-			}
-			if processMgr != nil {
-				if procs, err := processMgr.List(ctx, "cpu", 50); err == nil {
-					g.Processes = procs
-				}
-			}
-			if firewallMgr != nil {
-				if st, err := firewallMgr.Status(ctx); err == nil {
-					g.Firewall = st
-				}
-			}
-			return g
-		}),
-		Notifications: notificationHub,
-	})
-	if err != nil {
-		log.Fatalf("rootmote-agent: init runbook: %v", err)
-	}
-
-	hostname, _ := os.Hostname()
-	pushDeliveryConfigured := false
-	inventoryMgr := inventory.New(inventory.Config{
-		Docker:         dockerMgr,
-		Systemd:        systemdMgr,
-		Processes:      processMgr,
-		PushDevices:    st,
-		PushConfigured: func() bool { return pushDeliveryConfigured },
-		Auth:           authMgr,
-	})
 
 	// Watchtower Phase 2 local monitor engine (issue #78): the agent-side
 	// state machine that evaluates the disk/inode/memory/docker/systemd
@@ -295,6 +149,7 @@ func main() {
 			Infra:   infraMgr,
 			Docker:  dockerMgr,
 			Systemd: systemdMgr,
+			PM2:     monitor.NewPM2Source(privCaller),
 			Store:   st,
 			Client:  wtClient,
 		})
@@ -314,36 +169,38 @@ func main() {
 			// Watchtower.
 			bg := context.Background()
 			monMgr.Start(bg)
-			monitorRunning.Store(true)
-			go syncMonitorsLoop(bg, wtClient, monMgr)
+			go syncMonitorsLoop(bg, wtClient, monMgr, urlAllowlist)
 			log.Printf("rootmote-agent: watchtower monitor engine started")
 		})
 	}
-	srv := server.New(server.Config{
+	srvCfg := server.Config{
 		Addr:                *addr,
 		Review:              reviewMgr,
-		Tooling:             toolingMgr,
-		Auth:                authMgr,
 		Docker:              dockerMgr,
 		Infra:               infraMgr,
 		Systemd:             systemdMgr,
 		Webservers:          webserverMgr,
-		Processes:           processMgr,
-		Firewall:            firewallMgr,
-		Storage:             storageMgr,
-		Security:            securityMgr,
-		Alerts:              alertMgr,
-		AIProposals:         aiProposalMgr,
 		Notifications:       notificationHub,
-		Runbook:             runbookMgr,
 		Remediation:         remediationMgr,
-		Inventory:           inventoryMgr,
-		PushDevices:         st,
+		Store:               st,
+		URLs:                urlAllowlist,
+		Steps:               stepRunner,
+		DiagnoseRedactor:    diagnoseRedactor,
+		Priv:                privCaller,
 		Watchtower:          wtClient,
 		OnWatchtowerEnabled: startMonitorEngine,
 		ControlPlaneKey:     controlPlaneKey,
 		RequirePairing:      *requirePairing,
-	})
+	}
+	if monMgr != nil {
+		srvCfg.Monitor = monMgr
+	}
+	srv := server.New(srvCfg)
+	if wtClient != nil {
+		// The relay answers each firing monitor event with the incident it
+		// opened; the server proposes a playbook for it.
+		wtClient.IncidentOpened = srv.IncidentOpened
+	}
 	ln, err := srv.Listen()
 	if err != nil {
 		log.Fatalf("rootmote-agent: %v", err)
@@ -352,6 +209,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	srv.StartPlaybooks(ctx)
 	// A host command may have been mid-flight when the agent last stopped;
 	// RecoverInterrupted fails those executions closed (remediation_failed)
 	// rather than guessing whether the last step actually completed on the
@@ -361,9 +219,6 @@ func main() {
 	} else if len(recovered) > 0 {
 		log.Printf("rootmote-agent: recovered %d interrupted remediation(s) as failed", len(recovered))
 	}
-	alertMgr.Start(ctx)
-	runbookCleanup := runbookMgr.Start(ctx)
-	defer runbookCleanup()
 
 	// Watchtower heartbeat loop: opt-in. Starts at boot when either a relay
 	// URL is pre-configured (--watchtower-relay-url / ROOTMOTE_WATCHTOWER_RELAY_URL)
@@ -382,59 +237,6 @@ func main() {
 	// callback from watchtower.enable.
 	if *watchtowerRelayURL != "" || (wtClient != nil && wtClient.Creds() != nil) {
 		startMonitorEngine()
-	}
-
-	// Push delivery: optional. The agent stays fully functional without it
-	// (the notification hub + inbox keep delivering to connected sockets).
-	// With a relay URL configured, we additionally fan high-signal events
-	// out as system-level push so a backgrounded device still wakes the
-	// user. The relay (github.com/rockclaver/rootmote-notify) holds the one
-	// shared FCM service-account credential, so no per-install Firebase
-	// project is required: the agent self-registers for a bearer token on
-	// first run and persists it in agent_settings.
-	if *notifyRelayURL != "" {
-		token := *notifyToken
-		if token == "" {
-			if saved, getErr := st.GetAgentSetting("notify_relay_token"); getErr == nil {
-				token = saved
-			}
-		}
-		if token == "" {
-			registerCtx, registerCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			registeredToken, regErr := push.Register(registerCtx, *notifyRelayURL, hostname, *notifyEnrollSecret, nil)
-			registerCancel()
-			if regErr != nil {
-				log.Printf("rootmote-agent: notify relay register failed, push disabled: %v", regErr)
-			} else {
-				token = registeredToken
-				if putErr := st.PutAgentSetting("notify_relay_token", token); putErr != nil {
-					log.Printf("rootmote-agent: persist notify token: %v", putErr)
-				}
-			}
-		}
-		if token != "" {
-			// Prefer the operator-set --server-id (the same label used for
-			// cross-fleet cost/usage rows) when it has actually been set;
-			// otherwise fall back to the host's own name. Either way this
-			// prefixes the push title so a phone receiving alerts from
-			// several agents through the shared relay can tell them apart --
-			// every agent's alert body otherwise reads identically (e.g.
-			// "sshd.service recovered").
-			label := *serverID
-			if label == "" || label == alerts.ServerLocal {
-				label = hostname
-			}
-			pushHub := &push.Hub{
-				Sender: push.NewRelayClient(*notifyRelayURL, token, nil),
-				Store:  st,
-				Label:  label,
-				Logf:   log.Printf,
-			}
-			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
-			defer pushCleanup()
-			pushDeliveryConfigured = true
-			log.Printf("rootmote-agent: notify relay push enabled (%s)", *notifyRelayURL)
-		}
 	}
 
 	if err := srv.Serve(ctx, ln); err != nil {
@@ -456,14 +258,14 @@ func defaultDataDir() string {
 	return "./rootmote-data"
 }
 
-// homeDirOr falls back to the parent of dataDir if $HOME isn't set, so the
-// CLIs' credential files land somewhere stable. On the systemd-managed agent
-// $HOME=/var/lib/rootmote, dataDir=/var/lib/rootmote/rootmote, parent matches.
-func homeDirOr(dataDir string) string {
-	if h, err := os.UserHomeDir(); err == nil && h != "" {
-		return h
+// removeRetiredCredentials deletes the encrypted CLI and repository
+// credentials earlier agent versions kept. The agent no longer uses them.
+func removeRetiredCredentials(dataDir string) {
+	for _, name := range []string{"github-token.key", "github-tokens"} {
+		if err := os.RemoveAll(filepath.Join(dataDir, name)); err != nil {
+			log.Printf("rootmote-agent: remove retired %s: %v", name, err)
+		}
 	}
-	return filepath.Dir(dataDir)
 }
 
 // controlPlaneKeyPath is the 0600 file holding the WebSocket pairing key the
@@ -506,7 +308,7 @@ func loadOrCreateControlPlaneKey(dataDir string) (string, error) {
 // edit / disable) reaches the agent. It runs an immediate sync, then every
 // minute until ctx is done. A failed sync is logged and retried on the next
 // tick; the engine keeps evaluating whatever definitions it last had.
-func syncMonitorsLoop(ctx context.Context, wt *watchtower.Client, mon *monitor.Manager) {
+func syncMonitorsLoop(ctx context.Context, wt *watchtower.Client, mon *monitor.Manager, urls *server.URLAllowlist) {
 	sync := func() {
 		defs, err := wt.SyncMonitors(ctx)
 		if err != nil {
@@ -514,6 +316,15 @@ func syncMonitorsLoop(ctx context.Context, wt *watchtower.Client, mon *monitor.M
 			return
 		}
 		mon.SetSyncedDefinitions(monitor.DefinitionsFromSync(defs))
+		// check.http may only request addresses of this host: its own name,
+		// its web server domains, and the hosts of the user's web monitors.
+		var targets []string
+		for _, d := range defs {
+			if d.Kind == "external_http" || d.Kind == "tls_expiry" {
+				targets = append(targets, d.Target)
+			}
+		}
+		urls.SetMonitorTargets(targets)
 	}
 	sync()
 	ticker := time.NewTicker(time.Minute)
@@ -528,6 +339,42 @@ func syncMonitorsLoop(ctx context.Context, wt *watchtower.Client, mon *monitor.M
 	}
 }
 
+// serviceDataDir is the data dir of the systemd service the installer sets up
+// (the `rootmote` user's home is /var/lib/rootmote and the agent keeps its
+// data in the `rootmote` folder inside it).
+const serviceDataDir = "/var/lib/rootmote/rootmote"
+
+// pairingKeyDirs lists the data dirs that may hold the pairing key, in order.
+// An explicit --data-dir comes first. On Linux, when the service's data dir
+// exists it is used whatever $HOME is: a root shell has its own
+// ~/rootmote, and reading a key from there would hand the app a key the
+// running agent does not accept. Without a service dir (a manual or macOS
+// run) the user's own data dir is used.
+func pairingKeyDirs(flagDir, goos, serviceDir string) []string {
+	var dirs []string
+	if flagDir != "" {
+		dirs = append(dirs, flagDir)
+	}
+	if goos == "linux" {
+		if fi, err := os.Stat(serviceDir); err == nil && fi.IsDir() {
+			return append(dirs, serviceDir)
+		}
+	}
+	return append(dirs, defaultDataDir(), serviceDir)
+}
+
+// readPairingKey returns the first non-empty pairing key found in dirs.
+func readPairingKey(dirs []string) (string, bool) {
+	for _, dir := range dirs {
+		if b, err := os.ReadFile(controlPlaneKeyPath(dir)); err == nil {
+			if key := strings.TrimSpace(string(b)); key != "" {
+				return key, true
+			}
+		}
+	}
+	return "", false
+}
+
 // printPairingKey implements `rootmote-agent pairing-key`: it prints the
 // control-plane pairing key so the mobile app can read it over SSH. It scans
 // the standard install locations so an operator can run it (as root / via
@@ -536,18 +383,9 @@ func printPairingKey(args []string) {
 	fs := flag.NewFlagSet("pairing-key", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "agent data dir (defaults to the standard install locations)")
 	_ = fs.Parse(args)
-	var candidates []string
-	if *dataDir != "" {
-		candidates = append(candidates, *dataDir)
-	}
-	candidates = append(candidates, defaultDataDir(), "/var/lib/rootmote/rootmote")
-	for _, dir := range candidates {
-		if b, err := os.ReadFile(controlPlaneKeyPath(dir)); err == nil {
-			if key := strings.TrimSpace(string(b)); key != "" {
-				_, _ = os.Stdout.WriteString(key + "\n")
-				return
-			}
-		}
+	if key, ok := readPairingKey(pairingKeyDirs(*dataDir, runtime.GOOS, serviceDataDir)); ok {
+		_, _ = os.Stdout.WriteString(key + "\n")
+		return
 	}
 	log.Fatal("rootmote-agent: pairing key not found; is the agent installed and started?")
 }

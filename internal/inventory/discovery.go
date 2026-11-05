@@ -31,20 +31,25 @@ import (
 // restart history. It also carries a suggestion-only list of the services
 // that look production-critical — nothing here enables a monitor.
 type DiscoveryReport struct {
-	CapturedAt         time.Time            `json:"capturedAt"`
-	OS                 OSInfo               `json:"os"`
-	Capacity           CapacityInfo         `json:"capacity"`
-	Disks              []DiskInfo           `json:"disks"`
-	Docker             DockerInfo           `json:"docker"`
-	SystemdUnits       []SystemdUnitInfo    `json:"systemdUnits"`
-	ReverseProxies     []ReverseProxyInfo   `json:"reverseProxies"`
-	ListeningPorts     []ListeningPortInfo  `json:"listeningPorts"`
-	Databases          []DatabaseInfo       `json:"databases"`
-	PublicDomains      []string             `json:"publicDomains"`
-	TLSCertificates    []TLSCertificateInfo `json:"tlsCertificates"`
-	RestartHistory     []RestartEntry       `json:"restartHistory"`
-	ProductionCritical []string             `json:"productionCritical"`
-	Warnings           []string             `json:"warnings"`
+	CapturedAt         time.Time               `json:"capturedAt"`
+	OS                 OSInfo                  `json:"os"`
+	Capacity           CapacityInfo            `json:"capacity"`
+	Disks              []DiskInfo              `json:"disks"`
+	Docker             DockerInfo              `json:"docker"`
+	SystemdUnits       []SystemdUnitInfo       `json:"systemdUnits"`
+	ReverseProxies     []ReverseProxyInfo      `json:"reverseProxies"`
+	ListeningPorts     []ListeningPortInfo     `json:"listeningPorts"`
+	Databases          []DatabaseInfo          `json:"databases"`
+	DatabaseUnits      []DatabaseUnitInfo      `json:"databaseUnits"`
+	PM2Apps            []PM2AppInfo            `json:"pm2Apps"`
+	PHPFPMUnits        []string                `json:"phpFpmUnits"`
+	SupervisorPrograms []SupervisorProgramInfo `json:"supervisorPrograms"`
+	Certs              []CertInfo              `json:"certs"`
+	PublicDomains      []string                `json:"publicDomains"`
+	TLSCertificates    []TLSCertificateInfo    `json:"tlsCertificates"`
+	RestartHistory     []RestartEntry          `json:"restartHistory"`
+	ProductionCritical []string                `json:"productionCritical"`
+	Warnings           []string                `json:"warnings"`
 }
 
 // OSInfo describes the host operating system.
@@ -200,6 +205,9 @@ type DiscoveryConfig struct {
 	ReadFile  FileReader
 	Glob      Globber
 	Now       func() time.Time
+	// Priv runs `rootmote-agent priv <action> <args...>` and returns its
+	// stdout. Nil means the helper is not available.
+	Priv func(ctx context.Context, action string, args ...string) ([]byte, error)
 }
 
 // Discoverer runs the read-only host discovery scan.
@@ -239,6 +247,11 @@ func (d *Discoverer) Discover(ctx context.Context) DiscoveryReport {
 		ReverseProxies:     []ReverseProxyInfo{},
 		ListeningPorts:     []ListeningPortInfo{},
 		Databases:          []DatabaseInfo{},
+		DatabaseUnits:      []DatabaseUnitInfo{},
+		PM2Apps:            []PM2AppInfo{},
+		PHPFPMUnits:        []string{},
+		SupervisorPrograms: []SupervisorProgramInfo{},
+		Certs:              []CertInfo{},
 		PublicDomains:      []string{},
 		TLSCertificates:    []TLSCertificateInfo{},
 		RestartHistory:     []RestartEntry{},
@@ -255,7 +268,8 @@ func (d *Discoverer) Discover(ctx context.Context) DiscoveryReport {
 	d.discoverWebserver(ctx, &report)
 	d.discoverListeningPorts(ctx, &report)
 	d.discoverDatabases(&report)
-	d.discoverTLS(&report)
+	d.discoverStack(ctx, &report)
+	d.discoverTLS(ctx, &report)
 	d.discoverRestartHistory(&report)
 	d.discoverProductionCritical(&report, details)
 
@@ -678,7 +692,7 @@ var dbPorts = map[int]string{
 func (d *Discoverer) discoverDatabases(report *DiscoveryReport) {
 	type key struct{ engine, target string }
 	seen := map[key]bool{}
-	var dbs []DatabaseInfo
+	dbs := []DatabaseInfo{}
 	add := func(engine, source, target string, port int) {
 		k := key{engine, target}
 		if seen[k] {
@@ -724,11 +738,15 @@ func (d *Discoverer) discoverDatabases(report *DiscoveryReport) {
 // --- TLS certificates --------------------------------------------------
 
 var tlsGlobPatterns = []string{
-	"/etc/letsencrypt/live/*/fullchain.pem",
 	"/var/lib/caddy/.local/share/caddy/certificates/**/*.crt",
 }
 
-func (d *Discoverer) discoverTLS(report *DiscoveryReport) {
+func (d *Discoverer) discoverTLS(ctx context.Context, report *DiscoveryReport) {
+	certs := d.discoverLetsEncrypt(ctx, report)
+	if certs == nil {
+		certs = []TLSCertificateInfo{}
+	}
+
 	var paths []string
 	for _, pattern := range tlsGlobPatterns {
 		matches, err := d.cfg.Glob(pattern)
@@ -740,7 +758,6 @@ func (d *Discoverer) discoverTLS(report *DiscoveryReport) {
 	}
 	sort.Strings(paths)
 
-	certs := make([]TLSCertificateInfo, 0, len(paths))
 	for _, path := range paths {
 		cert, err := d.parseCertFile(path)
 		if err != nil {

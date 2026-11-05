@@ -15,9 +15,8 @@ import (
 
 // TestIncidentDiagnose_ReturnsAssessmentAndEvidence is a WS round trip
 // against a test server wired with a fake docker.Manager: incident.diagnose
-// runs the real Collector/Match pipeline (deterministic-only, no
-// DiagnoseProposer configured, proving AC6's "AI unavailable" path still
-// serves a full diagnosis) and incident.evidence returns the exact bundle
+// runs the real Collector/Match pipeline and returns the deterministic
+// assessment, and incident.evidence returns the exact bundle
 // that diagnosis was built from -- proved by a strictly-increasing fake
 // clock: a re-collection would observe a later capturedAt.
 func TestIncidentDiagnose_ReturnsAssessmentAndEvidence(t *testing.T) {
@@ -87,9 +86,6 @@ func TestIncidentDiagnose_ReturnsAssessmentAndEvidence(t *testing.T) {
 	}
 	if assessment.IncidentID != "inc_1" {
 		t.Fatalf("assessment.IncidentID = %q, want inc_1", assessment.IncidentID)
-	}
-	if assessment.AIAvailable {
-		t.Fatalf("assessment.AIAvailable = true, want false (no DiagnoseProposer configured)")
 	}
 	if assessment.SummaryText == "" || assessment.Confidence <= 0 {
 		t.Fatalf("assessment not populated: %+v", assessment)

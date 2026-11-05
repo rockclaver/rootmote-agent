@@ -35,8 +35,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 )
 
@@ -63,10 +63,22 @@ type ApprovalValidator interface {
 	Validate(ctx context.Context, token, executionID, contentHash string) (tokenID string, err error)
 }
 
-// VerificationResult is one internal-verification outcome.
+// StepVerification is the outcome of one step's own catalog verification.
+// Index is the step's position in the runbook.
+type StepVerification struct {
+	Index  int
+	Kind   string
+	Passed bool
+	Detail string
+}
+
+// VerificationResult is one internal-verification outcome. Steps holds the
+// per-step results, in step order; Passed is true only when every step and
+// every runbook check passed.
 type VerificationResult struct {
 	Passed bool
 	Detail string
+	Steps  []StepVerification
 }
 
 // InternalVerifier runs the agent's own bounded checks once execution
@@ -108,10 +120,9 @@ var (
 	// but no step_result event durably recorded a successful step to
 	// invert (e.g. the parent failed on its very first step).
 	ErrNoRollbackPlan = errors.New("remediation: runbook has no rollback plan")
-	// ErrRollbackUnsupported is returned by DeriveRollback when the parent
-	// runbook's typed steps cannot be safely, structurally reversed (see
-	// invertSteps).
-	ErrRollbackUnsupported = errors.New("remediation: rollback steps cannot be safely reversed")
+	// ErrRollbackUnsupported is returned by DeriveRollback when none of the
+	// steps that ran has a catalog undo (see invertSteps).
+	ErrRollbackUnsupported = errors.New("remediation: none of the steps that ran can be undone")
 )
 
 // Config wires Manager's dependencies. Store, Executor, Validator, and
@@ -448,6 +459,12 @@ func (m *Manager) Execute(ctx context.Context, executionID, requestedHash string
 	if verr != nil {
 		verifyData["error"] = verr.Error()
 	}
+	for _, sv := range result.Steps {
+		data := map[string]any{"index": sv.Index, "kind": sv.Kind, "passed": sv.Passed, "detail": sv.Detail}
+		if _, err := m.appendEvent(ctx, executionID, "step_verification", data); err != nil {
+			return store.RemediationExecution{}, err
+		}
+	}
 	if _, err := m.appendEvent(ctx, executionID, "internal_verification", verifyData); err != nil {
 		return store.RemediationExecution{}, err
 	}
@@ -767,18 +784,25 @@ func (m *Manager) DeriveRollback(ctx context.Context, parentExecutionID string) 
 	if len(successful) == 0 {
 		return store.RemediationExecution{}, ErrNoRollbackPlan
 	}
-	inverted, err := invertSteps(successful)
-	if err != nil {
-		return store.RemediationExecution{}, fmt.Errorf("%w: %v", ErrRollbackUnsupported, err)
+	inverted, irreversible := invertSteps(successful)
+	if len(inverted) == 0 {
+		return store.RemediationExecution{}, ErrRollbackUnsupported
 	}
 	rollbackRb := runbook.Runbook{
 		ID:            parentRb.ID + rollbackIDSuffix,
 		SchemaVersion: parentRb.SchemaVersion,
 		IncidentID:    parentRb.IncidentID,
+		Title:         "Undo: " + parentRb.Title,
+		Source:        parentRb.Source,
 		Summary:       "Rollback of " + parentRb.ID,
 		Risk:          parentRb.Risk,
 		RunAs:         parentRb.RunAs,
 		Steps:         inverted,
+	}
+	for _, step := range irreversible {
+		rollbackRb.ManualSteps = append(rollbackRb.ManualSteps, runbook.ManualStep{
+			Text: "This step cannot be undone: " + step.Description,
+		})
 	}
 	if rollbackForcesL3(inverted) {
 		rollbackRb.Blocked = true
@@ -806,12 +830,12 @@ type stepResultData struct {
 // event at all (one Execute's first-failure stop never reached). This is
 // the durable source of truth DeriveRollback inverts from, rather than the
 // parent runbook's full, static Steps slice.
-func (m *Manager) successfulSteps(executionID string, steps []runbook.Step) ([]runbook.Step, error) {
+func (m *Manager) successfulSteps(executionID string, list []runbook.Step) ([]runbook.Step, error) {
 	events, err := m.store.RemediationEventsAfter(executionID, 0)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]runbook.Step, 0, len(steps))
+	out := make([]runbook.Step, 0, len(list))
 	for _, ev := range events {
 		if ev.Type != "step_result" {
 			continue
@@ -823,90 +847,62 @@ func (m *Manager) successfulSteps(executionID string, steps []runbook.Step) ([]r
 		if d.Error != "" || d.ExitCode != 0 {
 			continue
 		}
-		if d.Index < 0 || d.Index >= len(steps) {
+		if d.Index < 0 || d.Index >= len(list) {
 			continue
 		}
-		out = append(out, steps[d.Index])
+		out = append(out, list[d.Index])
 	}
 	return out, nil
 }
 
-// invertSteps structurally reverses steps in reverse order (undo the last
-// change first), or returns an error naming the first step it cannot
-// safely invert.
-func invertSteps(steps []runbook.Step) ([]runbook.Step, error) {
-	out := make([]runbook.Step, len(steps))
-	for i, j := len(steps)-1, 0; i >= 0; i, j = i-1, j+1 {
-		inv, err := invertStep(steps[i])
-		if err != nil {
-			return nil, err
-		}
-		out[j] = inv
-	}
-	return out, nil
-}
-
-// invertStep returns the typed, guarded step that undoes step, or an error
-// if step's kind has no safe structural inverse (aiproposal.KindProcessKill
-// and aiproposal.KindSecurityFix: killing a process or an ad hoc security
-// fix cannot be mechanically undone).
-func invertStep(step runbook.Step) (runbook.Step, error) {
-	switch step.Kind {
-	case aiproposal.KindFirewallAdd:
-		return runbook.Step{Kind: aiproposal.KindFirewallRemove, Params: step.Params, Description: "Revert: " + step.Description}, nil
-	case aiproposal.KindFirewallRemove:
-		return runbook.Step{Kind: aiproposal.KindFirewallAdd, Params: step.Params, Description: "Revert: " + step.Description}, nil
-	case aiproposal.KindServiceAction:
-		action, _ := step.Params["action"].(string)
-		inv, ok := invertServiceAction(action)
+// invertSteps returns the catalog undo of every step that has one, in reverse
+// order (undo the last change first). Steps with no undo are returned
+// separately, in their original order, so the caller can list them as
+// "cannot be undone".
+func invertSteps(list []runbook.Step) (inverted, irreversible []runbook.Step) {
+	for i := len(list) - 1; i >= 0; i-- {
+		undoID, params, ok := steps.UndoOf(list[i].Kind, list[i].Params)
 		if !ok {
-			return runbook.Step{}, fmt.Errorf("service action %q has no safe inverse", action)
-		}
-		params := make(map[string]any, len(step.Params))
-		for k, v := range step.Params {
-			params[k] = v
-		}
-		params["action"] = inv
-		return runbook.Step{Kind: step.Kind, Params: params, Description: "Revert: " + step.Description}, nil
-	default:
-		return runbook.Step{}, fmt.Errorf("step kind %q cannot be safely reversed", step.Kind)
-	}
-}
-
-func invertServiceAction(action string) (string, bool) {
-	switch action {
-	case "start":
-		return "stop", true
-	case "stop":
-		return "start", true
-	case "enable":
-		return "disable", true
-	case "disable":
-		return "enable", true
-	default:
-		return "", false
-	}
-}
-
-// rollbackForcesL3 mirrors the runbook package's own SSH-lockout
-// classifier (isFirewallLockoutStep), restricted to the firewall inversions
-// this package can produce: a derived rollback that would remove any
-// port-22 allow rule or add a port-22 deny/reject rule is always blocked,
-// exactly like a primary runbook containing the same step.
-func rollbackForcesL3(steps []runbook.Step) bool {
-	for _, step := range steps {
-		port, _ := step.Params["port"].(float64)
-		if int(port) != 22 {
+			irreversible = append([]runbook.Step{list[i]}, irreversible...)
 			continue
 		}
-		switch step.Kind {
-		case aiproposal.KindFirewallRemove:
+		step := list[i]
+		inverted = append(inverted, runbook.Step{
+			Kind:        undoID,
+			Params:      params,
+			Description: "Revert: " + step.Description,
+			Command:     steps.Command(undoID, params),
+			Verify:      verifyText(undoID),
+			Undoable:    undoable(undoID, params),
+		})
+	}
+	return inverted, irreversible
+}
+
+// verifyText is the catalog's plain-text verification for a step.
+func verifyText(id steps.ID) string {
+	if s, ok := steps.Lookup(id); ok {
+		return s.Def().Verify
+	}
+	return ""
+}
+
+// undoable reports whether the catalog has an undo for the step.
+func undoable(id steps.ID, params steps.Params) bool {
+	_, _, ok := steps.UndoOf(id, params)
+	return ok
+}
+
+// rollbackForcesL3 blocks a derived rollback that would remove the firewall
+// rule for an SSH port (22): the privilege helper refuses it anyway, and a
+// primary runbook containing the same step is blocked the same way.
+func rollbackForcesL3(list []runbook.Step) bool {
+	for _, step := range list {
+		if step.Kind != steps.FirewallRemoveID {
+			continue
+		}
+		if port, ok := step.Params.Int("port"); ok && port == 22 {
 			return true
-		case aiproposal.KindFirewallAdd:
-			action, _ := step.Params["action"].(string)
-			if action == "deny" || action == "reject" {
-				return true
-			}
 		}
 	}
 	return false

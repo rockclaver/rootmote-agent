@@ -4,17 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
-	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
 	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
 	"github.com/rockclaver/rootmote-agent/internal/runbook"
-	"github.com/rockclaver/rootmote-agent/internal/security"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
@@ -42,7 +43,7 @@ type remediationTestEnv struct {
 	st       *store.Store
 	review   *review.Manager
 	remed    *remediation.Manager
-	firewall *fakeFWBackend
+	firewall *fakeHelper
 	systemd  *fakeSystemdClient
 	cfg      Config
 }
@@ -58,44 +59,76 @@ func newRemediationTestEnv(t *testing.T) *remediationTestEnv {
 
 	rm := review.New(nil, st, review.HeuristicSummarizer{})
 
-	fwBackend := &fakeFWBackend{kind: "ufw"}
-	fwMgr := newFirewallTestMgr(t, fwBackend, nil, nil)
-
+	helper := &fakeHelper{rules: map[string]bool{}}
 	sysClient := &fakeSystemdClient{details: map[string]systemd.UnitDetail{}}
 	sysMgr, err := systemd.New(systemd.Config{Client: sysClient})
 	if err != nil {
 		t.Fatal(err)
 	}
+	runner := &steps.Runner{Env: NewStepsEnv(StepsDeps{Systemd: sysMgr, Priv: helper})}
 
 	remed, err := remediation.New(remediation.Config{
 		Store:     st,
-		Executor:  NewRemediationStepExecutor(sysMgr, (*agentprocess.Manager)(nil), fwMgr, (*security.Manager)(nil)),
+		Executor:  NewRemediationStepExecutor(runner),
 		Validator: NewRemediationApprovalValidator(rm, st),
-		Verifier:  NewRemediationInternalVerifier(sysMgr, fwMgr),
+		Verifier:  NewRemediationInternalVerifier(runner, runner.Env.Units),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := Config{Addr: "127.0.0.1:0", Review: rm, Remediation: remed, Firewall: fwMgr, Systemd: sysMgr}
-	return &remediationTestEnv{st: st, review: rm, remed: remed, firewall: fwBackend, systemd: sysClient, cfg: cfg}
+	cfg := Config{Addr: "127.0.0.1:0", Review: rm, Remediation: remed, Systemd: sysMgr}
+	return &remediationTestEnv{st: st, review: rm, remed: remed, firewall: helper, systemd: sysClient, cfg: cfg}
 }
 
-// firewallDenyRunbook is a one-step L1 runbook that denies port 9999 on the
-// ufw backend, with a non-empty Rollback plan (so DeriveRollback has
-// something to reverse).
+// fakeHelper stands in for the privilege helper: it records every call and
+// keeps the set of open firewall ports so verification can read them back.
+type fakeHelper struct {
+	mu      sync.Mutex
+	rules   map[string]bool
+	calls   []string
+	added   []string
+	removed []string
+}
+
+func (f *fakeHelper) Call(_ context.Context, action string, args ...string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, action+" "+strings.Join(args, " "))
+	switch action {
+	case "firewall.allow":
+		f.added = append(f.added, args[0]+"/"+args[1])
+		f.rules[args[0]+"/"+args[1]] = true
+	case "firewall.remove":
+		f.removed = append(f.removed, args[0]+"/"+args[1])
+		delete(f.rules, args[0]+"/"+args[1])
+	case "firewall-rules":
+		out := []map[string]any{}
+		for k := range f.rules {
+			port, proto, _ := strings.Cut(k, "/")
+			n, _ := strconv.Atoi(port)
+			out = append(out, map[string]any{"port": n, "proto": proto})
+		}
+		return json.Marshal(out)
+	}
+	return []byte("ok"), nil
+}
+
+// firewallDenyRunbook is a one-step L1 runbook that opens port 9999 through
+// the firewall.allow step, with a non-empty Rollback plan (so DeriveRollback
+// has something to reverse). The name is historical.
 func firewallDenyRunbook(id, incidentID string) runbook.Runbook {
 	return runbook.Runbook{
 		ID:         id,
 		IncidentID: incidentID,
-		Summary:    "Block port 9999",
+		Summary:    "Open port 9999",
 		Risk:       runbook.RiskL1,
 		Steps: []runbook.Step{{
-			Kind:        aiproposal.KindFirewallAdd,
-			Params:      map[string]any{"action": "deny", "protocol": "tcp", "port": float64(9999), "backend": "ufw", "zone": "public"},
-			Description: "Deny port 9999",
+			Kind:        steps.FirewallAllowID,
+			Params:      map[string]any{"proto": "tcp", "port": float64(9999)},
+			Description: "Open port 9999",
 		}},
-		Rollback: []runbook.Command{{Command: "ufw delete deny 9999/tcp", RunAs: "root", Description: "Re-allow port 9999"}},
+		Rollback: []runbook.Command{{Command: "ufw delete allow 9999/tcp", RunAs: "root", Description: "Close port 9999"}},
 	}
 }
 
@@ -172,7 +205,7 @@ func TestIncidentRunbookGet_ReturnsFullRunbookJSON_AndNotFound(t *testing.T) {
 		t.Fatalf("execution mismatch: %+v", out.Execution)
 	}
 	if out.Runbook.ID != rb.ID || out.Runbook.Summary != rb.Summary || len(out.Runbook.Steps) != 1 ||
-		out.Runbook.Steps[0].Kind != aiproposal.KindFirewallAdd || len(out.Runbook.Rollback) != 1 ||
+		out.Runbook.Steps[0].Kind != steps.FirewallAllowID || len(out.Runbook.Rollback) != 1 ||
 		out.Runbook.Risk != runbook.RiskL1 || out.Runbook.ContentHash == "" {
 		t.Fatalf("runbook JSON incomplete: %+v", out.Runbook)
 	}
@@ -344,13 +377,13 @@ func TestIncidentRunbookExecute_RunsOnceReachesVerifying_DuplicateIsIdempotent(t
 	}
 }
 
-// AC: a step's approved "backend" param must match the firewall manager's
-// live-detected backend before any mutation; a mismatch fails the step
-// (stopping later steps) without ever calling Add/Remove.
-func TestIncidentRunbookExecute_BackendMismatch_ZeroMutation(t *testing.T) {
-	env := newRemediationTestEnv(t) // fake backend reports "ufw"
+// AC: a step the catalog refuses (here: restarting sshd) fails the step
+// before the privilege helper or the service manager is ever called, and
+// stops the execution.
+func TestIncidentRunbookExecute_ProtectedServiceRefused_ZeroMutation(t *testing.T) {
+	env := newRemediationTestEnv(t)
 	rb := firewallDenyRunbook("rb1", "inc1")
-	rb.Steps[0].Params["backend"] = "firewalld" // approved backend disagrees with the live one
+	rb.Steps[0] = runbook.Step{Kind: steps.ServiceRestartID, Params: map[string]any{"unit": "sshd.service"}, Description: "restart ssh"}
 	exec := env.propose(t, "exec1", "inc1", rb)
 	hash := exec.RunbookHash
 
@@ -362,8 +395,8 @@ func TestIncidentRunbookExecute_BackendMismatch_ZeroMutation(t *testing.T) {
 	if final.Status != store.RemediationRemediationFailed {
 		t.Fatalf("status = %q, want remediation_failed", final.Status)
 	}
-	if len(env.firewall.added) != 0 {
-		t.Fatalf("firewall mutated despite backend mismatch: %+v", env.firewall.added)
+	if len(env.firewall.calls) != 0 || len(env.systemd.actions) != 0 {
+		t.Fatalf("host touched despite refusal: helper=%v systemd=%v", env.firewall.calls, env.systemd.actions)
 	}
 }
 
@@ -579,5 +612,66 @@ func TestIncidentRunbookExecute_PrimaryIDLookingLikeRollbackBindsExecuteAction(t
 	waitForStatus(t, env.cfg, "exec1-rollback", store.RemediationVerifying, store.RemediationRemediationFailed)
 	if len(env.firewall.added) != 1 {
 		t.Fatalf("firewall Add called %d times, want 1", len(env.firewall.added))
+	}
+}
+
+// The verifier runs each step's own catalog check and reports the result per
+// step, so the app can say which step did not take effect.
+func TestInternalVerifier_ReportsEachStepSeparately(t *testing.T) {
+	helper := &fakeHelper{rules: map[string]bool{"9999/tcp": true}}
+	runner := &steps.Runner{Env: NewStepsEnv(StepsDeps{Priv: helper})}
+	verifier := NewRemediationInternalVerifier(runner, nil)
+	rb := runbook.Runbook{Steps: []runbook.Step{
+		{Kind: steps.FirewallAllowID, Params: map[string]any{"proto": "tcp", "port": float64(9999)}},
+		{Kind: steps.FirewallAllowID, Params: map[string]any{"proto": "tcp", "port": float64(8888)}},
+	}}
+	res, err := verifier.Verify(context.Background(), rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Passed {
+		t.Fatalf("verification passed although port 8888 is not open: %+v", res)
+	}
+	if len(res.Steps) != 2 || !res.Steps[0].Passed || res.Steps[1].Passed || res.Steps[1].Index != 1 {
+		t.Fatalf("per-step results = %+v, want step 0 passed and step 1 failed", res.Steps)
+	}
+	if res.Steps[1].Detail == "" || !strings.Contains(res.Detail, "step 2") {
+		t.Fatalf("failure not explained: detail=%q step=%+v", res.Detail, res.Steps[1])
+	}
+}
+
+// Every step's verification is stored as its own execution event.
+func TestIncidentExecute_RecordsStepVerificationEvents(t *testing.T) {
+	env := newRemediationTestEnv(t)
+	exec := env.propose(t, "exec-sv", "inc-sv", firewallDenyRunbook("rb-sv", "inc-sv"))
+	tok := env.mintToken(t, testRemediationExecuteAction, "inc-sv", []string{exec.RunbookHash})
+	payload, _ := json.Marshal(map[string]any{"execution_id": "exec-sv", "content_hash": exec.RunbookHash, "confirmation_token": tok})
+	remediationRoundTrip(t, env.cfg, "incident.runbook.execute", payload)
+	waitForStatus(t, env.cfg, "exec-sv", store.RemediationVerifying)
+
+	events, err := env.remed.EventsAfter("exec-sv", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Type != "step_verification" {
+			continue
+		}
+		found = true
+		var d struct {
+			Index  int    `json:"index"`
+			Kind   string `json:"kind"`
+			Passed bool   `json:"passed"`
+		}
+		if err := json.Unmarshal([]byte(ev.Data), &d); err != nil {
+			t.Fatal(err)
+		}
+		if d.Index != 0 || d.Kind != "firewall.allow" || !d.Passed {
+			t.Fatalf("step_verification = %+v", d)
+		}
+	}
+	if !found {
+		t.Fatalf("no step_verification event in %+v", events)
 	}
 }

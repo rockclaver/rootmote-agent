@@ -21,18 +21,23 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
       - name: Build binaries
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="${VERSION#v}"
           mkdir -p dist
 
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
               -trimpath \
-              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${version}" \
+              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${VERSION}" \
               -o "dist/rootmote-agent-linux-${arch}" \
               ./cmd/rootmote-agent
           done
@@ -40,16 +45,16 @@ jobs:
           for arch in amd64 arm64; do
             GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build \
               -trimpath \
-              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${version}" \
+              -ldflags "-s -w -X github.com/rockclaver/rootmote-agent/internal/version.Version=${VERSION}" \
               -o "dist/rootmote-agent-darwin-${arch}" \
               ./cmd/rootmote-agent
           done
 
           cp systemd/rootmote-agent.service dist/rootmote-agent.service
-          cp systemd/rootmote-agent-firewall.sudoers dist/rootmote-agent-firewall.sudoers
+          cp systemd/rootmote-agent.sudoers dist/rootmote-agent.sudoers
           cp systemd/rootmote-agent-sudo.tmpfiles.conf dist/rootmote-agent-sudo.tmpfiles.conf
           cp scripts/install-macos.sh dist/install-macos.sh
-          (cd dist && sha256sum rootmote-agent-* install-macos.sh > SHA256SUMS)
+          (cd dist && sha256sum rootmote-agent-* rootmote-agent.service rootmote-agent.sudoers install-macos.sh > SHA256SUMS)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -60,7 +65,7 @@ jobs:
             dist/rootmote-agent-darwin-amd64
             dist/rootmote-agent-darwin-arm64
             dist/rootmote-agent.service
-            dist/rootmote-agent-firewall.sudoers
+            dist/rootmote-agent.sudoers
             dist/rootmote-agent-sudo.tmpfiles.conf
             dist/install-macos.sh
             dist/SHA256SUMS

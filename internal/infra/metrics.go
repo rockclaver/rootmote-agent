@@ -99,6 +99,9 @@ type Config struct {
 	SysRoot  string
 	Reader   FileReader
 	StatFS   StatFS
+	// IsFile reports whether a mount point is a file rather than a directory.
+	// Defaults to checking the real filesystem.
+	IsFile   func(path string) bool
 	Command  CommandRunner
 	Platform string
 	Now      func() time.Time
@@ -110,6 +113,7 @@ type Manager struct {
 	sysRoot  string
 	reader   FileReader
 	statFS   StatFS
+	isFile   func(path string) bool
 	command  CommandRunner
 	platform string
 	now      func() time.Time
@@ -138,6 +142,12 @@ func New(cfg Config) (*Manager, error) {
 			return st, err
 		}
 	}
+	if cfg.IsFile == nil {
+		cfg.IsFile = func(path string) bool {
+			info, err := os.Stat(path)
+			return err == nil && !info.IsDir()
+		}
+	}
 	if cfg.Command == nil {
 		cfg.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).Output()
@@ -157,6 +167,7 @@ func New(cfg Config) (*Manager, error) {
 		sysRoot:  cfg.SysRoot,
 		reader:   cfg.Reader,
 		statFS:   cfg.StatFS,
+		isFile:   cfg.IsFile,
 		command:  cfg.Command,
 		platform: cfg.Platform,
 		now:      cfg.Now,
@@ -597,6 +608,11 @@ func isPseudoMountPath(path string) bool {
 func (m *Manager) collectDisks(mounts []mount) []DiskMetric {
 	out := make([]DiskMetric, 0, len(mounts))
 	for _, row := range mounts {
+		// A bind-mounted file (Docker's /etc/hostname, /etc/hosts and
+		// /etc/resolv.conf) is not a disk; it only repeats its host's usage.
+		if m.isFile != nil && m.isFile(row.path) {
+			continue
+		}
 		st, err := m.statFS(row.path)
 		if err != nil {
 			out = append(out, DiskMetric{Mountpoint: row.path, Filesystem: row.fs, Available: false, Reason: ReasonUnavailable, Message: err.Error()})

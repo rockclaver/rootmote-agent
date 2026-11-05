@@ -2,7 +2,6 @@ package webserver
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,33 +30,6 @@ func (f *fakeSystemd) List(context.Context) ([]systemd.Unit, error) {
 	}
 	return append([]systemd.Unit(nil), f.units...), nil
 }
-
-func (f *fakeSystemd) Action(_ context.Context, name string, action systemd.Action) error {
-	f.actions = append(f.actions, name+":"+string(action))
-	return f.err
-}
-
-type fakeRunner struct {
-	output string
-	err    error
-	calls  []string
-}
-
-func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
-	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
-	return f.output, f.err
-}
-
-type fakePrivilegedRunner struct {
-	fakeRunner
-	privilegedCalls []string
-}
-
-func (f *fakePrivilegedRunner) RunPrivileged(_ context.Context, name string, args ...string) (string, error) {
-	f.privilegedCalls = append(f.privilegedCalls, name+" "+strings.Join(args, " "))
-	return f.output, f.err
-}
-
 func write(t *testing.T, path, body string) string {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -201,46 +173,5 @@ func TestListMatchesHomebrewLaunchdWebserverUnits(t *testing.T) {
 	}
 	if got.Webservers[0].ID != "caddy:homebrew.mxcl.caddy" || got.Webservers[0].Domains[0].Host != "mac.example.com" {
 		t.Fatalf("homebrew launchd instance not mapped: %+v", got.Webservers[0])
-	}
-}
-
-func TestValidateReturnsFailureOutputWithoutAction(t *testing.T) {
-	dir := t.TempDir()
-	caddy := write(t, filepath.Join(dir, "Caddyfile"), `example.com { respond ok }`)
-	runner := &fakePrivilegedRunner{fakeRunner: fakeRunner{output: "bad config", err: errors.New("exit 1")}}
-	mgr, err := New(Config{
-		Systemd: &fakeSystemd{units: []systemd.Unit{{Name: "caddy.service"}}},
-		Runner:  runner,
-		Paths:   map[Kind][]string{KindCaddy: {caddy}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := mgr.Validate(context.Background(), "caddy:caddy.service")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.OK || res.Output != "bad config" {
-		t.Fatalf("unexpected validate result: %+v", res)
-	}
-	if len(runner.privilegedCalls) != 1 || !strings.Contains(runner.privilegedCalls[0], "caddy validate --config") {
-		t.Fatalf("wrong validation command: %+v", runner.privilegedCalls)
-	}
-}
-
-func TestActionAllowsOnlyReloadRestart(t *testing.T) {
-	sys := &fakeSystemd{units: []systemd.Unit{{Name: "nginx.service"}}}
-	mgr, err := New(Config{Systemd: sys, Paths: map[Kind][]string{KindNginx: nil}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Action(context.Background(), "nginx:nginx.service", "start"); err == nil {
-		t.Fatal("expected unsupported action error")
-	}
-	if _, err := mgr.Action(context.Background(), "nginx:nginx.service", "reload"); err != nil {
-		t.Fatal(err)
-	}
-	if len(sys.actions) != 1 || sys.actions[0] != "nginx.service:reload" {
-		t.Fatalf("wrong action calls: %+v", sys.actions)
 	}
 }

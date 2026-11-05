@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 )
 
 // SystemctlClient is the production Client that shells out to systemctl. It is
@@ -20,6 +23,8 @@ type SystemctlClient struct {
 	Binary string
 	// Timeout caps each invocation. Defaults to 8s.
 	Timeout time.Duration
+	// Priv runs privilege-helper actions; defaults to steps.ExecPriv.
+	Priv steps.PrivCaller
 }
 
 // NewSystemctlClient returns a SystemctlClient with sane defaults.
@@ -157,7 +162,7 @@ func (c *SystemctlClient) Get(ctx context.Context, name string) (UnitDetail, err
 	cctx, cancel := context.WithTimeout(ctx, c.timeout())
 	defer cancel()
 	cmd := exec.CommandContext(cctx, c.bin(), "show", name,
-		"--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,Following")
+		"--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,Following,NRestarts")
 	out, err := cmd.Output()
 	if err != nil {
 		return UnitDetail{}, fmt.Errorf("systemctl show %s: %w", name, err)
@@ -178,39 +183,32 @@ func (c *SystemctlClient) Get(ctx context.Context, name string) (UnitDetail, err
 		},
 		FragmentPath: props["FragmentPath"],
 		Following:    props["Following"],
+		NRestarts:    atoiOr0(props["NRestarts"]),
 	}, nil
 }
 
-// Action runs `systemctl <verb> <unit>`.
+// Action runs `systemctl <verb> <unit>`. The agent normally runs as the
+// unprivileged `rootmote` user, which cannot change services, so start, stop,
+// restart and reload go through the privilege helper
+// (`sudo -n rootmote-agent priv service.<verb> <unit>`), which validates the
+// unit name and refuses protected units as root. When the agent already runs
+// as root it calls systemctl directly. Other verbs (enable, disable) run
+// directly and need root.
 func (c *SystemctlClient) Action(ctx context.Context, name string, action Action) error {
+	switch action {
+	case ActionStart, ActionStop, ActionRestart, ActionReload:
+		if os.Geteuid() != 0 {
+			priv := c.Priv
+			if priv == nil {
+				priv = steps.ExecPriv{}
+			}
+			_, err := priv.Call(ctx, "service."+string(action), name)
+			return err
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, c.timeout())
 	defer cancel()
 	cmd := exec.CommandContext(cctx, c.bin(), string(action), name)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return errors.New(msg)
-	}
-	return nil
-}
-
-// Reboot runs `systemctl reboot`. The agent runs as the unprivileged `rootmote`
-// user, so when it is not already root the call is wrapped in `sudo -n`
-// (matching the firewall backends); a sudoers grant authorizes the literal
-// `systemctl reboot` verb.
-func (c *SystemctlClient) Reboot(ctx context.Context) error {
-	cctx, cancel := context.WithTimeout(ctx, c.timeout())
-	defer cancel()
-	name := c.bin()
-	args := []string{"reboot"}
-	if os.Geteuid() != 0 {
-		args = []string{"-n", name, "reboot"}
-		name = "sudo"
-	}
-	cmd := exec.CommandContext(cctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -265,4 +263,12 @@ func parseShowProperties(s string) map[string]string {
 		props[line[:i]] = line[i+1:]
 	}
 	return props
+}
+
+func atoiOr0(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }

@@ -1,5 +1,4 @@
-// Package webserver inventories host-installed reverse proxies and performs
-// guarded operational actions on their backing systemd units.
+// Package webserver inventories host-installed reverse proxies (read-only).
 package webserver
 
 import (
@@ -9,11 +8,9 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
@@ -50,35 +47,18 @@ type Snapshot struct {
 	Warnings   []string   `json:"warnings,omitempty"`
 }
 
-type ValidationResult struct {
-	ID     string `json:"id"`
-	OK     bool   `json:"ok"`
-	Output string `json:"output"`
-}
-
 type Systemd interface {
 	Status(context.Context) systemd.Status
 	List(context.Context) ([]systemd.Unit, error)
-	Action(context.Context, string, systemd.Action) error
-}
-
-type Runner interface {
-	Run(context.Context, string, ...string) (string, error)
-}
-
-type privilegedRunner interface {
-	RunPrivileged(context.Context, string, ...string) (string, error)
 }
 
 type Config struct {
 	Systemd Systemd
-	Runner  Runner
 	Paths   map[Kind][]string
 }
 
 type Manager struct {
 	systemd Systemd
-	runner  Runner
 	paths   map[Kind][]string
 }
 
@@ -86,15 +66,11 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Systemd == nil {
 		return nil, errors.New("webserver: Systemd is required")
 	}
-	runner := cfg.Runner
-	if runner == nil {
-		runner = shellRunner{}
-	}
 	paths := defaultPaths()
 	for k, v := range cfg.Paths {
 		paths[k] = append([]string(nil), v...)
 	}
-	return &Manager{systemd: cfg.Systemd, runner: runner, paths: paths}, nil
+	return &Manager{systemd: cfg.Systemd, paths: paths}, nil
 }
 
 func defaultPaths() map[Kind][]string {
@@ -128,59 +104,6 @@ func defaultPaths() map[Kind][]string {
 			"/usr/local/etc/httpd/extra/httpd-vhosts.conf",
 		},
 	}
-}
-
-type shellRunner struct{}
-
-func (shellRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, name, args...)
-	out, err := cmd.CombinedOutput()
-	msg := strings.TrimSpace(string(out))
-	if err != nil && msg == "" {
-		msg = err.Error()
-	}
-	return msg, err
-}
-
-func (r shellRunner) RunPrivileged(ctx context.Context, name string, args ...string) (string, error) {
-	if os.Geteuid() == 0 {
-		return r.Run(ctx, name, args...)
-	}
-	path, err := exec.LookPath(name)
-	if err != nil {
-		path = fallbackBinaryPath(name)
-		if path == "" {
-			// Preserve the same error shape the direct exec path would have exposed.
-			return "", err
-		}
-	}
-	sudoArgs := append([]string{"-n", path}, args...)
-	return r.Run(ctx, "sudo", sudoArgs...)
-}
-
-func fallbackBinaryPath(name string) string {
-	candidates := map[string][]string{
-		"nginx":      {"/usr/sbin/nginx", "/sbin/nginx"},
-		"apache2ctl": {"/usr/sbin/apache2ctl", "/usr/bin/apache2ctl"},
-		"apachectl":  {"/usr/sbin/apachectl", "/usr/bin/apachectl"},
-		"httpd":      {"/usr/sbin/httpd", "/usr/bin/httpd", "/sbin/httpd"},
-		"caddy":      {"/usr/bin/caddy", "/usr/local/bin/caddy"},
-	}
-	for _, p := range candidates[name] {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
-}
-
-func runPrivileged(ctx context.Context, runner Runner, name string, args ...string) (string, error) {
-	if pr, ok := runner.(privilegedRunner); ok {
-		return pr.RunPrivileged(ctx, name, args...)
-	}
-	return runner.Run(ctx, name, args...)
 }
 
 type spec struct {
@@ -268,80 +191,6 @@ func warn(prefix, msg string) string {
 	}
 	return prefix + ": " + msg
 }
-
-func (m *Manager) Validate(ctx context.Context, id string) (ValidationResult, error) {
-	inst, err := m.find(ctx, id)
-	if err != nil {
-		return ValidationResult{}, err
-	}
-	var name string
-	var args []string
-	switch inst.Kind {
-	case KindCaddy:
-		name = "caddy"
-		args = []string{"validate"}
-		if cfg := firstConfig(inst, "Caddyfile"); cfg != "" {
-			args = append(args, "--config", cfg)
-		}
-	case KindNginx:
-		name = "nginx"
-		args = []string{"-t"}
-	case KindApache:
-		if inst.Unit == "httpd.service" {
-			name = "httpd"
-			args = []string{"-t"}
-		} else {
-			name = "apache2ctl"
-			args = []string{"configtest"}
-		}
-	default:
-		return ValidationResult{}, fmt.Errorf("webserver: unsupported kind %q", inst.Kind)
-	}
-	out, runErr := runPrivileged(ctx, m.runner, name, args...)
-	return ValidationResult{ID: id, OK: runErr == nil, Output: out}, nil
-}
-
-func firstConfig(inst Instance, base string) string {
-	for _, p := range inst.ConfigPaths {
-		if filepath.Base(p) == base {
-			return p
-		}
-	}
-	if len(inst.ConfigPaths) > 0 {
-		return inst.ConfigPaths[0]
-	}
-	return ""
-}
-
-func (m *Manager) Action(ctx context.Context, id, action string) (Instance, error) {
-	if action != "reload" && action != "restart" {
-		return Instance{}, fmt.Errorf("webserver: unsupported action %q", action)
-	}
-	inst, err := m.find(ctx, id)
-	if err != nil {
-		return Instance{}, err
-	}
-	if inst.Unit == "" {
-		return Instance{}, fmt.Errorf("webserver: %s has no backing systemd unit", id)
-	}
-	if err := m.systemd.Action(ctx, inst.Unit, systemd.Action(action)); err != nil {
-		return inst, err
-	}
-	return inst, nil
-}
-
-func (m *Manager) find(ctx context.Context, id string) (Instance, error) {
-	if id == "" {
-		return Instance{}, errors.New("webserver: id required")
-	}
-	for _, inst := range m.List(ctx).Webservers {
-		if inst.ID == id {
-			return inst, nil
-		}
-	}
-	return Instance{}, fmt.Errorf("webserver: unknown id %q", id)
-}
-
 func collectPaths(patterns []string) ([]string, []string) {
 	var paths, warnings []string
 	for _, pattern := range patterns {

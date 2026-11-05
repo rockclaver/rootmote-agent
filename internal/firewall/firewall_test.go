@@ -3,8 +3,8 @@ package firewall
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -349,42 +349,93 @@ func TestParseUFWRules(t *testing.T) {
 	}
 }
 
-// Review comment #3329218455: in the packaged install the agent runs as
-// `rootmote`, so ufw / firewall-cmd must be invoked through a privileged
-// path. When Sudo=true the backends must prepend `sudo -n`.
-func TestBackends_SudoWraps_RealCommand(t *testing.T) {
-	var calls []string
-	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
-		calls = append(calls, name+" "+strings.Join(args, " "))
-		return []byte("running"), nil
+// The helper must never close the port SSH is reachable on: listening sshd
+// sockets, live sshd connections and sshd_config Port lines all count.
+func TestSSHFromHost_CollectsEverySource(t *testing.T) {
+	files := map[string]string{
+		"/etc/ssh/sshd_config": "# comment\nPort 2222\n",
 	}
-	lookup := func(string) (string, error) { return "/usr/bin/x", nil }
+	r := SSHFromHost{
+		Reader: fakeSockets{sockets: []Socket{
+			{Protocol: ProtoTCP, Port: 22, Process: "sshd"},
+			{Protocol: ProtoTCP, Port: 80, Process: "nginx"},
+		}},
+		ReadFile: func(p string) ([]byte, error) {
+			if s, ok := files[p]; ok {
+				return []byte(s), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		Established: func(context.Context) []Socket { return []Socket{{Port: 2200, Process: "sshd"}} },
+		Activated:   func(context.Context) []int { return nil },
+	}
+	if got, want := r.SSHPorts(context.Background()), []int{22, 2200, 2222}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SSHPorts = %v, want %v", got, want)
+	}
+}
 
-	u := &UFWBackend{Run: run, LookBin: lookup, Sudo: true}
-	if err := u.Available(context.Background()); err != nil {
-		t.Fatalf("ufw available: %v", err)
+// OpenSSH 9.8+ runs connections in sshd-session, and socket-activated ssh
+// leaves the listener with systemd. Both ports must still be protected.
+func TestSSHFromHost_SessionProcessAndSocketActivation(t *testing.T) {
+	r := SSHFromHost{
+		Reader: fakeSockets{sockets: []Socket{
+			{Protocol: ProtoTCP, Port: 2022, Process: "sshd-session"},
+			{Protocol: ProtoTCP, Port: 80, Process: "nginx"},
+		}},
+		Established: func(context.Context) []Socket { return nil },
+		Activated: func(context.Context) []int {
+			return parseListenPorts("Listen=[::]:2200 (Stream)\nListen=0.0.0.0:2200 (Stream)\nListen=/run/x.sock (Stream)\n")
+		},
 	}
-	if err := u.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 80}); err != nil {
-		t.Fatalf("ufw add: %v", err)
+	if got, want := r.SSHPorts(context.Background()), []int{2022, 2200}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SSHPorts = %v, want %v", got, want)
 	}
-	for _, c := range calls {
-		if !strings.HasPrefix(c, "sudo -n ufw ") {
-			t.Fatalf("ufw call not wrapped with sudo -n: %q", c)
-		}
+	if got := parseSS(`tcp ESTAB 0 0 10.0.0.1:2200 1.2.3.4:5555 users:(("sshd-session",pid=9,fd=4))`); len(got) != 1 || !isSSHProcess(got[0].Process) {
+		t.Fatalf("parseSS = %+v", got)
 	}
+	if got := sshPortsFromSockets([]Socket{{Port: 22, Process: "sshd-session"}, {Port: 80, Process: "nginx"}}); !reflect.DeepEqual(got, []int{22}) {
+		t.Fatalf("sshPortsFromSockets = %v", got)
+	}
+}
 
+// firewalld rules are changed in the running config and the saved config
+// separately. A reload would drop runtime-only rules, like SSH on a custom port.
+func TestFirewalldChangesRuntimeAndPermanentWithoutReload(t *testing.T) {
+	var calls [][]string
+	b := &FirewalldBackend{Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{name}, args...))
+		return nil, nil
+	}}
+	if err := b.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 8080}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Remove(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoUDP, Port: 53}); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"firewall-cmd", "--zone=public", "--add-port=8080/tcp"},
+		{"firewall-cmd", "--zone=public", "--add-port=8080/tcp", "--permanent"},
+		{"firewall-cmd", "--zone=public", "--remove-port=53/udp"},
+		{"firewall-cmd", "--zone=public", "--remove-port=53/udp", "--permanent"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v\nwant %v", calls, want)
+	}
+	// A failure in the runtime step stops before the saved config changes.
 	calls = nil
-	f := &FirewalldBackend{Run: run, LookBin: lookup, Sudo: true}
-	if err := f.Available(context.Background()); err != nil {
-		t.Fatalf("firewalld available: %v", err)
+	b.Run = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, args)
+		return []byte("boom"), errors.New("exit 1")
 	}
-	if err := f.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 80}); err != nil {
-		t.Fatalf("firewalld add: %v", err)
+	if err := b.Add(context.Background(), Rule{Action: ActionAllow, Protocol: ProtoTCP, Port: 8080}); err == nil || len(calls) != 1 {
+		t.Fatalf("err %v calls %v", err, calls)
 	}
-	for _, c := range calls {
-		if !strings.HasPrefix(c, "sudo -n firewall-cmd ") {
-			t.Fatalf("firewalld call not wrapped with sudo -n: %q", c)
-		}
+}
+
+func TestSSHFromHost_FallsBackTo22(t *testing.T) {
+	r := SSHFromHost{Established: func(context.Context) []Socket { return nil }, Activated: func(context.Context) []int { return nil }}
+	if got := r.SSHPorts(context.Background()); !reflect.DeepEqual(got, []int{22}) {
+		t.Fatalf("SSHPorts = %v, want [22]", got)
 	}
 }
 

@@ -1,0 +1,25 @@
+# Installed by the rootmote-agent installer at /etc/sudoers.d/rootmote-agent.
+#
+# The agent runs as the unprivileged `rootmote` user. Every fix that needs
+# root goes through one helper: `rootmote-agent priv <action> <args...>`. The
+# helper accepts only the fixed actions of the step catalog (`rootmote-agent
+# steps`), validates every argument itself as root (names must exist, protected
+# services and processes are refused, the SSH port is never closed), and runs
+# a fixed command with an exact argv. There is no shell and no generic command
+# grant. `sudo -l -U rootmote` must show exactly this one rule.
+#
+# The agent polls a few read-only helper actions (PM2 and Supervisor status,
+# certificates, web server error logs) every 30 seconds or so. Those calls are
+# not written to the sudo log, and they open no PAM session (which logs two
+# more lines per call), so they do not bury the lines for the calls that
+# change the server, which stay logged. This list is not a grant: it only
+# selects which calls skip the log, and each pattern names one read-only action.
+Cmnd_Alias ROOTMOTE_READONLY = \
+    /usr/local/bin/rootmote-agent priv pm2-list *, \
+    /usr/local/bin/rootmote-agent priv supervisor-status, \
+    /usr/local/bin/rootmote-agent priv certs-list, \
+    /usr/local/bin/rootmote-agent priv web-errors, \
+    /usr/local/bin/rootmote-agent priv firewall-rules
+Defaults!ROOTMOTE_READONLY !log_allowed, !pam_session
+
+rootmote ALL=(root) NOPASSWD: /usr/local/bin/rootmote-agent priv *

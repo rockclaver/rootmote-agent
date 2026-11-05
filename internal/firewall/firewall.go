@@ -224,7 +224,7 @@ func sshPortsFromSockets(sockets []Socket) []int {
 	seen := map[int]bool{}
 	var out []int
 	for _, sock := range sockets {
-		if sock.Process != "sshd" {
+		if !isSSHProcess(sock.Process) {
 			continue
 		}
 		if seen[sock.Port] {

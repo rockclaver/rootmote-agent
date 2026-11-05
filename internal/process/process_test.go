@@ -2,13 +2,10 @@ package process
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"testing"
-	"time"
 )
 
 func TestIssue43ProcessList_MapsProcFixturesAndSorts(t *testing.T) {
@@ -126,205 +123,6 @@ func TestReadProcess_DetectsKernelThreadsWithNoArgvOrExe(t *testing.T) {
 	}
 }
 
-func TestKill_RefusesKernelThreadWithoutSignalling(t *testing.T) {
-	root := t.TempDir()
-	writeProc(t, root, 39, "kdevtmpfs", "0", "", 1, 1, 1, 1)
-	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-	var signalled bool
-	mgr, err := New(Config{
-		ProcRoot:     root,
-		AgentPID:     999,
-		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Signal: func(context.Context, int, syscall.Signal) error {
-			signalled = true
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = mgr.Kill(context.Background(), 39, 1, SignalTerm)
-	if !errors.Is(err, ErrKernelThread) {
-		t.Fatalf("err = %v, want ErrKernelThread", err)
-	}
-	if signalled {
-		t.Fatal("kernel thread was signalled")
-	}
-}
-
-func TestIssue43ProtectedPIDGuardRejectsBeforeSignal(t *testing.T) {
-	root := t.TempDir()
-	for _, tc := range []struct {
-		name string
-		pid  int
-		comm string
-	}{
-		{name: "pid1", pid: 1, comm: "init"},
-		{name: "agent", pid: 44, comm: "rootmote-agent"},
-		{name: "sshd", pid: 55, comm: "sshd"},
-		{name: "tmux-pane", pid: 66, comm: "bash"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			writeProc(t, root, tc.pid, tc.comm, "1000", tc.comm+"\x00", 1, 1, 1, 1)
-			mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-			var signalled bool
-			mgr, err := New(Config{
-				ProcRoot: root,
-				AgentPID: 44,
-				TmuxPanePIDs: func(context.Context) []int {
-					return []int{66}
-				},
-				Signal: func(_ context.Context, pid int, sig syscall.Signal) error {
-					signalled = true
-					return nil
-				},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = mgr.Kill(context.Background(), tc.pid, 1, SignalTerm)
-			if !errors.Is(err, ErrProtectedPID) {
-				t.Fatalf("err = %v, want protected", err)
-			}
-			if signalled {
-				t.Fatal("signal called for protected pid")
-			}
-		})
-	}
-}
-
-func TestIssue43ProcessKillUsesTermByDefaultAndKillEscalation(t *testing.T) {
-	root := t.TempDir()
-	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1, 1)
-	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-	var got []syscall.Signal
-	mgr, err := New(Config{
-		ProcRoot:     root,
-		AgentPID:     999,
-		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Sleep:        func(time.Duration) {},
-		Signal: func(_ context.Context, pid int, sig syscall.Signal) error {
-			if pid != 77 {
-				t.Fatalf("pid = %d", pid)
-			}
-			got = append(got, sig)
-			// Simulate the process actually exiting on this signal so Kill's
-			// post-signal verification observes it gone instead of escalating.
-			_ = os.RemoveAll(filepath.Join(root, "77"))
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := mgr.Kill(context.Background(), 77, 1, ""); err != nil {
-		t.Fatal(err)
-	}
-	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1, 1)
-	if err := mgr.Kill(context.Background(), 77, 1, SignalKill); err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0] != syscall.SIGTERM || got[1] != syscall.SIGKILL {
-		t.Fatalf("signals = %v", got)
-	}
-}
-
-func TestKill_EscalatesToSigkillWhenSigtermIsIgnored(t *testing.T) {
-	root := t.TempDir()
-	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1, 1)
-	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-	var got []syscall.Signal
-	mgr, err := New(Config{
-		ProcRoot:     root,
-		AgentPID:     999,
-		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Sleep:        func(time.Duration) {},
-		KillGrace:    time.Millisecond,
-		Signal: func(_ context.Context, pid int, sig syscall.Signal) error {
-			got = append(got, sig)
-			if sig == syscall.SIGKILL {
-				// Only SIGKILL actually terminates it, mimicking a process
-				// that installed a handler ignoring SIGTERM.
-				_ = os.RemoveAll(filepath.Join(root, "77"))
-			}
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := mgr.Kill(context.Background(), 77, 1, SignalTerm); err != nil {
-		t.Fatalf("expected escalation to SIGKILL to succeed, got %v", err)
-	}
-	if len(got) != 2 || got[0] != syscall.SIGTERM || got[1] != syscall.SIGKILL {
-		t.Fatalf("signals = %v, want [TERM, KILL]", got)
-	}
-}
-
-func TestKill_ReturnsTerminationFailedWhenProcessSurvivesSigkill(t *testing.T) {
-	root := t.TempDir()
-	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1, 1)
-	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-	mgr, err := New(Config{
-		ProcRoot:     root,
-		AgentPID:     999,
-		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Sleep:        func(time.Duration) {},
-		KillGrace:    time.Millisecond,
-		Signal: func(context.Context, int, syscall.Signal) error {
-			// Process never actually exits, e.g. stuck in an uninterruptible
-			// kernel wait (D state).
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = mgr.Kill(context.Background(), 77, 1, SignalTerm)
-	if !errors.Is(err, ErrTerminationFailed) {
-		t.Fatalf("err = %v, want ErrTerminationFailed", err)
-	}
-}
-
-func TestIssue43ProcessKillRejectsPIDReuseBeforeSignal(t *testing.T) {
-	root := t.TempDir()
-	writeProc(t, root, 77, "worker", "1000", "worker\x00", 1, 1, 1000, 1)
-	mustWrite(t, filepath.Join(root, "uptime"), "200.00 0.00\n")
-	var signalled bool
-	mgr, err := New(Config{
-		ProcRoot:     root,
-		AgentPID:     999,
-		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Signal: func(_ context.Context, pid int, sig syscall.Signal) error {
-			signalled = true
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeProc(t, root, 77, "other", "1000", "other\x00", 1, 1, 2000, 1)
-	err = mgr.Kill(context.Background(), 77, 1000, SignalTerm)
-	if !errors.Is(err, ErrIdentityMismatch) {
-		t.Fatalf("err = %v, want identity mismatch", err)
-	}
-	if signalled {
-		t.Fatal("signal called for reused pid")
-	}
-}
-
-func TestSignalFlag_MapsTermAndKillToKillCLIFlags(t *testing.T) {
-	if got := signalFlag(syscall.SIGTERM); got != "-TERM" {
-		t.Fatalf("SIGTERM flag = %q", got)
-	}
-	if got := signalFlag(syscall.SIGKILL); got != "-KILL" {
-		t.Fatalf("SIGKILL flag = %q", got)
-	}
-	if got := signalFlag(syscall.SIGHUP); got != "-1" {
-		t.Fatalf("SIGHUP flag = %q", got)
-	}
-}
-
 func TestDarwinProcessList_UsesPSWhenProcfsIsUnavailable(t *testing.T) {
 	ps := `  10 root      0.0    512 Wed Jul  1 22:49:42 2026 /sbin/launchd
  100 rootmote   12.5  2048 Wed Jul  1 22:50:10 2026 /Applications/Foo.app/Contents/MacOS/Foo --flag
@@ -359,27 +157,6 @@ func TestDarwinProcessList_UsesPSWhenProcfsIsUnavailable(t *testing.T) {
 	if got[1].Command != "/Applications/Foo.app/Contents/MacOS/Foo --flag" || got[1].CPUPercent != 12.5 || got[1].StartTimeTicks == 0 {
 		t.Fatalf("process fields failed: %+v", got[1])
 	}
-}
-
-func TestSudoKillArgs_FormatsNoPromptSignalAndPID(t *testing.T) {
-	if got, want := sudoKillArgs(1234, syscall.SIGTERM), []string{"-n", "kill", "-TERM", "1234"}; !equalStrings(got, want) {
-		t.Fatalf("sudoKillArgs(SIGTERM) = %v, want %v", got, want)
-	}
-	if got, want := sudoKillArgs(1234, syscall.SIGKILL), []string{"-n", "kill", "-KILL", "1234"}; !equalStrings(got, want) {
-		t.Fatalf("sudoKillArgs(SIGKILL) = %v, want %v", got, want)
-	}
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func writeProc(t *testing.T, root string, pid int, comm, uid, cmdline string, utime, stime, start, rss int) {

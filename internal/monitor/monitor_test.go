@@ -17,11 +17,42 @@ import (
 // --- fakes ---------------------------------------------------------------
 
 type fakeStateStore struct {
-	states map[string]store.MonitorState
+	states   map[string]store.MonitorState
+	silences map[string]time.Time
+	acks     map[string]time.Time
 }
 
 func newFakeStateStore() *fakeStateStore {
-	return &fakeStateStore{states: map[string]store.MonitorState{}}
+	return &fakeStateStore{
+		states:   map[string]store.MonitorState{},
+		silences: map[string]time.Time{},
+		acks:     map[string]time.Time{},
+	}
+}
+
+func (f *fakeStateStore) PutAlertSilence(key, _, _ string, until time.Time) error {
+	f.silences[key] = until
+	return nil
+}
+
+func (f *fakeStateStore) DeleteAlertSilence(key string) error {
+	delete(f.silences, key)
+	return nil
+}
+
+func (f *fakeStateStore) AlertSilencesActive(now time.Time) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	for k, until := range f.silences {
+		if until.After(now) {
+			out[k] = until
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStateStore) PutAlertAck(key string, firedAt time.Time) error {
+	f.acks[key] = firedAt
+	return nil
 }
 
 func (f *fakeStateStore) PutMonitorState(s store.MonitorState) error {
@@ -457,6 +488,35 @@ func TestSystemdMonitor_LongRunningServicePages(t *testing.T) {
 	}
 }
 
+func TestSystemdMonitor_StoppedUnitPagesOnlyWhenNamed(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.systemd.units = []systemd.Unit{
+		{Name: "demo-api.service", ActiveState: "inactive", SubState: "dead", Type: "simple"},
+		{Name: "apt-daily.service", ActiveState: "inactive", SubState: "dead", Type: "simple"},
+	}
+	for range 3 {
+		h.tick()
+	}
+	if len(h.sender.events) != 0 {
+		t.Fatalf("idle units paged under the wildcard default: %+v", h.sender.events)
+	}
+	h.m.SetSyncedDefinitions([]Definition{{
+		Kind: KindSystemdUnit, Target: "demo-api.service", Enabled: true, Severity: "critical", EvaluationLocation: "agent",
+		FailureThreshold: 2, RecoveryThreshold: 2,
+	}})
+	for range 4 {
+		h.tick()
+	}
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing events for a stopped named unit = %d, want 1 (events: %+v)", got, h.sender.events)
+	}
+	for _, e := range h.sender.events {
+		if e.Target == "apt-daily.service" {
+			t.Fatalf("unnamed idle unit paged: %+v", e)
+		}
+	}
+}
+
 // --- collector failure must hold state, never look healthy ---------------
 
 func TestMemoryMonitor_CollectorFailureHoldsState(t *testing.T) {
@@ -489,14 +549,6 @@ func TestDiskMonitor_CollectorFailureHoldsState(t *testing.T) {
 	}
 	if got := h.sender.countTo("resolved"); got != 0 {
 		t.Fatalf("resolved events while disk collector failing = %d, want 0", got)
-	}
-}
-
-func TestOwnsAlertRule(t *testing.T) {
-	for rule, want := range map[string]bool{"disk_usage": true, "unit_failed": true, "load_sustained": true, "bogus": false} {
-		if got := OwnsAlertRule(rule); got != want {
-			t.Fatalf("OwnsAlertRule(%q) = %v, want %v", rule, got, want)
-		}
 	}
 }
 
@@ -741,5 +793,176 @@ func TestDockerMonitor_StalePendingForVanishedContainerClearsSilently(t *testing
 	}
 	if len(h.sender.events) != 0 {
 		t.Fatalf("clearing a pending state emitted events: %+v", h.sender.events)
+	}
+}
+
+// --- checks migrated from the old alerts engine ----------------------------
+
+func TestDiskMonitor_WatchesEveryMountWithRootThresholds(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.infra.metrics = infra.HostMetrics{
+		Disks: []infra.DiskMetric{
+			{Mountpoint: "/", Available: true, Percent: 40},
+			{Mountpoint: "/data", Available: true, Percent: 91},
+		},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 10},
+	}
+	h.tick()
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 0 {
+		t.Fatalf("firing before the third breach = %d, want 0", got)
+	}
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing events for /data at 91%% = %d, want 1", got)
+	}
+	if ev := h.sender.events[0]; ev.MonitorKind != string(KindDiskCapacity) || ev.Target != "/data" || ev.Severity != "critical" {
+		t.Fatalf("event = %+v, want disk_capacity /data critical", ev)
+	}
+	// 87% sits inside the 85-90 band: no recovery, no flap.
+	h.infra.metrics.Disks[1].Percent = 87
+	for range 5 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 0 {
+		t.Fatalf("resolved at 87%% = %d, want 0", got)
+	}
+	h.infra.metrics.Disks[1].Percent = 80
+	for range 3 {
+		h.tick()
+	}
+	if got := h.sender.countTo("resolved"); got != 1 {
+		t.Fatalf("resolved at 80%% = %d, want 1", got)
+	}
+}
+
+func TestDiskMonitor_UnavailableMountIsNotWatched(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.infra.metrics = infra.HostMetrics{
+		Disks:  []infra.DiskMetric{{Mountpoint: "/mnt/gone", Available: false, Percent: 99}},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 10},
+	}
+	for range 4 {
+		h.tick()
+	}
+	if got := len(h.sender.events); got != 0 {
+		t.Fatalf("events for an unreadable mount = %d, want 0", got)
+	}
+}
+
+func TestSystemdMonitor_SubStateFailedPages(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.systemd.units = []systemd.Unit{{Name: "worker.service", ActiveState: "activating", SubState: "failed", Type: "simple"}}
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 0 {
+		t.Fatalf("firing after one failed poll = %d, want 0 (needs two in a row)", got)
+	}
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing after two failed polls = %d, want 1", got)
+	}
+}
+
+func TestSystemdMonitor_FlappingUnitDoesNotPage(t *testing.T) {
+	h := newHarness(t, false, true)
+	failed := []systemd.Unit{{Name: "flap.service", ActiveState: "failed", Type: "simple"}}
+	ok := []systemd.Unit{{Name: "flap.service", ActiveState: "active", Type: "simple"}}
+	for range 4 {
+		h.systemd.units = failed
+		h.tick()
+		h.systemd.units = ok
+		h.tick()
+	}
+	if got := len(h.sender.events); got != 0 {
+		t.Fatalf("events for a unit failing every other poll = %d, want 0", got)
+	}
+}
+
+func TestLoadMonitor_NeedsSustainedLoad(t *testing.T) {
+	h := newHarness(t, false, false)
+	h.m.defs.SetSynced(nil)
+	cores := 4
+	for _, e := range h.m.evaluators {
+		if l, ok := e.(*LoadEvaluator); ok {
+			l.Cores = func() int { return cores }
+		}
+	}
+	h.infra.metrics = infra.HostMetrics{
+		Load:   infra.LoadMetric{MetricReason: infra.MetricReason{Available: true}, Five: 8},
+		Memory: infra.MemoryMetric{MetricReason: infra.MetricReason{Available: true}, Percent: 10},
+	}
+	for range 9 {
+		h.tick()
+	}
+	if got := h.sender.countTo("firing"); got != 0 {
+		t.Fatalf("firing before 10 ticks of load = %d, want 0", got)
+	}
+	h.tick()
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing after sustained 2.0/core = %d, want 1", got)
+	}
+}
+
+// --- silence and ack -----------------------------------------------------------
+
+func TestSilence_SuppressesFiringAndRecovery(t *testing.T) {
+	h := newHarness(t, false, false)
+	until, err := h.m.Silence(string(KindDiskCapacity), "/", time.Hour)
+	if err != nil {
+		t.Fatalf("Silence: %v", err)
+	}
+	if want := h.now.Add(time.Hour); !until.Equal(want) {
+		t.Fatalf("silence until = %s, want %s", until, want)
+	}
+	h.infra.metrics = diskSample(95)
+	for range 3 {
+		h.tick()
+	}
+	if got := len(h.sender.events); got != 0 {
+		t.Fatalf("events while silenced = %d, want 0", got)
+	}
+	if state := State(h.m.states[key(KindDiskCapacity, "/")].State); state != StateFiring {
+		t.Fatalf("state while silenced = %s, want firing (state machine still runs)", state)
+	}
+}
+
+func TestSilence_ExpiresAndNonPositiveDurationClears(t *testing.T) {
+	h := newHarness(t, false, false)
+	if _, err := h.m.Silence(string(KindDiskCapacity), "/", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Minute)
+	h.infra.metrics = diskSample(95)
+	for range 3 {
+		h.tick()
+	}
+	if got := h.sender.countTo("firing"); got != 1 {
+		t.Fatalf("firing after silence expired = %d, want 1", got)
+	}
+
+	if _, err := h.m.Silence(string(KindDiskCapacity), "/", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	until, err := h.m.Silence(string(KindDiskCapacity), "/", 0)
+	if err != nil || !until.IsZero() {
+		t.Fatalf("clearing a silence = (%v, %v), want zero time and no error", until, err)
+	}
+	if h.m.isSilenced(key(KindDiskCapacity, "/"), h.now) {
+		t.Fatal("silence still active after clearing")
+	}
+}
+
+func TestAck_RecordsEpisode(t *testing.T) {
+	st := newFakeStateStore()
+	m, err := New(Config{Infra: &fakeInfra{}, Store: st, Client: &fakeSender{}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fired := time.Unix(1_700_000_000, 0)
+	if err := m.Ack("disk_capacity:/", fired); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.acks["disk_capacity:/"]; !got.Equal(fired) {
+		t.Fatalf("recorded ack = %s, want %s", got, fired)
 	}
 }

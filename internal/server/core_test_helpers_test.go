@@ -14,7 +14,6 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/rootmote-agent/internal/docker"
-	"github.com/rockclaver/rootmote-agent/internal/firewall"
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
 )
 
@@ -89,11 +88,6 @@ type fakeDockerClient struct {
 
 	actionCalls *[]string
 	actionErr   error
-
-	diskUsage    docker.DiskUsage
-	diskUsageErr error
-	pruneResult  docker.PruneResult
-	pruneErr     error
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -180,24 +174,12 @@ func (f fakeDockerClient) ContainerAction(_ context.Context, id string, action d
 	return f.err
 }
 
-func (f fakeDockerClient) DiskUsage(context.Context) (docker.DiskUsage, error) {
-	return f.diskUsage, f.diskUsageErr
-}
-
-func (f fakeDockerClient) PruneContainers(context.Context) (docker.PruneResult, error) {
-	return f.pruneResult, f.pruneErr
-}
-
 func (f fakeDockerClient) PruneImages(context.Context) (docker.PruneResult, error) {
-	return f.pruneResult, f.pruneErr
+	return docker.PruneResult{}, f.err
 }
 
 func (f fakeDockerClient) PruneBuildCache(context.Context) (docker.PruneResult, error) {
-	return f.pruneResult, f.pruneErr
-}
-
-func (f fakeDockerClient) PruneVolumes(context.Context) (docker.PruneResult, error) {
-	return f.pruneResult, f.pruneErr
+	return docker.PruneResult{}, f.err
 }
 
 type fakeSystemdClient struct {
@@ -206,8 +188,6 @@ type fakeSystemdClient struct {
 	available error
 	actions   []string
 	actionErr error
-	reboots   int
-	rebootErr error
 }
 
 func (f *fakeSystemdClient) Available(_ context.Context) error { return f.available }
@@ -234,58 +214,11 @@ func (f *fakeSystemdClient) Action(_ context.Context, name string, action system
 	f.actions = append(f.actions, name+":"+string(action))
 	return f.actionErr
 }
-func (f *fakeSystemdClient) Reboot(_ context.Context) error {
-	f.reboots++
-	return f.rebootErr
-}
 
 func systemdRoundTrip(t *testing.T, cfg Config, kind string, payload []byte) Frame {
 	t.Helper()
 	return dockerRoundTripConfig(t, cfg, kind, payload)
 }
-
-type fakeFWBackend struct {
-	kind      firewall.BackendKind
-	available error
-	rules     []firewall.Rule
-	added     []firewall.Rule
-	removed   []firewall.Rule
-}
-
-func (f *fakeFWBackend) Kind() firewall.BackendKind        { return f.kind }
-func (f *fakeFWBackend) Available(_ context.Context) error { return f.available }
-func (f *fakeFWBackend) Rules(_ context.Context) ([]firewall.Rule, error) {
-	return append([]firewall.Rule(nil), f.rules...), nil
-}
-func (f *fakeFWBackend) Add(_ context.Context, r firewall.Rule) error {
-	f.added = append(f.added, r)
-	f.rules = append(f.rules, r)
-	return nil
-}
-func (f *fakeFWBackend) Remove(_ context.Context, r firewall.Rule) error {
-	f.removed = append(f.removed, r)
-	return nil
-}
-
-type fakeFWSockets struct{ sockets []firewall.Socket }
-
-func (f fakeFWSockets) Listening(_ context.Context) ([]firewall.Socket, error) {
-	return append([]firewall.Socket(nil), f.sockets...), nil
-}
-
-type fakeFWSSH struct{ ports []int }
-
-func (f fakeFWSSH) SSHPorts(_ context.Context) []int { return append([]int(nil), f.ports...) }
-
-func newFirewallTestMgr(t *testing.T, b firewall.Backend, sshPorts []int, sockets []firewall.Socket) *firewall.Manager {
-	t.Helper()
-	mgr, err := firewall.New(firewall.Config{Backends: []firewall.Backend{b}, Sockets: fakeFWSockets{sockets: sockets}, SSH: fakeFWSSH{ports: sshPorts}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return mgr
-}
-
 func readFrame(t *testing.T, ctx context.Context, c *websocket.Conn, id string) Frame {
 	t.Helper()
 	for {

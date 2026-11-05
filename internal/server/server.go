@@ -21,26 +21,18 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/rootmote-agent/internal/aiproposal"
-	"github.com/rockclaver/rootmote-agent/internal/alerts"
-	"github.com/rockclaver/rootmote-agent/internal/cliauth"
 	"github.com/rockclaver/rootmote-agent/internal/diagnose"
 	"github.com/rockclaver/rootmote-agent/internal/diagnose/redact"
 	"github.com/rockclaver/rootmote-agent/internal/docker"
-	"github.com/rockclaver/rootmote-agent/internal/firewall"
 	"github.com/rockclaver/rootmote-agent/internal/infra"
 	"github.com/rockclaver/rootmote-agent/internal/inventory"
 	"github.com/rockclaver/rootmote-agent/internal/notifications"
-	agentprocess "github.com/rockclaver/rootmote-agent/internal/process"
-	"github.com/rockclaver/rootmote-agent/internal/push"
+	"github.com/rockclaver/rootmote-agent/internal/playbook"
 	"github.com/rockclaver/rootmote-agent/internal/remediation"
 	"github.com/rockclaver/rootmote-agent/internal/review"
-	"github.com/rockclaver/rootmote-agent/internal/runbook"
-	"github.com/rockclaver/rootmote-agent/internal/security"
-	"github.com/rockclaver/rootmote-agent/internal/storage"
+	"github.com/rockclaver/rootmote-agent/internal/steps"
 	"github.com/rockclaver/rootmote-agent/internal/store"
 	"github.com/rockclaver/rootmote-agent/internal/systemd"
-	"github.com/rockclaver/rootmote-agent/internal/tooling"
 	"github.com/rockclaver/rootmote-agent/internal/version"
 	"github.com/rockclaver/rootmote-agent/internal/watchtower"
 	"github.com/rockclaver/rootmote-agent/internal/webserver"
@@ -67,49 +59,37 @@ type Config struct {
 	Now func() time.Time
 	// Review, when non-nil, enables confirmation-token and audit kinds.
 	Review *review.Manager
-	// Tooling, when non-nil, enables tooling.* kinds.
-	Tooling *tooling.Manager
-	// Auth, when non-nil, enables auth.* kinds (CLI login flows).
-	Auth *cliauth.Manager
 	// Docker, when non-nil, enables docker.* kinds.
 	Docker *docker.Manager
 	// Infra, when non-nil, enables infra.* host metrics kinds.
 	Infra *infra.Manager
 	// Systemd, when non-nil, enables infra.service.* kinds.
 	Systemd *systemd.Manager
-	// Processes, when non-nil, enables infra.process.* kinds.
-	Processes *agentprocess.Manager
-	// Firewall, when non-nil, enables infra.firewall.* kinds.
-	Firewall *firewall.Manager
-	// Storage, when non-nil, enables storage.* kinds (Storage Analyzer: scan
-	// culprits, guarded category cleanup, browse, and guarded delete).
-	Storage *storage.Manager
-	// Security, when non-nil, enables security.* kinds (defensive host audit
-	// and narrow guarded fixes such as firewall-blocking risky ports).
-	Security *security.Manager
 	// Webservers, when non-nil, enables infra.webserver.* host proxy kinds.
 	Webservers *webserver.Manager
-	// Alerts, when non-nil, enables infra.alerts.* kinds.
-	Alerts *alerts.Manager
-	// AIProposals, when non-nil, enables infra.proposal.* kinds (Phase 6:
-	// AI-assisted infrastructure).
-	AIProposals *aiproposal.Manager
+	// Monitor, when non-nil, enables monitor.silence and monitor.ack.
+	Monitor MonitorControl
 	// Notifications fans background task.notification events to connected clients.
 	Notifications *notifications.Hub
-	// Runbook, when non-nil, enables infra.runbook.* kinds and surfaces
-	// the AI-proposed remediation queue (Stickiness #4).
-	Runbook *runbook.Manager
 	// Remediation, when non-nil, enables the incident.runbook.*,
 	// incident.execution.subscribe, incident.verify, and incident.rollback
 	// kinds -- the durable approve/execute/verify lifecycle for one
 	// specific approved runbook (issue #74 Task 3).
 	Remediation *remediation.Manager
-	// Inventory, when non-nil, enables inventory.* kinds (AI Action Plane:
-	// fleet capability snapshots for target resolution).
-	Inventory *inventory.Manager
-	// PushDevices, when non-nil, enables push.register / push.unregister
-	// for FCM device-token management.
-	PushDevices *store.Store
+	// Store holds incident bindings and remediation executions. With
+	// Remediation it enables playbook building (incident.playbook.generate and
+	// the automatic playbook when an incident opens).
+	Store *store.Store
+	// URLs is the list of addresses check.http may request; playbooks pick
+	// their web address from it.
+	URLs *URLAllowlist
+	// Steps validates playbook steps against the live host before a playbook
+	// is proposed.
+	Steps *steps.Runner
+	// Priv runs privilege-helper actions. Inventory discovery uses it for
+	// the read-only pm2-list, certs-list and supervisor-status actions; nil
+	// turns those parts into warnings.
+	Priv steps.PrivCaller
 	// Watchtower, when non-nil, enables watchtower.enable / watchtower.status
 	// (Watchtower Phase 1 cloud spine tracer: enroll this agent against a
 	// relay and report enrollment state). The client already exists
@@ -124,10 +104,6 @@ type Config struct {
 	// any subset (including none) is nil-safe, exactly like
 	// discoverHostInventory.
 	DiagnoseRedactor *redact.Redactor
-	// DiagnoseProposer, when non-nil, enables the AI diagnosis step on top
-	// of the deterministic signatures. Nil means deterministic-only
-	// diagnosis (AC6) without disabling incident.diagnose/incident.evidence.
-	DiagnoseProposer diagnose.Proposer
 	// DiagnoseConfidenceThreshold overrides diagnose.DefaultConfidenceThreshold
 	// when > 0.
 	DiagnoseConfidenceThreshold float64
@@ -163,6 +139,13 @@ type Server struct {
 	diagnoseMu      sync.Mutex
 	diagnoseBundles map[string]diagnose.Bundle
 
+	// discovery caches one host discovery pass for a few seconds.
+	discovery discoveryCache
+
+	// playbooks builds and proposes a playbook per incident. Nil when the
+	// agent has no remediation manager or store.
+	playbooks *playbook.Service
+
 	// lifeCtx is the outer context passed to Serve -- the agent process's
 	// own lifecycle, cancelled on shutdown. incident.runbook.execute /
 	// incident.rollback run their StepExecutor pass on this context (via
@@ -182,12 +165,14 @@ func New(cfg Config) *Server {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Server{
+	s := &Server{
 		cfg:             cfg,
 		startAt:         cfg.Now(),
 		seen:            newIDSet(1024, replayWindow, cfg.Now),
 		diagnoseBundles: make(map[string]diagnose.Bundle),
 	}
+	s.playbooks = s.newPlaybookService()
+	return s
 }
 
 // ErrNonLoopbackBind is returned when the configured address is not loopback.
@@ -277,7 +262,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Request-id dedupe spans reconnects (the cache lives on Server, not this
 	// connection). When the mobile transport replays a frame after a tunnel
 	// drop on a new WebSocket, this branch still fires so side-effecting
-	// kinds like incident.runbook.execute / infra.proposal.approve don't execute twice.
+	// kinds like incident.runbook.execute and incident.rollback don't execute twice.
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
@@ -436,56 +421,23 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "auth.confirm",
 		"audit.list":
 		s.dispatchReview(ctx, c, writeMu, f)
-	case "tooling.check",
-		"tooling.install":
-		s.dispatchTooling(ctx, c, writeMu, f)
-	case "auth.status",
-		"auth.login_start",
-		"auth.input",
-		"auth.login_cancel",
-		"auth.set_token",
-		"auth.logout",
-		"auth.relay_callback":
-		s.dispatchAuth(ctx, c, writeMu, f)
 	case "infra.metrics.sample":
 		s.dispatchInfra(ctx, c, writeMu, f)
-	case "infra.alerts.config",
-		"infra.alerts.config_set",
-		"infra.alerts.silence",
-		"infra.alerts.unsilence",
-		"infra.alerts.ack":
-		s.dispatchAlerts(ctx, c, writeMu, f)
-	case "infra.proposal.approve",
-		"infra.proposal.decline":
-		s.dispatchProposal(ctx, c, writeMu, f)
-	case "infra.runbook.list",
-		"infra.runbook.get":
-		s.dispatchRunbook(ctx, c, writeMu, f)
-	case "inventory.capabilities", "inventory.discover":
+	case "monitor.silence", "monitor.ack":
+		s.dispatchMonitor(ctx, c, writeMu, f)
+	case "inventory.discover":
 		s.dispatchInventory(ctx, c, writeMu, f)
-	case "push.register", "push.unregister", "push.list",
-		"notifications.prefs.list", "notifications.prefs.set":
-		s.dispatchPush(ctx, c, writeMu, f)
 	case "watchtower.enable", "watchtower.status":
 		s.dispatchWatchtower(ctx, c, writeMu, f)
 	case "incident.diagnose", "incident.evidence":
 		s.dispatchDiagnose(ctx, c, writeMu, f)
 	case "incident.runbook.get", "incident.runbook.decline", "incident.runbook.execute",
-		"incident.execution.subscribe", "incident.verify", "incident.rollback":
+		"incident.execution.subscribe", "incident.verify", "incident.rollback",
+		"incident.playbook.generate":
 		s.dispatchRemediation(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
-}
-
-// ChangedFileDTO is retained only for source compatibility with historical
-// audit payloads; the diff API itself is no longer exposed.
-type ChangedFileDTO struct {
-	Path     string `json:"path"`
-	OldPath  string `json:"old_path,omitempty"`
-	Group    string `json:"group"`
-	Binary   bool   `json:"binary"`
-	Revision string `json:"revision"`
 }
 
 // AuditDTO is the wire shape of one audit row.
@@ -600,52 +552,19 @@ func (s *Server) dispatchInfra(ctx context.Context, c *websocket.Conn, writeMu *
 	s.writeOK(ctx, c, writeMu, f.ID, "infra.metrics.sample", map[string]any{"sample": s.cfg.Infra.Sample(ctx)})
 }
 
-func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Alerts == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "alerts subsystem not configured")
+// MonitorControl is the part of the monitor engine the control plane drives.
+type MonitorControl interface {
+	Silence(rule, target string, d time.Duration) (time.Time, error)
+	Ack(key string, firedAt time.Time) error
+}
+
+func (s *Server) dispatchMonitor(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Monitor == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "monitoring is not enabled")
 		return
 	}
 	switch f.Kind {
-	case "infra.alerts.config":
-		var in struct {
-			ServerID string `json:"server_id"`
-		}
-		if len(f.Payload) > 0 {
-			if err := json.Unmarshal(f.Payload, &in); err != nil {
-				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "invalid alerts config payload")
-				return
-			}
-		}
-		rules, err := s.cfg.Alerts.Config(ctx, in.ServerID)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.config", map[string]any{"rules": rules})
-	case "infra.alerts.config_set":
-		var in struct {
-			ServerID  string  `json:"server_id"`
-			Kind      string  `json:"kind"`
-			Enabled   bool    `json:"enabled"`
-			Threshold float64 `json:"threshold"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		rule, err := s.cfg.Alerts.SetConfig(ctx, store.InfraAlertRule{
-			ServerID:  in.ServerID,
-			Kind:      in.Kind,
-			Enabled:   in.Enabled,
-			Threshold: in.Threshold,
-			UpdatedAt: s.cfg.Now(),
-		})
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.config_set", map[string]any{"rule": rule})
-	case "infra.alerts.silence":
+	case "monitor.silence":
 		var in struct {
 			Rule       string `json:"rule"`
 			Target     string `json:"target"`
@@ -655,7 +574,7 @@ func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu 
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "rule required")
 			return
 		}
-		until, err := s.cfg.Alerts.Silence(in.Rule, in.Target, time.Duration(in.DurationMS)*time.Millisecond)
+		until, err := s.cfg.Monitor.Silence(in.Rule, in.Target, time.Duration(in.DurationMS)*time.Millisecond)
 		if err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
 			return
@@ -666,22 +585,8 @@ func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu 
 		} else {
 			out["silenced"] = false
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.silence", out)
-	case "infra.alerts.unsilence":
-		var in struct {
-			Rule   string `json:"rule"`
-			Target string `json:"target"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Rule == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "rule required")
-			return
-		}
-		if err := s.cfg.Alerts.Unsilence(in.Rule, in.Target); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.unsilence", map[string]any{"silenced": false})
-	case "infra.alerts.ack":
+		s.writeOK(ctx, c, writeMu, f.ID, "monitor.silence", out)
+	case "monitor.ack":
 		var in struct {
 			Key     string `json:"key"`
 			FiredAt int64  `json:"fired_at"`
@@ -690,271 +595,11 @@ func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu 
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "key required")
 			return
 		}
-		if err := s.cfg.Alerts.Ack(in.Key, time.Unix(in.FiredAt, 0)); err != nil {
+		if err := s.cfg.Monitor.Ack(in.Key, time.Unix(in.FiredAt, 0)); err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
 			return
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.ack", map[string]any{"acked": true})
-	}
-}
-
-// ToolingStatusDTO mirrors tooling.Status on the wire.
-type ToolingStatusDTO struct {
-	Kind      string `json:"kind"`
-	Installed bool   `json:"installed"`
-	Path      string `json:"path,omitempty"`
-	Version   string `json:"version,omitempty"`
-}
-
-func toToolingDTO(st tooling.Status) ToolingStatusDTO {
-	return ToolingStatusDTO{
-		Kind: string(st.Kind), Installed: st.Installed,
-		Path: st.Path, Version: st.Version,
-	}
-}
-
-func (s *Server) dispatchTooling(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Tooling == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "tooling subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Tooling
-	switch f.Kind {
-	case "tooling.check":
-		var in struct {
-			Kind string `json:"kind"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		st, err := mgr.Check(ctx, tooling.Kind(in.Kind))
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "tooling.check", toToolingDTO(st))
-	case "tooling.install":
-		var in struct {
-			Kind string `json:"kind"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		kind := tooling.Kind(in.Kind)
-		// Ack the install request immediately so the client can start
-		// rendering the log view; progress lines correlate via the
-		// install_id we hand back.
-		installID := f.ID
-		s.writeOK(ctx, c, writeMu, f.ID, "tooling.install", map[string]any{
-			"install_id": installID,
-			"kind":       in.Kind,
-			"state":      "started",
-		})
-		go func() {
-			onLine := func(l tooling.Line) {
-				s.writeOK(ctx, c, writeMu, "", "tooling.progress", map[string]any{
-					"install_id": installID,
-					"kind":       in.Kind,
-					"stream":     string(l.Stream),
-					"line":       l.Text,
-				})
-			}
-			st, err := mgr.Install(ctx, kind, onLine)
-			if err != nil {
-				if errors.Is(err, tooling.ErrAlreadyRunning) {
-					s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
-						"install_id": installID,
-						"kind":       in.Kind,
-						"ok":         false,
-						"error":      "already_running",
-					})
-					return
-				}
-				s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
-					"install_id": installID,
-					"kind":       in.Kind,
-					"ok":         false,
-					"error":      err.Error(),
-					"status":     toToolingDTO(st),
-				})
-				return
-			}
-			s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
-				"install_id": installID,
-				"kind":       in.Kind,
-				"ok":         true,
-				"status":     toToolingDTO(st),
-			})
-		}()
-	}
-}
-
-// CliAuthStatusDTO mirrors cliauth.Status.
-type CliAuthStatusDTO struct {
-	Kind     string `json:"kind"`
-	LoggedIn bool   `json:"logged_in"`
-	Method   string `json:"method"`
-	Account  string `json:"account,omitempty"`
-	Version  string `json:"version,omitempty"`
-}
-
-func toAuthDTO(st cliauth.Status) CliAuthStatusDTO {
-	return CliAuthStatusDTO{
-		Kind: st.Kind, LoggedIn: st.LoggedIn,
-		Method: st.Method, Account: st.Account, Version: st.Version,
-	}
-}
-
-func (s *Server) dispatchAuth(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Auth == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "auth subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Auth
-	switch f.Kind {
-	case "auth.status":
-		var in struct {
-			Kind string `json:"kind"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		st, err := mgr.Status(ctx, in.Kind)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.status", toAuthDTO(st))
-	case "auth.login_start":
-		var in struct {
-			Kind string `json:"kind"`
-			Mode string `json:"mode"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		if in.Mode == "" {
-			in.Mode = cliauth.ModeInteractive
-		}
-		login, err := mgr.StartLogin(ctx, in.Kind, in.Mode)
-		if err != nil {
-			code := "internal"
-			if errors.Is(err, cliauth.ErrAlreadyRunning) {
-				code = "cli_pending"
-			} else if errors.Is(err, cliauth.ErrBadKind) || errors.Is(err, cliauth.ErrBadMode) {
-				code = "bad_payload"
-			}
-			s.writeError(ctx, c, writeMu, f.ID, code, err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.login_start", map[string]any{
-			"login_id": login.ID, "kind": login.Kind, "mode": in.Mode,
-		})
-		go func() {
-			for ev := range login.Events {
-				switch ev.Type {
-				case cliauth.EvtProgress:
-					s.writeOK(ctx, c, writeMu, "", "auth.progress", map[string]any{
-						"login_id": login.ID, "kind": login.Kind,
-						"stream": ev.Stream, "line": ev.Line,
-					})
-				case cliauth.EvtURL:
-					s.writeOK(ctx, c, writeMu, "", "auth.url", map[string]any{
-						"login_id": login.ID, "kind": login.Kind,
-						"url": ev.URL, "user_code": ev.UserCode,
-					})
-				case cliauth.EvtCallbackTarget:
-					s.writeOK(ctx, c, writeMu, "", "auth.callback_target", map[string]any{
-						"login_id": login.ID, "kind": login.Kind,
-						"host": ev.CallbackHost, "port": ev.CallbackPort, "path": ev.CallbackPath,
-					})
-				case cliauth.EvtPromptPaste:
-					s.writeOK(ctx, c, writeMu, "", "auth.prompt_paste", map[string]any{
-						"login_id": login.ID, "kind": login.Kind,
-					})
-				case cliauth.EvtDone:
-					s.writeOK(ctx, c, writeMu, "", "auth.done", map[string]any{
-						"login_id": login.ID, "kind": login.Kind,
-						"ok": ev.OK, "error": ev.Error, "status": toAuthDTO(ev.Status),
-					})
-				}
-			}
-		}()
-	case "auth.input":
-		var in struct {
-			LoginID string `json:"login_id"`
-			Text    string `json:"text"`
-			Enter   bool   `json:"enter"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
-			return
-		}
-		if err := mgr.Send(ctx, in.LoginID, in.Text, in.Enter); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.input", map[string]any{"login_id": in.LoginID})
-	case "auth.login_cancel":
-		var in struct {
-			LoginID string `json:"login_id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
-			return
-		}
-		if err := mgr.Cancel(in.LoginID); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.login_cancel", map[string]any{"login_id": in.LoginID, "cancelled": true})
-	case "auth.set_token":
-		var in struct {
-			Kind  string `json:"kind"`
-			Mode  string `json:"mode"`
-			Value string `json:"value"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" || in.Value == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind and value required")
-			return
-		}
-		st, err := mgr.SetToken(ctx, in.Kind, in.Mode, in.Value)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.set_token", toAuthDTO(st))
-	case "auth.relay_callback":
-		var in struct {
-			LoginID string `json:"login_id"`
-			Query   string `json:"query"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
-			return
-		}
-		if err := mgr.Relay(ctx, in.LoginID, in.Query); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.relay_callback", map[string]any{"login_id": in.LoginID, "ok": true})
-	case "auth.logout":
-		var in struct {
-			Kind string `json:"kind"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
-			return
-		}
-		if err := mgr.Logout(ctx, in.Kind); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "auth.logout", map[string]any{"kind": in.Kind, "ok": true})
+		s.writeOK(ctx, c, writeMu, f.ID, "monitor.ack", map[string]any{"acked": true})
 	}
 }
 
@@ -974,291 +619,8 @@ func (s *Server) writeError(ctx context.Context, c *websocket.Conn, writeMu *con
 	writeMu.enqueue(out)
 }
 
-// dispatchInfraSnapshot aggregates the four infra read sources (metrics,
-// services, processes, firewall) into a single payload so an AI session can
-// ground answers about host health on real data with one round-trip. Missing
-// subsystems are reported as null fields rather than failing the call.
-func (s *Server) auditAIProposed(auditType, summary string, data map[string]any) store.AuditEntry {
-	if s.cfg.Review == nil {
-		return store.AuditEntry{}
-	}
-	body, _ := json.Marshal(data)
-	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
-		Type:      auditType,
-		ProjectID: "infra",
-		Actor:     "ai-proposed",
-		Summary:   summary,
-		Data:      string(body),
-		CreatedAt: s.cfg.Now(),
-	})
-	return entry
-}
-
-func (s *Server) dispatchProposal(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.AIProposals == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "AI proposal subsystem not configured")
-		return
-	}
-	switch f.Kind {
-	case "infra.proposal.decline":
-		var in struct {
-			ID      string `json:"id"`
-			Comment string `json:"comment"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		// Decline never mutates the host, so it does not require a
-		// confirmation token; just record the decision.
-		audit := s.auditAIProposed("infra.proposal.decline", "ai-proposed declined: "+in.ID, map[string]any{
-			"proposal_id": in.ID,
-			"comment":     in.Comment,
-		})
-		p, err := s.cfg.AIProposals.Resolve(in.ID, aiproposal.StatusDeclined, in.Comment, audit.ID)
-		if err != nil {
-			if errors.Is(err, aiproposal.ErrNotFound) {
-				s.writeError(ctx, c, writeMu, f.ID, "not_found", err.Error())
-				return
-			}
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.decline", map[string]any{"proposal": p})
-	case "infra.proposal.approve":
-		s.handleProposalApprove(ctx, c, writeMu, f)
-	}
-}
-
-// handleProposalApprove implements the propose -> approve -> execute path.
-// Critical invariants:
-//
-//   - The guard checks (protected unit, protected PID) run BEFORE the
-//     confirmation token is consumed so a rejected proposal does not burn a
-//     token the operator may want to reuse.
-//   - The confirmation token is consumed BEFORE the underlying mutation is
-//     attempted, so a failure in the executor cannot be retried by replaying
-//     the same token.
-//   - Every terminal outcome (rejected / failed / executed) writes an audit
-//     row attributed to "ai-proposed" and resolves the proposal so a second
-//     approval attempt returns ErrAlreadyResolved.
-func (s *Server) handleProposalApprove(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	var in struct {
-		ID                string `json:"id"`
-		ConfirmationToken string `json:"confirmation_token"`
-	}
-	if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-		return
-	}
-	if s.cfg.Review == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
-		return
-	}
-	p, err := s.cfg.AIProposals.Get(in.ID)
-	if err != nil {
-		s.writeError(ctx, c, writeMu, f.ID, "not_found", err.Error())
-		return
-	}
-	if p.Status != aiproposal.StatusPending {
-		s.writeError(ctx, c, writeMu, f.ID, "already_resolved", "proposal is not pending")
-		return
-	}
-
-	auditType := "infra.proposal." + string(p.Kind)
-	// Pre-emptively claim the proposal so a second concurrent approve cannot
-	// also consume a (different) confirmation token and double-execute the
-	// underlying action. The claim is released on any recoverable failure
-	// path (token rejected) so the operator can retry; terminal outcomes
-	// transition straight from StatusExecuting to a resolved status.
-	claimed, claimErr := s.cfg.AIProposals.Claim(p.ID)
-	if claimErr != nil {
-		s.writeError(ctx, c, writeMu, f.ID, "already_resolved", claimErr.Error())
-		return
-	}
-	p = claimed
-	released := false
-	releaseOnce := func() {
-		if !released {
-			s.cfg.AIProposals.Release(p.ID)
-			released = true
-		}
-	}
-	defer releaseOnce()
-
-	// Guard checks BEFORE consuming the token.
-	switch p.Kind {
-	case aiproposal.KindServiceAction:
-		if s.cfg.Systemd == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "systemd subsystem not configured")
-			return
-		}
-		name, _ := p.Params["name"].(string)
-		actStr, _ := p.Params["action"].(string)
-		act := systemd.Action(actStr)
-		if s.cfg.Systemd.IsProtected(name) && (act == systemd.ActionStop || act == systemd.ActionDisable) {
-			audit := s.auditAIProposed(auditType, fmt.Sprintf("ai-proposed %s rejected: protected unit %s", actStr, name), map[string]any{
-				"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "protected_unit",
-			})
-			_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusRejected, "protected_unit", audit.ID)
-			s.writeError(ctx, c, writeMu, f.ID, "protected_unit", fmt.Sprintf("refused %s on protected unit %s", actStr, name))
-			return
-		}
-	case aiproposal.KindProcessKill:
-		if s.cfg.Processes == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "process subsystem not configured")
-			return
-		}
-		pid := intFromParams(p.Params["pid"])
-		if reason, ok := s.cfg.Processes.IsProtected(ctx, pid); ok {
-			audit := s.auditAIProposed(auditType, fmt.Sprintf("ai-proposed kill rejected: protected pid %d", pid), map[string]any{
-				"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "protected_pid", "detail": reason,
-			})
-			_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusRejected, "protected_pid", audit.ID)
-			s.writeError(ctx, c, writeMu, f.ID, "protected_pid", fmt.Sprintf("refused kill on protected pid %d: %s", pid, reason))
-			return
-		}
-	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
-		if s.cfg.Firewall == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "firewall subsystem not configured")
-			return
-		}
-		// anti-lockout is enforced inside Firewall.RuleRemove (post-token)
-	case aiproposal.KindSecurityFix:
-		if s.cfg.Security == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "security subsystem not configured")
-			return
-		}
-	}
-
-	// Consume the confirmation token. A token failure here is recoverable:
-	// the operator can retry the approval with a freshly-minted token, so we
-	// leave the proposal in StatusPending rather than resolving it.
-	if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, p.TokenAction, p.TokenProjectID, p.TokenFiles, ""); err != nil {
-		s.auditAIProposed(auditType, "ai-proposed token rejected: "+err.Error(), map[string]any{
-			"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "token_invalid",
-		})
-		s.writeReviewErr(ctx, c, writeMu, f.ID, err)
-		return
-	}
-
-	// Execute via the same managers human-initiated calls use.
-	execErr := s.executeProposal(ctx, p)
-	if execErr != nil {
-		audit := s.auditAIProposed(auditType, "ai-proposed execution failed: "+execErr.Error(), map[string]any{
-			"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "ok": false, "error": execErr.Error(),
-		})
-		_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusFailed, execErr.Error(), audit.ID)
-		// Map known error classes to the same wire kinds the human path uses.
-		var pue *systemd.ProtectedUnitError
-		var ppe *agentprocess.ProtectedPIDError
-		var ale *firewall.AntiLockoutError
-		switch {
-		case errors.As(execErr, &pue):
-			s.writeError(ctx, c, writeMu, f.ID, "protected_unit", execErr.Error())
-		case errors.As(execErr, &ppe):
-			s.writeError(ctx, c, writeMu, f.ID, "protected_pid", execErr.Error())
-		case errors.As(execErr, &ale):
-			s.writeError(ctx, c, writeMu, f.ID, "anti_lockout", execErr.Error())
-		case errors.Is(execErr, agentprocess.ErrIdentityMismatch):
-			s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", execErr.Error())
-		case errors.Is(execErr, agentprocess.ErrTerminationFailed):
-			s.writeError(ctx, c, writeMu, f.ID, "process_termination_failed", execErr.Error())
-		case errors.Is(execErr, agentprocess.ErrKernelThread):
-			s.writeError(ctx, c, writeMu, f.ID, "process_kernel_thread", execErr.Error())
-		case errors.Is(execErr, firewall.ErrReadOnly):
-			s.writeError(ctx, c, writeMu, f.ID, "firewall_read_only", execErr.Error())
-		default:
-			s.writeError(ctx, c, writeMu, f.ID, "exec_error", execErr.Error())
-		}
-		return
-	}
-	audit := s.auditAIProposed(auditType, "ai-proposed executed: "+p.ID, map[string]any{
-		"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "ok": true,
-	})
-	resolved, _ := s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusExecuted, "ok", audit.ID)
-	s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.approve", map[string]any{
-		"proposal": resolved,
-		"audit_id": audit.ID,
-	})
-}
-
-func (s *Server) executeProposal(ctx context.Context, p aiproposal.Proposal) error {
-	switch p.Kind {
-	case aiproposal.KindServiceAction:
-		name, _ := p.Params["name"].(string)
-		actStr, _ := p.Params["action"].(string)
-		return s.cfg.Systemd.Action(ctx, name, systemd.Action(actStr))
-	case aiproposal.KindProcessKill:
-		pid := intFromParams(p.Params["pid"])
-		startTicks := uint64FromParams(p.Params["start_time_ticks"])
-		signal, _ := p.Params["signal"].(string)
-		return s.cfg.Processes.Kill(ctx, pid, startTicks, signal)
-	case aiproposal.KindFirewallAdd:
-		rule, err := ruleFromParams(p.Params)
-		if err != nil {
-			return err
-		}
-		return s.cfg.Firewall.RuleAdd(ctx, rule)
-	case aiproposal.KindFirewallRemove:
-		rule, err := ruleFromParams(p.Params)
-		if err != nil {
-			return err
-		}
-		return s.cfg.Firewall.RuleRemove(ctx, rule)
-	case aiproposal.KindSecurityFix:
-		req, err := securityFixRequestFromParams(p.Params)
-		if err != nil {
-			return err
-		}
-		_, err = s.cfg.Security.Fix(ctx, req)
-		return err
-	}
-	return fmt.Errorf("unknown proposal kind %q", p.Kind)
-}
-
-// dispatchRunbook surfaces the runbook.Manager's queue. Mutations are NOT
-// exposed: a runbook is created server-side from an alert, and its steps are
-// approved via the existing infra.proposal.approve path (which already routes
-// through biometric + confirmation token).
-func (s *Server) dispatchRunbook(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Runbook == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "runbook subsystem not configured")
-		return
-	}
-	switch f.Kind {
-	case "infra.runbook.list":
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.runbook.list", map[string]any{
-			"runbooks": s.cfg.Runbook.List(),
-		})
-	case "infra.runbook.get":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		rb, ok := s.cfg.Runbook.Get(in.ID)
-		if !ok {
-			s.writeError(ctx, c, writeMu, f.ID, "not_found", "runbook "+in.ID)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "infra.runbook.get", map[string]any{
-			"runbook": rb,
-		})
-	}
-}
-
 func (s *Server) dispatchInventory(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Inventory == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "inventory subsystem not configured")
-		return
-	}
 	switch f.Kind {
-	case "inventory.capabilities":
-		snap := s.cfg.Inventory.SnapshotCapabilities(ctx)
-		s.writeOK(ctx, c, writeMu, f.ID, "inventory.capabilities", map[string]any{"snapshot": snap})
 	case "inventory.discover":
 		report := s.discoverHostInventory(ctx)
 		s.writeOK(ctx, c, writeMu, f.ID, "inventory.discover", report)
@@ -1282,121 +644,19 @@ func (s *Server) discoverHostInventory(ctx context.Context) inventory.DiscoveryR
 	if s.cfg.Webservers != nil {
 		cfg.Webserver = s.cfg.Webservers
 	}
+	if s.cfg.Priv != nil {
+		cfg.Priv = func(ctx context.Context, action string, args ...string) ([]byte, error) {
+			return s.cfg.Priv.Call(ctx, action, args...)
+		}
+	}
 	return inventory.NewDiscoverer(cfg).Discover(ctx)
-}
-
-// dispatchPush owns FCM device-token registration. Tokens are stored on the
-// host so the agent can fan push messages to every device that has connected
-// to this server — no external device-registry service is required.
-func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.PushDevices == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "push subsystem not configured")
-		return
-	}
-	switch f.Kind {
-	case "push.register":
-		var in struct {
-			Token     string `json:"token"`
-			APNsToken string `json:"apns_token"`
-			Platform  string `json:"platform"`
-			// ServerID is Rootmote's own client-side identifier for the
-			// server this device is registering against (minted when the
-			// user added the server; the agent has no other way to learn
-			// it). Persisted per-device so push.Hub can stamp the right
-			// value into deep_link/staged-action payloads instead of the
-			// agent's internal rule-bucket id, which the client can never
-			// match against its own server list.
-			ServerID string `json:"server_id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
-			return
-		}
-		err := s.cfg.PushDevices.PutPushDevice(store.PushDevice{
-			Token: in.Token, APNsToken: in.APNsToken, Platform: in.Platform,
-			ClientServerID: in.ServerID, LastSeenAt: s.cfg.Now(),
-		})
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "push.register", map[string]any{"ok": true})
-	case "push.unregister":
-		var in struct {
-			Token string `json:"token"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
-			return
-		}
-		if err := s.cfg.PushDevices.DeletePushDevice(in.Token); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "push.unregister", map[string]any{"ok": true})
-	case "push.list":
-		devices, err := s.cfg.PushDevices.ListPushDevices()
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "push.list", map[string]any{"devices": devices})
-	case "notifications.prefs.list":
-		overrides, err := s.cfg.PushDevices.ListNotificationPrefs()
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		ov := make(map[string]bool, len(overrides))
-		for _, p := range overrides {
-			ov[p.Type] = p.PushEnabled
-		}
-		kinds := push.KnownKinds()
-		out := make([]NotificationPrefDTO, 0, len(kinds))
-		for _, k := range kinds {
-			enabled, overridden := k.DefaultPush, false
-			if v, ok := ov[k.Key]; ok {
-				enabled, overridden = v, true
-			}
-			out = append(out, NotificationPrefDTO{
-				Type: k.Key, Label: k.Label, DefaultPush: k.DefaultPush,
-				PushEnabled: enabled, Overridden: overridden,
-			})
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "notifications.prefs.list", map[string]any{"prefs": out})
-	case "notifications.prefs.set":
-		var in struct {
-			Type        string `json:"type"`
-			PushEnabled bool   `json:"push_enabled"`
-			// Reset, when true, deletes any override and reverts Type to
-			// its built-in default; PushEnabled is ignored.
-			Reset bool `json:"reset"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Type == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "type required")
-			return
-		}
-		if in.Reset {
-			if err := s.cfg.PushDevices.DeleteNotificationPref(in.Type); err != nil {
-				s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-				return
-			}
-		} else if err := s.cfg.PushDevices.PutNotificationPref(store.NotificationPref{
-			Type: in.Type, PushEnabled: in.PushEnabled, UpdatedAt: s.cfg.Now(),
-		}); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "notifications.prefs.set", map[string]any{"ok": true})
-	}
 }
 
 // dispatchWatchtower owns the Watchtower Phase 1 cloud spine tracer:
 // enrolling this agent against a relay (mobile-driven, using the
 // enrollmentCode minted when the user added the server) and reporting
 // enrollment state back to the app. No confirmation-token gate: enabling
-// Watchtower only starts an outbound heartbeat loop, mirroring the
-// ungated push.register write it sits next to.
+// Watchtower only starts an outbound heartbeat loop.
 func (s *Server) dispatchWatchtower(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Watchtower == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "watchtower not configured")
@@ -1466,7 +726,8 @@ func (s systemdDiagnoseSource) Logs(ctx context.Context, unit string, tail int) 
 // Docker/Systemd/Infra/Webservers are configured, nil-safe for any subset
 // (including none) exactly like discoverHostInventory: a missing source
 // just means that section of the evidence bundle stays empty with a
-// Warning, per diagnose.Collector.Collect's documented behavior.
+// Warning, per diagnose.Collector.Collect's documented behavior. The
+// stack, disk and proxy sources read the host directly.
 func (s *Server) buildDiagnosePipeline() *diagnose.Pipeline {
 	cfg := diagnose.CollectorConfig{
 		Redactor: s.cfg.DiagnoseRedactor,
@@ -1484,11 +745,12 @@ func (s *Server) buildDiagnosePipeline() *diagnose.Pipeline {
 	if s.cfg.Webservers != nil {
 		cfg.Webserver = s.cfg.Webservers
 	}
+	cfg.Stack = stackSource{s}
+	cfg.Disk = diskSource{}
+	cfg.Proxy = proxySource{s: s}
 	return diagnose.NewPipeline(diagnose.PipelineConfig{
 		Collector:           diagnose.NewCollector(cfg),
-		Proposer:            s.cfg.DiagnoseProposer,
 		ConfidenceThreshold: s.cfg.DiagnoseConfidenceThreshold,
-		Now:                 s.cfg.Now,
 	})
 }
 
@@ -1505,11 +767,10 @@ func (s *Server) getDiagnoseBundle(incidentID string) (diagnose.Bundle, bool) {
 	return b, ok
 }
 
-// dispatchDiagnose owns incident.diagnose and incident.evidence (Watchtower
-// Phase 5, issue #73): running the bounded, redacted local diagnostic
-// pipeline and serving its evidence bundle. Raw evidence never leaves this
-// handler's response -- the relay only ever receives Assessment.Summary()
-// via watchtower.Client.SendDiagnosticSummary, posted elsewhere.
+// dispatchDiagnose owns incident.diagnose and incident.evidence: running the
+// bounded, redacted local diagnostic pipeline and serving its evidence
+// bundle. Raw evidence never leaves this handler's response; the playbook
+// request to the relay is built separately from the redacted bundle.
 func (s *Server) dispatchDiagnose(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.DiagnoseRedactor == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "diagnose subsystem not configured")
@@ -1525,6 +786,11 @@ func (s *Server) dispatchDiagnose(ctx context.Context, c *websocket.Conn, writeM
 		return
 	}
 	target := diagnose.Target{IncidentID: in.IncidentID, MonitorKind: in.MonitorKind, Target: in.Target}
+	if s.cfg.Store != nil {
+		if b, err := s.cfg.Store.GetIncidentBinding(in.IncidentID); err == nil {
+			target.Summary = b.Summary
+		}
+	}
 	switch f.Kind {
 	case "incident.diagnose":
 		assessment, bundle := s.buildDiagnosePipeline().Run(ctx, target)
@@ -1538,15 +804,4 @@ func (s *Server) dispatchDiagnose(ctx context.Context, c *websocket.Conn, writeM
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "incident.evidence", bundle)
 	}
-}
-
-// NotificationPrefDTO is one row of the push notification settings list: a
-// known kind, its built-in default, and the effective push_enabled after
-// applying any persisted override.
-type NotificationPrefDTO struct {
-	Type        string `json:"type"`
-	Label       string `json:"label"`
-	DefaultPush bool   `json:"default_push"`
-	PushEnabled bool   `json:"push_enabled"`
-	Overridden  bool   `json:"overridden"`
 }

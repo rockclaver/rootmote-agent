@@ -3,6 +3,7 @@ package infra
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -226,6 +227,45 @@ func TestMetricsCollector_SkipsDockerAndPseudoMounts(t *testing.T) {
 	}
 	if got.Disks[0].Mountpoint != "/" {
 		t.Fatalf("disk mountpoint = %q, want /", got.Disks[0].Mountpoint)
+	}
+}
+
+// Docker bind-mounts /etc/hostname, /etc/hosts and /etc/resolv.conf as files.
+// They are not disks and must not appear in metrics, monitors or discovery.
+func TestMetricsCollector_IgnoresMountPointsThatAreFiles(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "hostname")
+	if err := os.WriteFile(file, []byte("box\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader := fakeReader{files: map[string][]byte{
+		"stat":    []byte("cpu  1 0 1 8 0 0 0 0\n"),
+		"loadavg": []byte("0.1 0.2 0.3 1/1 1\n"),
+		"meminfo": []byte("MemTotal: 1 kB\nMemAvailable: 1 kB\n"),
+		"dev":     []byte(" eth0: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\n"),
+		"mounts": []byte(strings.Join([]string{
+			"/dev/vda1 / ext4 rw 0 0",
+			"/dev/vda1 " + dir + " ext4 rw 0 0",
+			"/dev/vda1 " + file + " ext4 rw 0 0",
+			"",
+		}, "\n")),
+	}}
+	mgr, err := New(Config{
+		Platform: "linux",
+		Reader:   reader,
+		StatFS: func(path string) (syscall.Statfs_t, error) {
+			return syscall.Statfs_t{Blocks: 100, Bavail: 25, Bsize: 4096}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range mgr.Sample(context.Background()).Disks {
+		got = append(got, d.Mountpoint)
+	}
+	if len(got) != 2 || got[0] != "/" || got[1] != dir {
+		t.Fatalf("mount points = %v, want / and the directory only", got)
 	}
 }
 

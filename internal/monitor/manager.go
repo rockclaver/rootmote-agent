@@ -19,6 +19,10 @@ import (
 type StateStore interface {
 	PutMonitorState(store.MonitorState) error
 	ListMonitorStates() ([]store.MonitorState, error)
+	PutAlertSilence(key, rule, target string, until time.Time) error
+	DeleteAlertSilence(key string) error
+	AlertSilencesActive(now time.Time) (map[string]time.Time, error)
+	PutAlertAck(key string, firedAt time.Time) error
 }
 
 // EventSender is the subset of *watchtower.Client the engine needs to emit
@@ -41,6 +45,7 @@ type Config struct {
 	Host      Host          // optional: defaults to the real machine (OSHost)
 	Sockets   SocketSource  // optional: defaults to ss/netstat
 	Processes ProcessSource // optional: defaults to the agent process manager
+	PM2       PM2Source     // optional: nil disables the pm2_app evaluator
 	Cores     func() int    // optional: logical CPU count for load_per_core; defaults to runtime.NumCPU
 	Store     StateStore
 	Client    EventSender
@@ -140,6 +145,9 @@ func New(cfg Config) (*Manager, error) {
 	)
 	if cfg.Processes != nil {
 		m.evaluators = append(m.evaluators, &ProcessEvaluator{Procs: cfg.Processes, Defs: m.defs})
+	}
+	if cfg.PM2 != nil {
+		m.evaluators = append(m.evaluators, &PM2Evaluator{PM2: cfg.PM2, Defs: m.defs, Now: m.now})
 	}
 	// Without a persistent boot-ID store a reboot cannot be told apart from
 	// an agent restart, so the evaluator is only registered with one.
@@ -340,6 +348,11 @@ func (m *Manager) process(ctx context.Context, kind Kind, obs Observation) {
 	newRt.UpdatedAt = now
 	m.mu.Unlock()
 
+	if tr != nil && m.isSilenced(k, now) {
+		// A silenced monitor still advances its state machine, but neither
+		// the firing page nor its recovery reaches the relay.
+		tr = nil
+	}
 	if tr != nil {
 		eventID, err := watchtower.NewMonitorEventID()
 		if err != nil {

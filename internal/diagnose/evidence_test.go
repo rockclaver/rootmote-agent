@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -513,5 +514,34 @@ func TestCollect_SystemdTargetCollectsUnitStateAndLogs(t *testing.T) {
 	}
 	if !strings.Contains(b.Logs[0].Content, "line two") {
 		t.Fatalf("log content = %q, want it to contain seeded lines", b.Logs[0].Content)
+	}
+}
+
+func TestBuildLog_ByteBudgetKeepsTheNewestLines(t *testing.T) {
+	redactor, _ := redact.New(nil)
+	c := NewCollector(CollectorConfig{
+		Redactor: redactor,
+		Now:      fixedNow,
+		Budget:   Budget{MaxLogLines: 100, MaxItemBytes: 60, MaxItems: DefaultMaxItems},
+	})
+	var lines []string
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, fmt.Sprintf("line %02d is here", i))
+	}
+	log, _, _ := c.buildLog(newIDAllocator(), "test", lines)
+	if !log.Truncated {
+		t.Fatal("Truncated = false, want true")
+	}
+	if len(log.Content) > 60 {
+		t.Fatalf("Content len = %d, want <= 60", len(log.Content))
+	}
+	if !strings.HasSuffix(log.Content, "line 20 is here") {
+		t.Fatalf("the newest line was cut: %q", log.Content)
+	}
+	if strings.Contains(log.Content, "line 01 ") {
+		t.Fatalf("the oldest line was kept: %q", log.Content)
+	}
+	if !strings.HasPrefix(log.Content, "line ") {
+		t.Fatalf("the excerpt starts in the middle of a line: %q", log.Content)
 	}
 }

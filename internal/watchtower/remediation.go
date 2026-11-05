@@ -48,8 +48,8 @@ type remediationEventPayload struct {
 
 // SendRemediationEvent posts one redacted remediation lifecycle event to
 // relayURL/v1/incidents/{incidentId}/remediation-events. It reuses the
-// same signed-envelope construction as Heartbeat and SendDiagnosticSummary
-// (SigningString, PayloadHash, Sign, newNonce, saveCreds/envelope) -- the
+// same signed-envelope construction as Heartbeat (SigningString,
+// PayloadHash, Sign, newNonce, saveCreds/envelope) -- the
 // payload kind is "remediation_event". As with those, the sequence number
 // is incremented and persisted to the credential file BEFORE the request
 // is sent, so a crash mid-request never reuses a sequence number the relay

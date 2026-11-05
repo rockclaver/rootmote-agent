@@ -1,9 +1,9 @@
-// Package diagnose implements the agent-side bounded diagnostic pipeline
-// (PRD 12/13): collect a small, redacted evidence bundle for an incident,
-// run deterministic signature checks against it, and optionally ask an AI
-// provider to summarize it. Raw evidence never leaves the server: every
-// piece of text this package puts into a Bundle has already passed through
-// a redact.Redactor.
+// Package diagnose implements the agent-side bounded diagnostic pipeline:
+// collect a small, redacted evidence bundle for an incident and run
+// deterministic signature checks against it. The playbook package turns the
+// result into a fix. Raw evidence never leaves the server: every piece of
+// text this package puts into a Bundle has already passed through a
+// redact.Redactor.
 package diagnose
 
 import (
@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rockclaver/rootmote-agent/internal/diagnose/redact"
 	"github.com/rockclaver/rootmote-agent/internal/docker"
@@ -37,6 +38,9 @@ type Signal struct {
 	Value         float64 `json:"value,omitempty"`
 	WindowSeconds int     `json:"windowSeconds,omitempty"`
 	Detail        string  `json:"detail,omitempty"`
+	// Subject names what the signal is about: the container, the killed
+	// process or the directory.
+	Subject string `json:"subject,omitempty"`
 }
 
 // LogExcerpt is a bounded, redacted tail of a log source.
@@ -58,6 +62,11 @@ type Component struct {
 	State  string `json:"state"`
 	Health string `json:"health,omitempty"`
 	Detail string `json:"detail,omitempty"`
+	// Owner is the user that owns the component (a PM2 app's user).
+	Owner string `json:"owner,omitempty"`
+	// ComposeProject and ComposeService are set for Compose containers.
+	ComposeProject string `json:"composeProject,omitempty"`
+	ComposeService string `json:"composeService,omitempty"`
 }
 
 // Change is a recent, diagnostically relevant host event (a restart, a
@@ -75,6 +84,8 @@ type Metric struct {
 	Name  string  `json:"name"`
 	Value float64 `json:"value"`
 	Unit  string  `json:"unit,omitempty"`
+	// Subject is the mount point of a disk metric.
+	Subject string `json:"subject,omitempty"`
 }
 
 // Bundle is the full, REDACTED evidence collected for one incident. It is
@@ -94,7 +105,7 @@ type Bundle struct {
 }
 
 // EvidenceIDs returns every id in the bundle, sorted. Used to validate that
-// AI hypotheses reference real evidence.
+// signatures reference real evidence.
 func (b Bundle) EvidenceIDs() []string {
 	ids := make([]string, 0, len(b.Signals)+len(b.Logs)+len(b.Components)+len(b.RecentChanges)+len(b.Metrics))
 	for _, s := range b.Signals {
@@ -188,6 +199,60 @@ type WebserverSource interface {
 	List(ctx context.Context) webserver.Snapshot
 }
 
+// Stack is the part of host discovery the collector needs: PM2 apps with
+// their state, and certificates with their expiry.
+type Stack struct {
+	PM2Apps []PM2App
+	Certs   []Cert
+}
+
+// PM2App is one PM2 app, the user that runs it, and PM2's status for it.
+type PM2App struct {
+	User   string
+	App    string
+	Status string
+}
+
+// Cert is one certificate and when it expires.
+type Cert struct {
+	Name      string
+	ExpiresAt time.Time
+}
+
+// StackSource reports the PM2 apps and certificates on this host.
+type StackSource interface {
+	Stack(ctx context.Context) Stack
+}
+
+// DirSize is one directory and its size in megabytes.
+type DirSize struct {
+	Path   string
+	SizeMB float64
+}
+
+// DiskSource finds what uses the space on one mount point.
+type DiskSource interface {
+	LargestDirs(ctx context.Context, mount string, n int) ([]DirSize, error)
+}
+
+// Upstream is a backend a reverse proxy forwards to. Kind is "unit" or
+// "container" when the backend is a service on this host, empty when it is
+// not known.
+type Upstream struct {
+	Address string
+	Kind    string
+	Name    string
+}
+
+// ProxySource reads what the reverse proxy knows about a failing address.
+type ProxySource interface {
+	// Upstreams lists the backends that serve the address (a URL or host).
+	Upstreams(ctx context.Context, target string) ([]Upstream, error)
+	// ErrorLog returns the tail of the proxy's error log, or an error when it
+	// cannot be read.
+	ErrorLog(ctx context.Context, tail int) (string, error)
+}
+
 // CollectorConfig configures a Collector. Every source is optional; a nil
 // source contributes a Warning instead of evidence.
 type CollectorConfig struct {
@@ -195,6 +260,9 @@ type CollectorConfig struct {
 	Systemd   SystemdSource   // optional
 	Infra     InfraSource     // optional
 	Webserver WebserverSource // optional
+	Stack     StackSource     // optional
+	Disk      DiskSource      // optional
+	Proxy     ProxySource     // optional
 	Redactor  *redact.Redactor
 	Budget    Budget
 	Now       func() time.Time
@@ -206,6 +274,9 @@ type Collector struct {
 	systemd   SystemdSource
 	infra     InfraSource
 	webserver WebserverSource
+	stack     StackSource
+	disk      DiskSource
+	proxy     ProxySource
 	redactor  *redact.Redactor
 	budget    Budget
 	now       func() time.Time
@@ -228,6 +299,9 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		systemd:   cfg.Systemd,
 		infra:     cfg.Infra,
 		webserver: cfg.Webserver,
+		stack:     cfg.Stack,
+		disk:      cfg.Disk,
+		proxy:     cfg.Proxy,
 		redactor:  redactor,
 		budget:    cfg.Budget.withDefaults(),
 		now:       now,
@@ -239,6 +313,8 @@ type Target struct {
 	IncidentID  string
 	MonitorKind string // docker_container | systemd_unit | disk_capacity | …
 	Target      string
+	// Summary is the monitor's own one-line description of the failure.
+	Summary string
 }
 
 // Collect runs the bounded PRD 12.1 workflow and returns a REDACTED bundle.
@@ -261,6 +337,14 @@ func (c *Collector) Collect(ctx context.Context, t Target) Bundle {
 		c.collectDocker(cctx, t, &b, ids)
 	case "systemd_unit":
 		c.collectSystemd(cctx, t, &b, ids)
+	case "disk_capacity", "inode_capacity", "disk_fill_rate":
+		c.collectDisk(cctx, t, &b, ids)
+	case "process_running", "pm2_app":
+		c.collectPM2(cctx, t, &b, ids)
+	case "cert_expiry", "tls_expiry":
+		c.collectCerts(cctx, t, &b, ids)
+	case "external_http":
+		c.collectProxy(cctx, t, &b, ids)
 	}
 
 	if cctx.Err() != nil {
@@ -370,10 +454,11 @@ func (c *Collector) collectDocker(ctx context.Context, t Target, b *Bundle, ids 
 		redacted, rep := c.redactor.Text(text)
 		b.Redaction.Merge(rep)
 		b.Signals = append(b.Signals, Signal{
-			ID:     ids.id("sig_container_restart_loop"),
-			Type:   "container_restart_loop",
-			Value:  float64(detail.RestartCount),
-			Detail: redacted,
+			ID:      ids.id("sig_container_restart_loop"),
+			Type:    "container_restart_loop",
+			Value:   float64(detail.RestartCount),
+			Detail:  redacted,
+			Subject: primary.Name,
 		})
 	}
 	if detail.RestartCount > 0 && c.itemBudgetOK(b) {
@@ -433,13 +518,22 @@ func (c *Collector) buildDockerComponent(ids *idAllocator, s docker.ContainerSum
 	rep.Merge(textRep)
 
 	return Component{
-		ID:     ids.id(fmt.Sprintf("cmp_docker_%s", sanitize(s.Name))),
-		Kind:   "docker_container",
-		Name:   s.Name,
-		State:  s.State,
-		Health: s.Health,
-		Detail: detailText,
+		ID:             ids.id(fmt.Sprintf("cmp_docker_%s", sanitize(s.Name))),
+		Kind:           "docker_container",
+		Name:           s.Name,
+		State:          s.State,
+		Health:         s.Health,
+		Detail:         detailText,
+		ComposeProject: composeProjectOf(s, detail),
+		ComposeService: s.ComposeService,
 	}, rep
+}
+
+func composeProjectOf(s docker.ContainerSummary, detail *docker.ContainerDetail) string {
+	if detail != nil && detail.ComposeProject != "" {
+		return detail.ComposeProject
+	}
+	return s.ComposeProject
 }
 
 // --- systemd ---
@@ -553,33 +647,41 @@ func (c *Collector) collectInfra(ctx context.Context, b *Bundle, ids *idAllocato
 			Value:         float64(len(events)),
 			WindowSeconds: int(c.budget.ChangeWindow.Seconds()),
 			Detail:        redacted,
+			Subject:       last.Process,
 		})
 	}
 }
 
 func (c *Collector) addInfraMetrics(hm infra.HostMetrics, b *Bundle, ids *idAllocator) {
-	add := func(id, name string, value float64, unit string) {
+	add := func(id, name string, value float64, unit, subject string) {
 		if !c.itemBudgetOK(b) {
 			return
 		}
-		b.Metrics = append(b.Metrics, Metric{ID: ids.id(id), Name: name, Value: value, Unit: unit})
+		b.Metrics = append(b.Metrics, Metric{ID: ids.id(id), Name: name, Value: value, Unit: unit, Subject: subject})
+	}
+	const mb = 1024 * 1024
+	if hm.CPU.Available {
+		add("met_cpu_percent", "cpu_percent", hm.CPU.Percent, "%", "")
 	}
 	if hm.Memory.Available {
-		add("met_available_memory_percent", "available_memory_percent", 100-hm.Memory.Percent, "%")
+		add("met_available_memory_percent", "available_memory_percent", 100-hm.Memory.Percent, "%", "")
+		add("met_memory_used_percent", "memory_used_percent", hm.Memory.Percent, "%", "")
+		add("met_memory_total_mb", "memory_total_mb", float64(hm.Memory.TotalBytes)/mb, "MB", "")
 	}
 	if hm.Swap.Available {
-		add("met_swap_used_percent", "swap_used_percent", hm.Swap.Percent, "%")
+		add("met_swap_used_percent", "swap_used_percent", hm.Swap.Percent, "%", "")
+		add("met_swap_total_mb", "swap_total_mb", float64(hm.Swap.TotalBytes)/mb, "MB", "")
 	}
 	if hm.Load.Available {
-		add("met_load_one", "load_one", hm.Load.One, "")
+		add("met_load_one", "load_one", hm.Load.One, "", "")
 	}
 	for _, d := range hm.Disks {
 		if !d.Available {
 			continue
 		}
 		mount := sanitize(d.Mountpoint)
-		add("met_disk_used_percent_"+mount, "disk_used_percent", d.Percent, "%")
-		add("met_inode_used_percent_"+mount, "inode_used_percent", d.InodePercent, "%")
+		add("met_disk_used_percent_"+mount, "disk_used_percent", d.Percent, "%", d.Mountpoint)
+		add("met_inode_used_percent_"+mount, "inode_used_percent", d.InodePercent, "%", d.Mountpoint)
 	}
 }
 
@@ -644,7 +746,7 @@ func (c *Collector) buildLog(ids *idAllocator, source string, lines []string) (L
 	}
 	redacted, rep := c.redactor.Text(strings.Join(lines, "\n"))
 	if len(redacted) > c.budget.MaxItemBytes {
-		redacted = redacted[:c.budget.MaxItemBytes]
+		redacted = keepEnd(redacted, c.budget.MaxItemBytes)
 		truncated = true
 	}
 	return LogExcerpt{
@@ -655,6 +757,21 @@ func (c *Collector) buildLog(ids *idAllocator, source string, lines []string) (L
 		Redacted:  true,
 		Content:   redacted,
 	}, rep, dropped
+}
+
+// keepEnd returns the last max bytes of text. A log is read from the end (the
+// newest lines explain the incident), so the oldest bytes are the ones to
+// drop. The cut moves forward to the next line start when there is one, and
+// never lands inside a UTF-8 character.
+func keepEnd(text string, max int) string {
+	cut := len(text) - max
+	if nl := strings.IndexByte(text[cut:], '\n'); nl >= 0 && cut+nl+1 < len(text) {
+		return text[cut+nl+1:]
+	}
+	for cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut++
+	}
+	return text[cut:]
 }
 
 // --- ids ---
